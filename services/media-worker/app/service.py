@@ -1,0 +1,360 @@
+"""Phase 3 media worker API.
+
+Endpoints:
+  GET  /health                              -> {"ok": true}
+  GET  /status                              -> authenticated worker status (X-API-Key)
+  POST /jobs                                -> {"job_id": "<uuid>", "status": "queued"}
+  GET  /jobs/{job_id}                       -> job record (status, per-source fields)
+  GET  /jobs/{job_id}/manifest              -> unified multi-source manifest
+
+Website extraction is live (Phase 2). Instagram/Facebook collection is live
+(Phase 3): gallery-dl primary with Instaloader/yt-dlp fallbacks, gated behind
+the operator's `social_permission_confirmed` acknowledgement, with honest
+per-source statuses and a unified manifest. No AI or Google Drive yet.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import hmac
+import json
+import os
+import sqlite3
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import BoundedSemaphore, Lock
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="Pet Grooming Media Worker", version="0.1.0-phase1")
+
+executor = ThreadPoolExecutor(max_workers=2)
+slots = BoundedSemaphore(4)
+lock = Lock()
+
+DATA_DIR = Path(os.environ.get("PROJECTS_DIR", "./storage/jobs"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB = DATA_DIR / "_system" / "jobs.sqlite"
+DB.parent.mkdir(parents=True, exist_ok=True)
+
+
+def connect() -> sqlite3.Connection:
+    con = sqlite3.connect(DB, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    con.execute("PRAGMA busy_timeout=5000;")
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+    )
+    return con
+
+
+def store(record: dict[str, Any]) -> None:
+    with lock, connect() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO jobs (id, payload) VALUES (?,?)",
+            (record["job_id"], json.dumps(record)),
+        )
+
+
+def fetch(job_id: str) -> dict[str, Any] | None:
+    with lock, connect() as con:
+        row = con.execute("SELECT payload FROM jobs WHERE id=?", (job_id,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+# Recover jobs left running/queued across a restart (fail-closed: mark interrupted).
+with connect() as _db:
+    for _id, _blob in _db.execute("SELECT id, payload FROM jobs").fetchall():
+        _old = json.loads(_blob)
+        if _old.get("status") in ("running", "queued"):
+            _old.update(
+                status="interrupted",
+                error="Service restarted; resubmit to retry",
+            )
+            _db.execute(
+                "UPDATE jobs SET payload=? WHERE id=?",
+                (json.dumps(_old), _id),
+            )
+
+
+class CreateJobRequest(BaseModel):
+    website_url: str = Field(min_length=1, description="Required pet grooming business website URL")
+    instagram_url: str | None = Field(default=None, description="Optional public Instagram URL")
+    facebook_url: str | None = Field(default=None, description="Optional public Facebook Page URL")
+    lookback_days: int = Field(default=365, ge=1, le=366)
+    max_selected_images: int = Field(default=30, ge=1, le=200)
+    max_selected_videos: int = Field(default=10, ge=1, le=100)
+    user_selection_notes: str | None = None
+    max_pages: int = Field(default=10, ge=1, le=25, description="Website crawl page cap (low-volume Phase 2 default)")
+    max_media: int = Field(default=30, ge=1, le=80, description="Website media download cap")
+    social_permission_confirmed: bool = Field(
+        default=False,
+        description=(
+            "Operator acknowledges the intended collection and use of social media are "
+            "permitted. This acknowledgement is NOT platform authorization and NOT a "
+            "copyright licence; it never bypasses login walls or rate limits."
+        ),
+    )
+    max_social_files: int = Field(default=20, ge=1, le=60, description="Per-platform social media download cap")
+
+
+@app.get("/health")
+def health() -> dict[str, bool]:
+    return {"ok": True}
+
+
+_MEDIA_WORKER_TOKEN = os.environ.get("MEDIA_WORKER_TOKEN", "").strip()
+
+
+@app.get("/status")
+def status(request: Request) -> object:
+    """Authenticated worker status (used by the n8n Phase 1 probe workflow).
+
+    Fails closed when MEDIA_WORKER_TOKEN is unset or mismatched; constant-time
+    comparison adapted from the legacy `src/engine/auth.py`.
+    """
+    supplied = request.headers.get("x-api-key", "").strip()
+    if not _MEDIA_WORKER_TOKEN or not hmac.compare_digest(supplied, _MEDIA_WORKER_TOKEN):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized: MEDIA_WORKER_TOKEN required"},
+        )
+    return {
+        "ok": True,
+        "service": "media-worker",
+        "phase": 1,
+        "auth": "verified",
+        "token_configured": True,
+    }
+
+
+@app.post("/jobs", status_code=202)
+def create_job(req: CreateJobRequest) -> dict[str, str]:
+    if not slots.acquire(blocking=False):
+        raise HTTPException(429, "Worker busy; retry later")
+    job_id = uuid.uuid4().hex
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    payload: dict[str, Any] = {
+        "job_id": job_id,
+        "status": "queued",
+        "website_url": req.website_url,
+        "instagram_url": req.instagram_url,
+        "facebook_url": req.facebook_url,
+        "lookback_days": req.lookback_days,
+        "max_selected_images": req.max_selected_images,
+        "max_selected_videos": req.max_selected_videos,
+        "user_selection_notes": req.user_selection_notes,
+        "max_pages": req.max_pages,
+        "max_media": req.max_media,
+        "social_permission_confirmed": req.social_permission_confirmed,
+        "max_social_files": req.max_social_files,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "sources": {
+            "website": {"status": "queued"},
+            "instagram": {"status": "queued" if req.instagram_url else "not_requested"},
+            "facebook": {"status": "queued" if req.facebook_url else "not_requested"},
+        },
+    }
+    store(payload)
+    try:
+        executor.submit(_process_job, job_id, payload)
+    except Exception:
+        slots.release()
+        raise
+    return {"job_id": job_id, "status": "queued"}
+
+
+def _process_job(job_id: str, payload: dict[str, Any]) -> None:
+    """Phase 3: website extraction + permitted social collection.
+
+    Each source is isolated: a social failure never destroys website results,
+    and no source is ever marked successful without verifiable evidence.
+    Social collection only runs when the operator acknowledged permitted use
+    (social_permission_confirmed); that acknowledgement is not platform
+    authorization and never bypasses access restrictions.
+    """
+    from app.collector import run_website_extraction
+    from app.manifest import merge_social_into_manifest, write_manifest
+    from app.social_adapter import (
+        SocialExtractionResult,
+        run_social_extraction,
+        section_from_result,
+    )
+
+    def _now() -> str:
+        return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+    try:
+        sources: dict[str, Any] = dict(payload.get("sources") or {})
+        sources["website"] = {"status": "running"}
+        for platform in ("instagram", "facebook"):
+            sources[platform] = {
+                "status": "running" if payload.get(f"{platform}_url") else "not_requested"
+            }
+        store({**payload, "status": "running", "sources": sources, "updated_at": _now()})
+
+        job_dir = Path(DATA_DIR) / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- Website source -------------------------------------------------
+        website_status: dict[str, Any] = {}
+        try:
+            result = run_website_extraction(
+                job_id,
+                job_dir,
+                str(payload["website_url"]),
+                max_pages=int(payload.get("max_pages") or 10),
+                max_media=int(payload.get("max_media") or 30),
+            )
+            website_status = {
+                "status": result.status,
+                "pages_crawled": result.pages_crawled,
+                "downloaded": result.assets_downloaded,
+                "duplicates": result.duplicates,
+                "failed": result.failed,
+                "skipped": result.skipped,
+                "bytes": result.bytes_downloaded,
+            }
+            if result.issues:
+                website_status["issues"] = result.issues[:20]
+            if result.notes:
+                website_status["notes"] = result.notes[:10]
+        except Exception as exc:  # noqa: BLE001 — isolate website failures
+            website_status = {"status": "failed", "error": str(exc)[:240]}
+
+        # --- Social sources (isolated; permission-gated) ---------------------
+        social_sections: list[tuple[str, dict[str, Any]]] = []
+        for platform in ("instagram", "facebook"):
+            url = payload.get(f"{platform}_url")
+            if not url:
+                sources[platform] = {"status": "not_requested"}
+                continue
+            try:
+                social_result = run_social_extraction(
+                    job_id,
+                    job_dir,
+                    platform,
+                    str(url),
+                    max_files=int(payload.get("max_social_files") or 20),
+                    lookback_days=int(payload.get("lookback_days") or 365),
+                    permission_confirmed=bool(payload.get("social_permission_confirmed")),
+                )
+            except Exception as exc:  # noqa: BLE001 — isolate social failures
+                social_result = SocialExtractionResult(
+                    job_id=job_id,
+                    platform=platform,
+                    url=str(url),
+                    status="failed",
+                    reason=f"adapter_error: {exc}"[:240],
+                )
+            section = section_from_result(social_result)
+            social_sections.append((platform, section))
+            sources[platform] = {k: v for k, v in section.items() if k != "items"}
+            # Incremental progress so the operator sees per-source status early.
+            store(
+                {
+                    **payload,
+                    "status": "running",
+                    "sources": {**sources, "website": website_status},
+                    "updated_at": _now(),
+                }
+            )
+
+        # --- Unified manifest ------------------------------------------------
+        website_doc: dict[str, Any] | None = None
+        manifest_file = job_dir / "manifest.json"
+        if manifest_file.is_file():
+            try:
+                website_doc = json.loads(manifest_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                website_doc = None
+        if social_sections or website_doc is None:
+            try:
+                merged = merge_social_into_manifest(
+                    website_doc,
+                    social_sections,
+                    job_id=job_id,
+                    lookback_days=int(payload.get("lookback_days") or 365),
+                    permission_confirmed=bool(payload.get("social_permission_confirmed")),
+                )
+                write_manifest(job_dir, merged)
+            except Exception as exc:  # noqa: BLE001 — manifest failure is recorded
+                sources["manifest"] = {"status": "failed", "error": str(exc)[:240]}
+
+        # --- Honest overall status -------------------------------------------
+        # NOTE: compute from the SAME merged dict the record stores, otherwise a
+        # stale "running" placeholder in `sources` can override the real result.
+        final_sources = {**sources, "website": website_status}
+        attempted = [
+            s.get("status")
+            for s in final_sources.values()
+            if isinstance(s, dict) and s.get("status") in ("completed", "partial_success", "failed", "invalid_url")
+        ]
+        if not attempted:
+            job_status = "failed"
+        elif all(s == "completed" for s in attempted):
+            job_status = "extraction_complete"
+        elif any(s in ("completed", "partial_success") for s in attempted):
+            job_status = "partial_success"
+        else:
+            job_status = "failed"
+
+        record = {
+            **payload,
+            "status": job_status,
+            "sources": final_sources,
+            "updated_at": _now(),
+        }
+        if manifest_file.is_file():
+            record["manifest_path"] = str(manifest_file)
+        if job_status == "failed":
+            record["error"] = "Extraction failed for every attempted source; see sources for reasons."
+        store(record)
+    except Exception as exc:  # noqa: BLE001 — record failure and keep worker up
+        store(
+            {
+                **payload,
+                "status": "failed",
+                "error": str(exc)[:240],
+                "sources": {
+                    **(payload.get("sources") or {}),
+                    "website": {"status": "failed", "error": str(exc)[:240]},
+                },
+                "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            }
+        )
+    finally:
+        slots.release()
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str) -> dict[str, Any]:
+    rec = fetch(job_id)
+    if rec is None:
+        raise HTTPException(404, "Unknown job")
+    return rec
+
+
+@app.get("/jobs/{job_id}/manifest")
+def get_manifest(job_id: str) -> dict[str, Any]:
+    rec = fetch(job_id)
+    if rec is None:
+        raise HTTPException(404, "Unknown job")
+    manifest_file = Path(DATA_DIR) / job_id / "manifest.json"
+    if manifest_file.is_file():
+        try:
+            return json.loads(manifest_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(500, f"Manifest unreadable: {exc}") from exc
+    return {
+        "job_id": job_id,
+        "status": rec.get("status"),
+        "assets": [],
+        "note": "No manifest generated for this job yet (pre-Phase-2 job, or extraction not finished).",
+    }

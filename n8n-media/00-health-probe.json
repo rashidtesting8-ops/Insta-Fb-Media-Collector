@@ -1,0 +1,95 @@
+{
+  "name": "00 - Phase 1 Health Probe (temporary)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "phase1-probe",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Phase 1 Probe Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [240, 300],
+      "webhookId": "b1100000-0000-4000-8000-000000000001"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://collector:8787/health",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Worker Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://collector:8787/status",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "pgm-worker-token-cred",
+          "name": "Media Worker API Token"
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "Worker Auth Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "/data/media/sentinel.txt",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "Read Shared Mount Sentinel",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ worker_health: $('Worker Health').item.json, worker_status: $('Worker Auth Status').item.json, shared_mount_sentinel: ($('Read Shared Mount Sentinel').item.binary && $('Read Shared Mount Sentinel').item.binary.data) ? { file_name: ($('Read Shared Mount Sentinel').item.binary.data.fileName || null), mime_type: ($('Read Shared Mount Sentinel').item.binary.data.mimeType || null) } : null }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000005",
+      "name": "Respond With Probe Evidence",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [1120, 300]
+    }
+  ],
+  "connections": {
+    "Phase 1 Probe Webhook": {
+      "main": [[{"node": "Worker Health", "type": "main", "index": 0}]]
+    },
+    "Worker Health": {
+      "main": [[{"node": "Worker Auth Status", "type": "main", "index": 0}]]
+    },
+    "Worker Auth Status": {
+      "main": [[{"node": "Read Shared Mount Sentinel", "type": "main", "index": 0}]]
+    },
+    "Read Shared Mount Sentinel": {
+      "main": [[{"node": "Respond With Probe Evidence", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

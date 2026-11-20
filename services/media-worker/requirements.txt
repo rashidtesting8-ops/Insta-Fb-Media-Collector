@@ -1,0 +1,24 @@
+# Phase 2 skeleton + website collector API
+fastapi>=0.115,<1
+uvicorn>=0.32,<1
+pydantic>=2.7,<3
+
+# Website crawler dependencies (required by app/legacy_collector.py, the
+# byte-for-byte vendored legacy builder module)
+beautifulsoup4>=4.12,<5
+Pillow>=10,<13
+requests>=2.31,<3
+
+# Phase 2+ media tooling, preinstalled so the image is proven now.
+# gallery-dl: bumped 1.30.0 -> 1.32.20 in Phase 3 (the mid-2025 legacy pin
+# categorically failed against 2026 Instagram/Facebook: access-gated error
+# envelopes with exit 0 / empty output). Current stable at time of change.
+# Review this pin again if extractors drift; never use cookies/login to work
+# around access restrictions.
+gallery-dl==1.32.20
+yt-dlp>=2025.1.15
+instaloader>=4.14,<5
+
+# Test runner ships in the image so tests are reproducible in-container
+# (host machine has no Python installed).
+pytest>=8.3,<9

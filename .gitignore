@@ -1,0 +1,72 @@
+# ------------------------------------------------------------------
+# Pet Grooming Media Intelligence — .gitignore
+# Public repository hygiene: never commit secrets, runtime media,
+# databases, backups, browser sessions, or the local legacy reference
+# archive (kept locally under reference/, deliberately unpublished).
+# ------------------------------------------------------------------
+
+# --- Environment & secrets ---------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+client_secret*.json
+cookies.txt
+session*
+*.session
+service-account*.json
+
+# --- Runtime job storage (downloaded media, manifests, job DBs) ---
+storage/
+storage/jobs/
+
+# --- Databases ----------------------------------------------------
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# --- Local backups & disk images ---------------------------------
+DockerBackup/
+backups/
+*.vhdx
+*.vhd
+
+# --- Python -------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.venv/
+venv/
+*.egg-info/
+
+# --- Node / frontend build artifacts ------------------------------
+node_modules/
+.next/
+dist/
+build/
+coverage/
+
+# --- Logs & temp --------------------------------------------------
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# --- Local-only onboarding docs (reference unpublished local ZIPs) -
+OpenCode_Phase_0_Audit_Prompt.txt
+README_FIRST.md
+
+# --- Local legacy reference archive (never publish; never delete) -
+reference/
+
+# --- n8n local state (never publish credential exports) ----------
+*.n8n-credentials.json
+n8n-credentials*.json

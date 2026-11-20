@@ -1,0 +1,80 @@
+# Phase 1 Docker Compose: n8n + Python media worker.
+#
+# Networking:
+#   Host browser:    http://localhost:5679 (n8n), http://localhost:8788 (worker)
+#   n8n -> worker:   http://collector:8787  (Docker service DNS, NOT localhost)
+#
+# Storage:
+#   n8n persistent state -> n8n_media_data volume (NEW, separate from any existing n8n volume)
+#   shared media         -> D:/pgm-media-storage/jobs  (worker RW at /data/projects, n8n RO at /data/media)
+#
+# Ports deliberately avoid the occupied 5678 (existing n8n) and 8787 (local python).
+
+# Explicit project name: keeps containers, volume and network namespaced away
+# from every legacy project (website-builder-testing-*, pet-gromming-agent-factory-*).
+name: pgm-media
+
+services:
+  n8n:
+    image: ${N8N_IMAGE:?set N8N_IMAGE in .env}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5679:5678"
+    environment:
+      - TZ=${TZ:-UTC}
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE:-UTC}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
+      - N8N_RESTRICT_FILE_ACCESS_TO=/data/media
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - N8N_EDITOR_BASE_URL=http://127.0.0.1:5679
+      # NOTE: MEDIA_WORKER_TOKEN is intentionally NOT exposed to n8n here.
+      # n8n 2.x blocks $env access in expressions; the worker token lives in an
+      # n8n Credential ("Media Worker API Token", httpHeaderAuth) instead.
+    volumes:
+      - n8n_media_data:/home/node/.n8n
+      - D:/pgm-media-storage/jobs:/data/media:ro
+    depends_on:
+      collector:
+        condition: service_healthy
+    mem_limit: 1g
+    mem_reservation: 384m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - media-net
+
+  collector:
+    build:
+      context: ./services/media-worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8788:8787"
+    environment:
+      - PROJECTS_DIR=/data/projects
+      - MEDIA_WORKER_TOKEN=${MEDIA_WORKER_TOKEN:?set MEDIA_WORKER_TOKEN in .env}
+    volumes:
+      - D:/pgm-media-storage/jobs:/data/projects:rw
+    mem_limit: 1g
+    mem_reservation: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - media-net
+
+volumes:
+  n8n_media_data:
+
+networks:
+  media-net:
+    driver: bridge

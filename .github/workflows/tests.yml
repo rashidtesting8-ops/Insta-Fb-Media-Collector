@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+    branches: [main, "chore/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  offline-pytest:
+    name: Offline worker test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/media-worker/requirements.txt
+
+      - name: Install worker dependencies
+        run: pip install -r services/media-worker/requirements.txt
+
+      # Fully offline: in-process HTTP fixtures and mocked tool runners.
+      # No network access, no Docker services, no secrets required.
+      - name: Run test suite
+        env:
+          PYTHONPATH: services/media-worker
+        run: python -m pytest services/media-worker/tests -q
