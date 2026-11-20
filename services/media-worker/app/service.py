@@ -301,6 +301,38 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             except Exception as exc:  # noqa: BLE001 — manifest failure is recorded
                 sources["manifest"] = {"status": "failed", "error": str(exc)[:240]}
 
+        # --- Phase 4 media preprocessing (isolated; partial-failure safe) --
+        preprocessing_record: dict[str, Any] = {"status": "not_run"}
+        if manifest_file.is_file():
+            try:
+                from app.preprocessing import run_media_preprocessing
+
+                cutoff = (
+                    _dt.datetime.now(_dt.timezone.utc)
+                    - _dt.timedelta(days=int(payload.get("lookback_days") or 365))
+                ).date().isoformat()
+                pre = run_media_preprocessing(job_dir, job_id, cutoff_date=cutoff)
+                preprocessing_record = {
+                    "status": pre.status,
+                    "images": {
+                        "analyzed": pre.images_analyzed,
+                        "unsupported_format": pre.images_unsupported,
+                        "problem": pre.images_problem,
+                    },
+                    "videos": {
+                        "probed": pre.videos_probed,
+                        "frames_extracted": pre.videos_frames,
+                        "problem": pre.videos_problem,
+                    },
+                    "duplicate_groups": {
+                        "exact": pre.exact_duplicate_groups,
+                        "perceptual": pre.perceptual_duplicate_groups,
+                    },
+                    "warnings": pre.warnings[:20],
+                }
+            except Exception as exc:  # noqa: BLE001 — preprocessing failure is recorded
+                preprocessing_record = {"status": "failed", "error": str(exc)[:240]}
+
         # --- Honest overall status -------------------------------------------
         # NOTE: compute from the SAME merged dict the record stores, otherwise a
         # stale "running" placeholder in `sources` can override the real result.
@@ -333,12 +365,20 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             **payload,
             "status": job_status,
             "sources": final_sources,
+            "preprocessing": preprocessing_record,
             "updated_at": _now(),
         }
         if manifest_file.is_file():
             record["manifest_path"] = str(manifest_file)
         if job_status == "failed":
             record["error"] = "Extraction failed for every attempted source; see sources for reasons."
+        elif (
+            preprocessing_record.get("status") == "failed"
+            and job_status == "extraction_complete"
+        ):
+            # honest downgrade: collection succeeded, post-processing failed
+            record["status"] = job_status = "partial_success"
+            record["error"] = "Media preprocessing failed; see preprocessing.error."
         store(record)
     except Exception as exc:  # noqa: BLE001 — record failure and keep worker up
         store(

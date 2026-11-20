@@ -25,7 +25,9 @@ permitted media for that business. The platform separates concerns:
   prompts, Google Drive delivery, status APIs.
 - **Python/Docker media worker** owns collection & processing: a vendored,
   SSRF-hardened website crawler; gallery-dl (primary social tool) with
-  Instaloader / yt-dlp fallbacks; FFmpeg for planned frame extraction.
+  Instaloader / yt-dlp fallbacks; and deterministic Phase 4 media
+  preprocessing (cross-source dedupe, technical quality metrics, bounded
+  FFmpeg frame extraction, verified-date categorization).
 - **Shared bind-mounted storage** holds per-job media and manifests.
 
 ## 2. Current implementation status
@@ -36,6 +38,7 @@ permitted media for that business. The platform separates concerns:
 | Docker + n8n infrastructure, shared storage, credential auth (Phase 1) | ✅ Done | `docs/PHASE_1_REPORT.md` |
 | Website media collector + unified manifest (Phase 2) | ✅ Done | 10 offline tests + bounded live smoke (`docs/PHASE_2_REPORT.md`) |
 | Instagram/Facebook collection engine (Phase 3) | ✅ Done | 13 offline mocked tests + bounded consent-gated live smoke (`docs/PHASE_3_REPORT.md`) |
+| Media preprocessing: dedupe, quality metrics, video frames, date categories (Phase 4) | ✅ Done | 14 offline tests + live end-to-end evidence (`docs/PHASE_4_REPORT.md`) |
 | AI Visual Director selection (Phase 5) | ⏳ Planned | prompt assets preserved in `docs/` |
 | Google Drive delivery (Phase 6) | ⏳ Planned | — |
 | Frontend (Phase 7) | ⏳ Planned | — |
@@ -47,16 +50,14 @@ uploads, any frontend, production deployment. Social collection is live but
 
 ## 3. Planned features
 
-1. Media preprocessing: cross-source dedupe, FFmpeg video frames, quality
-   metrics, date categorization (Phase 4).
-2. Two-stage AI Creative Director (MODE A batch analysis / MODE B final
+1. Two-stage AI Creative Director (MODE A batch analysis / MODE B final
    curation) using the preserved `docs/AI_VISUAL_DIRECTOR_V2.md` prompt, with
    strict JSON schema validation outside the model (Phase 5).
-3. Google Drive business-folder delivery of selected originals with
+2. Google Drive business-folder delivery of selected originals with
    verification and rights gates (Phase 6, via n8n credentials).
-4. Nontechnical frontend: URL form, live progress, per-source errors,
+3. Nontechnical frontend: URL form, live progress, per-source errors,
    previews, Drive link (Phase 7).
-5. End-to-end QA, concurrency/disk testing, hardening (Phase 8).
+4. End-to-end QA, concurrency/disk testing, hardening (Phase 8).
 
 ## 4. Architecture overview
 
@@ -243,8 +244,9 @@ health, credential-authenticated status, and the read-only shared mount.
    `unknown`, never invented.
 3. Social items may include low-value assets (e.g. profile pictures);
    relevance judgement is deferred to the planned AI selection stage.
-4. Cross-platform duplicate detection (same photo on site + social) is
-   planned for Phase 4 preprocessing (`sha256` is already recorded).
+4. Cross-platform duplicate detection was delivered in Phase 4 (exact
+   sha256 + perceptual groups with recorded decisions; see
+   `docs/PHASE_4_REPORT.md`).
 5. `POST /jobs` is loopback-only without token auth; an n8n-side auth gate
    is on the roadmap.
 6. gallery-dl extractor sites (Instagram/Facebook) drift frequently; the pin
@@ -253,8 +255,9 @@ health, credential-authenticated status, and the read-only shared mount.
 
 ## 16. Development roadmap
 
-- **Phase 4** — media preprocessing: cross-source dedupe, FFmpeg frames,
-  quality metrics, date categorization.
+- **Phase 4** — ✅ delivered: deterministic media preprocessing (cross-source
+  dedupe, technical quality metrics, FFmpeg frames, verified-date
+  categorization) enriching the unified manifest additively.
 - **Phase 5** — AI Visual Director (two-stage MODE A/B per
   `docs/AI_VISUAL_DIRECTOR_V2.md`, strict schema validation, no invented
   assets).
