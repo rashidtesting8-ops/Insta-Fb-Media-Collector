@@ -29,7 +29,15 @@ from typing import Any
 SCHEMA_VERSION = "3.0-unified"
 
 SOCIAL_PREFIXES = {"instagram": "ig", "facebook": "fb"}
-_PLATFORM_STATUSES = ("completed", "partial_success", "failed", "invalid_url")
+_PLATFORM_STATUSES = (
+    "completed",
+    "partial_success",
+    "failed",
+    "invalid_url",
+    "restricted",
+    "rate_limited",
+    "inaccessible",
+)
 
 DOWNLOADED = "downloaded"
 DUPLICATE = "duplicate"
