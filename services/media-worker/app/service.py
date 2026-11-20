@@ -180,7 +180,7 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
     authorization and never bypasses access restrictions.
     """
     from app.collector import run_website_extraction
-    from app.manifest import merge_social_into_manifest, write_manifest
+    from app.manifest import merge_social_into_manifest, validate_against_disk, write_manifest
     from app.social_adapter import (
         SocialExtractionResult,
         run_social_extraction,
@@ -283,7 +283,21 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
                     lookback_days=int(payload.get("lookback_days") or 365),
                     permission_confirmed=bool(payload.get("social_permission_confirmed")),
                 )
+                # Final guarantee: every manifest asset that claims a file must
+                # exist on disk with a matching hash (Phase 3 acceptance #5).
+                problems = validate_against_disk(job_dir, merged)
+                if problems:
+                    issues = list((merged.get("coverage") or {}).get("issues") or [])
+                    issues = issues[:50] + [
+                        {"reason": "manifest_validation", "detail": p} for p in problems[:20]
+                    ]
+                    merged.setdefault("coverage", {})["issues"] = issues
                 write_manifest(job_dir, merged)
+                if problems:
+                    sources["manifest"] = {
+                        "status": "partial_success",
+                        "problems": problems[:20],
+                    }
             except Exception as exc:  # noqa: BLE001 — manifest failure is recorded
                 sources["manifest"] = {"status": "failed", "error": str(exc)[:240]}
 
@@ -294,7 +308,17 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
         attempted = [
             s.get("status")
             for s in final_sources.values()
-            if isinstance(s, dict) and s.get("status") in ("completed", "partial_success", "failed", "invalid_url")
+            if isinstance(s, dict)
+            and s.get("status")
+            in (
+                "completed",
+                "partial_success",
+                "failed",
+                "invalid_url",
+                "restricted",
+                "rate_limited",
+                "inaccessible",
+            )
         ]
         if not attempted:
             job_status = "failed"
