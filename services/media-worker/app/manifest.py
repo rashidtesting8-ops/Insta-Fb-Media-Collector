@@ -220,7 +220,7 @@ def validate_against_disk(job_dir: str | Path, manifest: dict[str, Any]) -> list
             problems.append(f"asset_id missing or duplicated: {asset_id!r}")
             continue
         seen_ids.add(asset_id)
-        if item.get("extraction_status") != DOWNLOADED:
+        if item.get("extraction_status") not in (DOWNLOADED, "extracted_frame"):
             continue
         rel = item.get("local_path")
         if not rel or isinstance(rel, str) and (rel.startswith("/") or ".." in Path(rel).parts):
