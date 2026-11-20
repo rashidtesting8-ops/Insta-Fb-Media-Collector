@@ -8,14 +8,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from PIL import Image, ImageFilter
 
 from app.manifest import validate_against_disk
 from app.preprocessing import run_media_preprocessing
+
+# Video tests need ffmpeg to synthesize project-owned media; environments
+# without it skip honestly instead of erroring.
+pytestmark_ffmpeg = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None, reason="ffmpeg not available on this runner"
+)
 
 CUTOFF = (datetime.now(UTC) - timedelta(days=365)).date().isoformat()
 
@@ -253,6 +261,7 @@ def test_blur_and_exposure_metrics_are_deterministic(tmp_path):
     assert q["web_0001_sharp"]["crop_windows"]["1:1"]["x"] > 0
 
 
+@pytestmark_ffmpeg
 def test_video_frames_extracted_bounded_and_referenced(tmp_path):
     job = tmp_path / "job"
     job.mkdir()
@@ -290,6 +299,7 @@ def test_video_frames_extracted_bounded_and_referenced(tmp_path):
     assert validate_against_disk(job, enriched) == []
 
 
+@pytestmark_ffmpeg
 def test_video_duration_limit_is_respected(tmp_path):
     job = tmp_path / "job"
     job.mkdir()
@@ -310,6 +320,7 @@ def test_video_duration_limit_is_respected(tmp_path):
     assert result.status == "partial"
 
 
+@pytestmark_ffmpeg
 def test_invalid_video_reports_probe_failure(tmp_path):
     job = tmp_path / "job"
     job.mkdir()
