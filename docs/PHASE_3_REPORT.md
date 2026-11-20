@@ -1,6 +1,6 @@
 # Phase 3 Report — Social Media Collection Engine (Instagram + Facebook)
 
-**Date:** 20 November 2026
+**Date:** 20 November 2026 (hardening addendum same day — §7)
 **Scope delivered:** gallery-dl-primary social extraction integrated into the worker (separate Instagram and Facebook adapters), Instaloader Instagram fallback, yt-dlp fallback for supported single Facebook video/post URLs, 365-day lookback with honest date verification, configurable bounded limits, operator-consent gate, unified multi-source manifest, offline mocked tests, and bounded authorized live smoke tests with truthful outcomes.
 **Out of scope (unchanged):** AI Visual Director, Google Drive, frontend, production deployment, Docker cleanup.
 
@@ -66,5 +66,60 @@ Post-run battery: worker/n8n(×2) healthy; probe HTTP 200 `auth=verified` + sent
 ## 6. Phase 4 readiness
 
 Ready: website + social sources live and honest; unified manifest on D: with sha-verified assets; per-source isolation proven; consent + bounds wired end-to-end; both n8n instances and the credential/probe path intact. Phase 4 (media processing: hashes/dedupe across sources, video frames via FFmpeg, quality metrics, date categorization — preparing AI payloads) can proceed on approval; the manifest already carries everything Phase 4/5 need (real pixels on disk, sha256, dims, dates, rights flags).
+
+## 7. Acceptance hardening (same-day addendum)
+
+The refined Phase 3 acceptance requirements were implemented and re-verified:
+
+1. **No first-N-as-coverage proof:** every social section now carries a
+   `coverage` block —
+   `discovery_selection: "bounded_sample_not_full_coverage"`,
+   `full_coverage_claimed: false`, `cutoff_date`, `discovery_limit_files`,
+   and the date-filter semantics. Nothing anywhere claims complete 365-day
+   extraction.
+2. **Six-way source statuses:** `completed`, `partial_success`,
+   `restricted` (login walls / access-gate envelopes), `rate_limited`
+   (never retried, never fallback-hammered), `inaccessible`
+   (not-found/unreachable), `failed` (tool/adapter errors), plus
+   `permission_required` / `invalid_url` / `not_requested`. Job-level
+   aggregation was extended to the new statuses.
+3. **Fallbacks stay appropriate:** Instaloader (Instagram only) and yt-dlp
+   (single Facebook post/video URLs only) fire only on access-gate or
+   extractor-broken reasons; never on rate limits or not-found. No login,
+   cookies, CAPTCHA bypass, or restriction circumvention exists anywhere.
+4. **Dates:** verified platform timestamps are preserved with
+   `date_status: "verified"`; everything else is `unknown`; only *verified*
+   out-of-range dates are filtered (regression-tested at the boundary).
+5. **Disk-backed manifest:** social items are now validated against disk at
+   write time (sha + size + path safety), and the **final merged manifest**
+   is re-validated in the service before persistence — any problem is
+   recorded in `sources.manifest` and in the manifest's coverage issues.
+6. **Independent sources:** unchanged and regression-covered (a restricted
+   Facebook never disturbs website/Instagram results).
+7. **New regressions (6):** access-gate envelope → `restricted`;
+   not-found → `inaccessible` (no fallback); files+gate → `partial_success`
+   (the live Facebook pattern); date boundary (in-range kept, out-of-range
+   dropped, undated kept); duplicate fallback posts deduped; coverage
+   metadata recorded and no full-coverage language present.
+8. **Tool execution ledger:** each section records `tools_executed` —
+   tool name, live-captured version (offline/mocked runs skip the version
+   probe), and per-tool outcome.
+9. **Coverage honesty:** as (1) — enforced structurally, asserted by test.
+10. **Final regression:** **29/29 offline tests pass** (10 website
+    Phase-2 + 19 social), plus the live Phase-1 battery (worker `/health`,
+    both n8n `/healthz`, authenticated probe HTTP 200) and a fresh live
+    Phase-2 website-only job (`partial_success`, 3 files — unchanged
+    honest profile).
+
+**Post-hardening live evidence (job `f8ff89faa0ad48738e5f92542177fbec`,
+consent-gated, max 3 social files):** Instagram — `gallery-dl(1.32.20,
+gallery_dl_error_6)` → `instaloader(4.16, downloaded_1)` → 1 file,
+`partial_success`; Facebook — `gallery-dl(1.32.20, gallery_dl_error_6)` →
+3 files, `partial_success`; website 3 files; overall job `partial_success`;
+no source falsely marked complete; no fallback fired after a rate limit.
+
+**Note:** these hardening changes are local-first and **not yet pushed** to
+the GitHub baseline (committing them is the recommended next git step, e.g.
+`feat/phase3-acceptance-hardening` → PR → `main`).
 
 **Phase 3 complete. Stopping here per instruction — Phase 4 (AI integration / Google Drive) not started.**

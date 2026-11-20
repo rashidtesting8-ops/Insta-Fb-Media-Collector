@@ -47,13 +47,55 @@ from app.legacy_social_collect import (
     classify_social_failure,
     collect_social,
 )
-from app.manifest import build_social_item
+from app.manifest import build_social_item, validate_against_disk
 
 RunnerFn = Callable[[list[str], Path], tuple[int, str]]
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif"}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | {".mp4", ".webm", ".mov"}
 MAX_SOCIAL_ITEM_BYTES = 25 * 1024 * 1024  # mirrors the legacy cap
+
+# ---------------------------------------------------------------------------
+# Source-level status taxonomy (Phase 3 acceptance requirement #2).
+#   completed        - files downloaded, no gating/failure evidence
+#   partial_success  - some files plus gating/failure evidence (or fallback use)
+#   restricted       - platform access restriction (login wall / access gate)
+#   rate_limited     - rate limited; never retried or fallback-hammered
+#   inaccessible     - source/profile not found or unreachable
+#   failed           - tool/adapter errors without a more precise class
+#   permission_required / invalid_url / not_requested - pre-execution states
+# ---------------------------------------------------------------------------
+_RATE_LIMITED_REASONS = {"rate_limited"}
+_RESTRICTED_REASONS = {"login_required", "gallery_dl_error_6"}
+_INACCESSIBLE_REASONS = {"gallery_dl_error_4", "not_found", "profile_not_found"}
+
+
+def _empty_source_status(reason: str | None) -> str:
+    if reason in _RATE_LIMITED_REASONS:
+        return "rate_limited"
+    if reason in _RESTRICTED_REASONS:
+        return "restricted"
+    if reason in _INACCESSIBLE_REASONS:
+        return "inaccessible"
+    return "failed"
+
+
+def _tool_version(executable: str, runner: RunnerFn | None) -> str | None:
+    """Best-effort tool version capture. Live mode only: with a test runner
+    injected (offline mode) no extra subprocess is fired."""
+    if runner is not None:
+        return None
+    try:
+        proc = subprocess.run(
+            [executable, "--version"], capture_output=True, text=True, timeout=15
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = (proc.stdout or proc.stderr or "").strip().splitlines()
+    return lines[0][:60] if lines else None
+
 
 _FALLBACK_IG_REASONS = {
     "login_required",
@@ -79,7 +121,9 @@ class SocialExtractionResult:
     job_id: str
     platform: str
     url: str
-    status: str  # completed | partial_success | failed | permission_required | invalid_url | not_requested
+    # completed | partial_success | restricted | rate_limited | inaccessible |
+    # failed | permission_required | invalid_url | not_requested
+    status: str
     files_added: int = 0
     duplicates: int = 0
     bytes_downloaded: int = 0
@@ -88,6 +132,11 @@ class SocialExtractionResult:
     fallback_outcome: str | None = None
     items: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Exactly which tools executed for this source and their outcomes (req #8).
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    # Honest coverage metadata (req #1/#9): a bounded sample, never a claim of
+    # full 365-day extraction.
+    coverage: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -103,6 +152,8 @@ def section_from_result(result: SocialExtractionResult) -> dict[str, Any]:
         "url": result.url,
         "fallback_attempted": result.fallback_attempted,
         "fallback_outcome": result.fallback_outcome,
+        "tools_executed": result.tools,
+        "coverage": result.coverage,
         "counts": {
             "files_added": result.files_added,
             "duplicates": result.duplicates,
@@ -430,6 +481,13 @@ def run_social_extraction(
 
     fallback_rows: list[dict[str, Any]] = []
     legacy_reason, diagnostic = _refine_gallery_reason(legacy)
+    result.tools.append(
+        {
+            "tool": "gallery-dl",
+            "version": _tool_version("gallery-dl", runner),
+            "outcome": legacy_reason or f"downloaded_{moved}",
+        }
+    )
     if diagnostic:
         result.notes.append(f"extractor diagnostic: {diagnostic}")
     if legacy_reason == "unknown" and not normalized:
@@ -452,6 +510,13 @@ def run_social_extraction(
                     timeout=timeout, runner=instaloader_runner,
                 )
                 result.fallback_outcome = fb_reason or f"downloaded_{len(fallback_rows)}"
+                result.tools.append(
+                    {
+                        "tool": "instaloader",
+                        "version": _tool_version("instaloader", instaloader_runner),
+                        "outcome": result.fallback_outcome,
+                    }
+                )
                 for row in fallback_rows:
                     src = stage / str(row["file"])
                     if not src.is_file():
@@ -474,6 +539,13 @@ def run_social_extraction(
                     url, stage, max_files=max_files, timeout=timeout, runner=ytdlp_runner,
                 )
                 result.fallback_outcome = fb_reason or f"downloaded_{len(fallback_rows)}"
+                result.tools.append(
+                    {
+                        "tool": "yt-dlp",
+                        "version": _tool_version("yt-dlp", ytdlp_runner),
+                        "outcome": result.fallback_outcome,
+                    }
+                )
                 for row in fallback_rows:
                     src = stage / str(row["file"])
                     if not src.is_file():
@@ -516,8 +588,34 @@ def run_social_extraction(
     result.duplicates = dupes
     result.bytes_downloaded = sum(int(i.get("bytes") or 0) for i in items)
 
+    # Honest coverage metadata (req #1/#9): this is a bounded, date-filtered
+    # SAMPLE — never presented as complete 365-day coverage.
+    result.coverage = {
+        "lookback_days": lookback_days,
+        "cutoff_date": (datetime.now(UTC) - timedelta(days=lookback_days)).date().isoformat(),
+        "discovery_limit_files": max_files,
+        "discovery_selection": "bounded_sample_not_full_coverage",
+        "date_filter": "only_verified_dates_outside_lookback_are_filtered",
+        "full_coverage_claimed": False,
+    }
+
+    # Every manifest asset must reference an existing file on disk (req #5).
+    problems = validate_against_disk(job_dir, {"assets": items})
+    if problems:
+        for item in items:
+            if item["extraction_status"] == "downloaded" and any(
+                p.startswith(item["asset_id"] + ":") for p in problems
+            ):
+                item["extraction_status"] = "integrity_mismatch"
+                item["local_path"] = None
+        result.notes.append(
+            f"{len(problems)} manifest validation problem(s); see coverage.issues."
+        )
+
     if items:
         result.status = "completed"
+        if legacy_reason:
+            result.reason = legacy_reason
         result.notes.append(
             "Public visibility is not permission to reuse; rights remain unverified "
             "until reviewed."
@@ -529,10 +627,21 @@ def run_social_extraction(
                 f"fallback={result.fallback_attempted}:{result.fallback_outcome}."
             )
     else:
-        result.status = "failed"
+        result.status = _empty_source_status(legacy_reason)
         result.reason = legacy_reason or "no_media_accessible"
-        result.notes.append(
-            "No media was accessible with permitted anonymous access. This is an "
-            "honest limitation, not a job success."
-        )
+        if result.status == "rate_limited":
+            result.notes.append(
+                "The platform rate-limited this attempt. No retry or fallback was "
+                "performed, by design."
+            )
+        elif result.status == "restricted":
+            result.notes.append(
+                "The platform restricted anonymous access. No login, cookie, or "
+                "restriction bypass was attempted, by design."
+            )
+        else:
+            result.notes.append(
+                "No media was accessible with permitted anonymous access. This is an "
+                "honest limitation, not a job success."
+            )
     return result
