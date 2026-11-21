@@ -286,3 +286,44 @@ Add these to the **local** `.env` (use `.env.example` as the template), then rec
 **Fix for the next bounded run:** MODE A batch size is now env-configurable (`AI_BATCH_SIZE`, conservative default **3** to match the model's documented image limit) and the worker service uses it. Offline suite after all changes: **78 passed** (68 prior + 10 transport/config tests). Worker recreated with `--no-deps`; both n8n instances and all data untouched.
 
 **Remaining blocker:** live MODE A/B validation needs a **fresh authorization for another ≤3-request run** with `AI_BATCH_SIZE=3` (4 assets → 2 MODE A batches + MODE B). 403/1010 is gone; the outstanding item is purely the model's per-request image limit and the exhausted request budget. Phase 6 not started.
+
+---
+
+## 15. FINAL bounded live Groq test (after PR #5 merge) — **BLOCKED: 413 payload size + 429 rate limit**
+
+**Setup verified:** latest `main` pulled at merge commit `0e4b0a2d79797fe079cf78e91a3e543a27533c84` (PR #5 merged; Actions run #14 passed). `requests.post` transport with `verify=True` active in the worker (no `urllib.request`); read-only unauthenticated models GET from the worker returned **401 with `cf-ray: a5deac29bfbf374e-KHI`** — no 403/1010. Worker-only rebuild/recreate (`--no-deps`); both n8n instances intact. Config: `AI_PROVIDER=openai_compatible`, `AI_MODEL=qwen/qwen3.8-27b`, request cap **3**, cost ceiling **$0.25**, prices configured (`0.0008`/`0.004` per 1k), `batch_size=3` and `max_retries=0` enforced by the test script. Prompts verified to contain "STRICT JSON" (Groq `json_object` requirement).
+
+**Job:** `a46ad72…` on the D: mount — 12 manifest rows, exactly **4 processed image assets** (the rest are honest failure/unsupported rows). MODE A batches planned 3+1 images, then MODE B = **3 provider requests total**.
+
+**Actual outcomes (verbatim error prefixes, no secret values):**
+1. MODE A batch 1 → **HTTP 413**: `Request too large for model qwen/qwen3.8-27b in organization … service tier …` (3 image data-URL payloads + prompt exceeded the model's request-size limit).
+2. MODE A batch 2 → **HTTP 429**: `Rate limit reached for model qwen/qwen3.8-27b in organization … service tier …`.
+3. `max_retries=0` → **no retry**; pipeline status `failed`, `mode_a_count: 0`, no MODE B call (budget preserved).
+
+**Genuine results:** model `qwen/qwen3.8-27b`, provider `openai_compatible`, `mock: false` on the attempted run; **2 provider requests attempted, 0 tokens billed, $0.00 cost** (both rejections pre-inference). No MODE A analyses, no MODE B curation, no non-mock `curation.json` produced. The earlier mock curation file on D: remains intact and **labeled `mock: true`** — it was not relabelled as live success. No alternate model, signature, proxy, or repeated retry was attempted.
+
+**Root causes of this attempt (both provider-side constraints, not auth/network):**
+- 413: payload-size limit for this model. Remediation candidate (requires fresh approval): reduce image dimensions/byte cap further (e.g. 512 px / ≤400 KB per image) and/or `AI_BATCH_SIZE=1`.
+- 429: Groq rate limit for this model/service tier. Remediation candidate (requires fresh approval): pace requests and/or raise the account tier limit; the adapter already honors 429 with bounded backoff when retries are enabled.
+
+**Regression/health after the attempt:** offline suite **78 passed**; worker `/health`, new n8n and legacy n8n `/healthz` OK; authenticated probe HTTP 200 `auth=verified`; volumes/jobs/backups untouched. **Live AI acceptance remains BLOCKED on provider-side payload/rate constraints; Phase 6 not started.**
+
+---
+
+## 16. Payload optimization + rate-limit hardening and minimal live run (branch `fix/phase5-groq-payload-rate-limits`)
+
+**Provider limits reviewed (Groq docs):** `qwen/qwen3.8-27b` base limits 30 RPM / 1K RPD / 8K TPM / 200K TPD; documented headers `retry-after`, `x-ratelimit-remaining-requests` (RPD), `x-ratelimit-remaining-tokens` (TPM), reset headers; 429 is the rate-limit signal. A read-only models GET with the configured key returned **200** (account permitted). Smaller images alone are not assumed to solve all limits — batch size and pacing were changed too.
+
+**Implemented:**
+- Configurable `AI_MAX_IMAGE_DIM` (512), `AI_MAX_IMAGE_BYTES` (300 KB encoded target), `AI_MAX_REQUEST_BYTES` (1 MB full JSON body including base64 expansion), `AI_MIN_REQUEST_SPACING_S` (2 s), `AI_BATCH_SIZE` (set to **1** locally), all forwarded to the worker in `compose.media.yml` and documented in `.env.example`.
+- JPEG optimization with adaptive quality/downscale to the byte target; EXIF orientation applied on a copy (original `exif_orientation` stays intact); originals never overwritten.
+- **Local preflight** rejects oversized bodies with `RequestTooLargeError` before any HTTP call (no repeated 413s); 413 is never retried.
+- 429 handling parses `Retry-After` (bounded), records a non-secret rate-limit header snapshot, honors short retry windows; explicit `RateLimitedError` for quota exhaustion; no key/proxy/account rotation; 401/403 remain authoritative.
+- Pipeline now preserves MODE A results, coverage and usage on MODE B failure (honest partial bookkeeping), and drops model-invented `missing_assets[].category` values with a recorded warning instead of silently relabeling them.
+
+**Minimal live run (1 real D: image derived from job `a46ad72…`, no new scraping, budget 3 requests / $0.25):**
+- **MODE A SUCCEEDED with real pixels**: the real vision model accepted the 512 px / ≤300 KB image payload and the pipeline advanced to MODE B. (MODE A analyses were in-memory; they are no longer discarded on MODE B failure after this branch's fix.)
+- **MODE B failed strict schema validation**: the model emitted `missing_assets[].category` outside the V2 enum (`ModeBResponse` rejected it). With `max_retries=0` there was no uncontrolled retry. **2 of 3 provider requests used; no further live call was made.** Token/cost figures from that run were not persisted by the old early-return path (now fixed for future runs).
+- **No non-mock `curation.json` produced.** The earlier mock curation on D: remains labeled `mock: true` and was not relabelled.
+
+**Offline regression suite:** new tests cover 512 px resizing, JPEG byte target, base64 expansion, full-body preflight, 413 no-retry, 429 Retry-After, quota exhaustion, request pacing, and the two new MODE B honesty fixes, plus all Phase 1–5 regressions (final count recorded after the rebuild). **Phase 6 not started; MODE B live curation remains pending a fresh bounded run with the fixed validator.**

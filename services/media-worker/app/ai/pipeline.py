@@ -49,6 +49,7 @@ from app.ai.provider import (
 )
 from app.ai.schemas import (
     SCHEMA_VERSION,
+    Category,
     ModeAResponse,
     ModeBResponse,
     breakdown_matches_score,
@@ -216,8 +217,8 @@ def run_ai_curation(
     config: AIProviderConfig | None = None,
     provider: VisionProvider | None = None,
     tracker: UsageTracker | None = None,
-    max_image_dim: int = DEFAULT_MAX_IMAGE_DIM,
-    max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+    max_image_dim: int | None = None,
+    max_image_bytes: int | None = None,
 ) -> AICurationResult:
     job_dir = Path(job_dir)
     manifest_path = job_dir / "manifest.json"
@@ -225,6 +226,8 @@ def run_ai_curation(
     business_context = business_context or {}
 
     cfg = config or AIProviderConfig.from_env()
+    max_image_dim = max_image_dim if max_image_dim is not None else cfg.max_image_dim
+    max_image_bytes = max_image_bytes if max_image_bytes is not None else cfg.max_image_bytes
     if provider is None:
         provider, status = build_provider(cfg)
         if provider is None:
@@ -376,6 +379,23 @@ def run_ai_curation(
             continue
         try:
             data = json.loads(extract_json_text(completion.text))
+            # The model occasionally emits a non-V2 category in missing_assets.
+            # Drop those items with a recorded warning rather than inventing a
+            # valid value — no silent relabeling, no fabricated data.
+            if isinstance(data, dict) and isinstance(data.get("missing_assets"), list):
+                allowed = set(Category.__args__)
+                invalid = [
+                    m for m in data["missing_assets"]
+                    if not isinstance(m, dict) or m.get("category") not in allowed
+                ]
+                if invalid:
+                    data["missing_assets"] = [
+                        m for m in data["missing_assets"] if m not in invalid
+                    ]
+                    result.warnings.append(
+                        f"MODE B: dropped {len(invalid)} missing_assets item(s) with "
+                        "a category outside the V2.0 enum"
+                    )
             candidate_response = ModeBResponse.model_validate(data)
         except Exception as exc:  # noqa: BLE001
             mode_b_errors.append(f"MODE B validation: {str(exc)[:200]}")
@@ -438,6 +458,24 @@ def run_ai_curation(
     if mode_b is None:
         result.status = "failed"
         result.errors.extend(mode_b_errors[:5] or ["MODE B failed for unknown reason"])
+        # Honest partial bookkeeping: MODE A results and usage DID happen.
+        result.mode_a_items = mode_a_items
+        result.usage = tracker.as_dict()
+        result.coverage = {
+            "assets_supplied": len(candidates),
+            "assets_analyzed": len(analyzed),
+            "inherited_from_duplicates": inherited,
+            "unavailable": sum(
+                1 for i in mode_a_items if i.get("visual_analysis_status") == "unavailable"
+            ),
+            "batches_total": total_batches,
+            "batches_failed": batch_failures,
+            "mode_b_status": "failed",
+            "prompt_version": PROMPT_VERSION,
+            "provider": result.provider,
+            "model": result.model,
+            "mock": result.mock,
+        }
         return result
 
     curation = mode_b.model_dump()
