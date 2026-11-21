@@ -455,6 +455,52 @@ def get_job(job_id: str) -> dict[str, Any]:
     return rec
 
 
+@app.get("/jobs/{job_id}/delivery-plan")
+def get_delivery_plan(job_id: str, business_name: str = "") -> dict[str, Any]:
+    rec = fetch(job_id)
+    if rec is None:
+        raise HTTPException(404, "Unknown job")
+    from app.delivery import build_delivery_plan
+
+    return build_delivery_plan(Path(DATA_DIR) / job_id, job_id, business_name)
+
+
+@app.post("/jobs/{job_id}/delivery-result")
+def post_delivery_result(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    rec = fetch(job_id)
+    if rec is None:
+        raise HTTPException(404, "Unknown job")
+    from app.delivery import finalize_delivery, json_load
+    from app.manifest import atomic_write_json
+
+    job_dir = Path(DATA_DIR) / job_id
+    plan = json_load(job_dir / "delivery.json") if (job_dir / "delivery.json").is_file() else {}
+    plan = plan.get("plan") or plan  # tolerate a plan echoed back by n8n
+    result = finalize_delivery(
+        job_dir,
+        plan,
+        list(payload.get("uploads") or []),
+        authorization_confirmed=bool(payload.get("authorization_confirmed")),
+    )
+    result["drive_folder_id"] = payload.get("drive_folder_id")
+    result["drive_folder_link"] = payload.get("drive_folder_link")
+    atomic_write_json(job_dir / "delivery.json", result)
+    return result
+
+
+@app.get("/jobs/{job_id}/delivery")
+def get_delivery(job_id: str) -> dict[str, Any]:
+    rec = fetch(job_id)
+    if rec is None:
+        raise HTTPException(404, "Unknown job")
+    from app.delivery import json_load
+
+    path = Path(DATA_DIR) / job_id / "delivery.json"
+    if path.is_file():
+        return json_load(path)
+    return {"job_id": job_id, "status": "not_started", "note": "No delivery recorded for this job."}
+
+
 @app.get("/jobs/{job_id}/curation")
 def get_curation(job_id: str) -> dict[str, Any]:
     """Serve the Phase 5 curation result (MODE B envelope) for a job."""
