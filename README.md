@@ -39,7 +39,7 @@ permitted media for that business. The platform separates concerns:
 | Website media collector + unified manifest (Phase 2) | ✅ Done | 10 offline tests + bounded live smoke (`docs/PHASE_2_REPORT.md`) |
 | Instagram/Facebook collection engine (Phase 3) | ✅ Done | 13 offline mocked tests + bounded consent-gated live smoke (`docs/PHASE_3_REPORT.md`) |
 | Media preprocessing: dedupe, quality metrics, video frames, date categories (Phase 4) | ✅ Done | 14 offline tests + live end-to-end evidence (`docs/PHASE_4_REPORT.md`) |
-| AI Visual Director selection (Phase 5) | ⏳ Planned | prompt assets preserved in `docs/` |
+| AI Visual Director V2.0 MODE A/B, provider adapter, strict validation (Phase 5) | ✅ Implemented (mock-tested; **live provider validation pending — no AI credentials configured**) | `docs/PHASE_5_REPORT.md` |
 | Google Drive delivery (Phase 6) | ⏳ Planned | — |
 | Frontend (Phase 7) | ⏳ Planned | — |
 | Production hardening (Phase 8) | ⏳ Planned | — |
