@@ -24,7 +24,9 @@ Design:
 from __future__ import annotations
 
 import base64
+import io
 import json
+import math
 import os
 import re
 import time
@@ -32,9 +34,25 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import requests
+from PIL import Image
+
+GROQ_ACCEPTANCE_MODEL = "qwen/qwen3.8-27b"
+GROQ_ACCEPTANCE_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+# Reserve the full model context as an input-token upper bound, including image tokens.
+GROQ_ACCEPTANCE_INPUT_TOKEN_BOUND = 131_072
+# Published Qwen rates in USD per 1,000 tokens. Use higher account rates if configured.
+GROQ_ACCEPTANCE_INPUT_PRICE = 0.0008
+GROQ_ACCEPTANCE_OUTPUT_PRICE = 0.004
 
 SecretPattern = re.compile(r"(?i)(authorization|api[_-]?key|bearer|token)\s*[=:]\s*\S+")
 BearerPattern = re.compile(r"(?i)\bBearer\s+\S+")
+_SENSITIVE_DIAGNOSTIC = re.compile(
+    r"https?://[^\s\"'<>]+|\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b|"
+    r"\b(?:gsk|org|proj|sk)[_-][A-Za-z0-9_-]{8,}\b",
+    re.IGNORECASE,
+)
+_PROVIDER_CODE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_RATE_VALUE = re.compile(r"\d+(?:\.\d+)?|(?:\d+(?:\.\d+)?(?:ms|s|m|h|d)){1,5}")
 
 
 def scrub_secrets(text: str) -> str:
@@ -42,6 +60,14 @@ def scrub_secrets(text: str) -> str:
     # before the value could be matched, leaving the secret in the tail.
     cleaned = BearerPattern.sub("Bearer [REDACTED]", text or "")
     return SecretPattern.sub(r"\1=[REDACTED]", cleaned)
+
+
+def _safe_provider_message(text: str, credential: str) -> str:
+    if credential:
+        text = text.replace(credential, "[REDACTED]")
+    if re.search(r"data:[^\s]*;base64|ASSET_SPECS|VALIDATED_ANALYSES|[\"']messages[\"']\s*:", text, re.I):
+        return "Provider message omitted because it echoed request content"
+    return " ".join(_SENSITIVE_DIAGNOSTIC.sub("[REDACTED]", scrub_secrets(text)).split())[:240]
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -68,6 +94,7 @@ class AIUsage:
     output_tokens: int = 0
     estimated_cost_usd: float = 0.0
     rate_limit_snapshot: dict[str, str] = field(default_factory=dict)
+    provider_error: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         result = {
@@ -79,6 +106,8 @@ class AIUsage:
         }
         if self.rate_limit_snapshot:
             result["rate_limit_snapshot"] = self.rate_limit_snapshot
+        if self.provider_error:
+            result["provider_error"] = self.provider_error
         return result
 
 
@@ -101,6 +130,32 @@ class AIProviderConfig:
     min_request_spacing_s: float = 2.0  # gentle pacing for free-tier RPM/TPM
     price_in_per_1k: float = 0.0
     price_out_per_1k: float = 0.0
+    mode_a_max_output_tokens: int = 4000
+    mode_b_max_output_tokens: int = 4000
+    bounded_acceptance: bool = False
+
+    def __post_init__(self) -> None:
+        if min(self.mode_a_max_output_tokens, self.mode_b_max_output_tokens) < 1:
+            raise ValueError("Output-token caps must be positive")
+        if not self.bounded_acceptance:
+            return
+        if (self.provider, self.model, self.endpoint) != (
+            "openai_compatible", GROQ_ACCEPTANCE_MODEL, GROQ_ACCEPTANCE_ENDPOINT
+        ):
+            raise ValueError("Bounded acceptance requires the configured Groq Qwen endpoint and model")
+        for value in (self.price_in_per_1k, self.price_out_per_1k, self.max_cost_usd_per_job):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("Bounded acceptance requires positive finite pricing and cost limits")
+        self.price_in_per_1k = max(self.price_in_per_1k, GROQ_ACCEPTANCE_INPUT_PRICE)
+        self.price_out_per_1k = max(self.price_out_per_1k, GROQ_ACCEPTANCE_OUTPUT_PRICE)
+        self.max_retries = 0
+        self.max_requests_per_job = min(self.max_requests_per_job, 2)
+        self.max_cost_usd_per_job = min(self.max_cost_usd_per_job, 0.25)
+        self.max_image_dim = min(self.max_image_dim, 256)
+        self.max_image_bytes = min(self.max_image_bytes, 100_000)
+        self.batch_size = 1
+        self.mode_a_max_output_tokens = min(self.mode_a_max_output_tokens, 1200)
+        self.mode_b_max_output_tokens = min(self.mode_b_max_output_tokens, 1800)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "AIProviderConfig":
@@ -121,6 +176,9 @@ class AIProviderConfig:
             min_request_spacing_s=float(e.get("AI_MIN_REQUEST_SPACING_S") or 2.0),
             price_in_per_1k=float(e.get("AI_PRICE_IN_PER_1K") or 0.0),
             price_out_per_1k=float(e.get("AI_PRICE_OUT_PER_1K") or 0.0),
+            mode_a_max_output_tokens=int(e.get("AI_MODE_A_MAX_OUTPUT_TOKENS") or 4000),
+            mode_b_max_output_tokens=int(e.get("AI_MODE_B_MAX_OUTPUT_TOKENS") or 4000),
+            bounded_acceptance=e.get("AI_BOUNDED_ACCEPTANCE") == "1",
         )
 
 
@@ -160,14 +218,29 @@ class UsageTracker:
     def record(self, usage: dict[str, Any], retries: int) -> None:
         self.usage.requests += 1
         self.usage.retries += retries
+        self.record_tokens(usage)
+
+    def reserve_request(self, max_output_tokens: int, *, retry: bool) -> float:
+        self.pre_flight()
+        reservation = 0.0
+        if self.config.bounded_acceptance:
+            reservation = self._cost(GROQ_ACCEPTANCE_INPUT_TOKEN_BOUND, max_output_tokens)
+            if self.usage.estimated_cost_usd + reservation > self.config.max_cost_usd_per_job:
+                raise BudgetExceededError("Worst-case next request would exceed the AI cost budget")
+        self.usage.requests += 1
+        self.usage.retries += int(retry)
+        self.usage.estimated_cost_usd += reservation
+        return reservation
+
+    def record_tokens(self, usage: dict[str, Any], *, reservation: float = 0.0) -> None:
         self.usage.input_tokens += int(usage.get("input_tokens") or 0)
         self.usage.output_tokens += int(usage.get("output_tokens") or 0)
         in_tok = int(usage.get("input_tokens") or 0)
         out_tok = int(usage.get("output_tokens") or 0)
-        self.usage.estimated_cost_usd += (
-            in_tok / 1000.0 * self.config.price_in_per_1k
-            + out_tok / 1000.0 * self.config.price_out_per_1k
-        )
+        self.usage.estimated_cost_usd += self._cost(in_tok, out_tok) - reservation
+
+    def _cost(self, input_tokens: int, output_tokens: int) -> float:
+        return (input_tokens * self.config.price_in_per_1k + output_tokens * self.config.price_out_per_1k) / 1000
 
     def as_dict(self) -> dict[str, Any]:
         return self.usage.as_dict()
@@ -176,6 +249,9 @@ class UsageTracker:
         """Non-secret rate-limit header snapshot (Groq documents these)."""
         try:
             for key in (
+                "retry-after",
+                "x-ratelimit-limit-requests",
+                "x-ratelimit-limit-tokens",
                 "x-ratelimit-remaining-requests",
                 "x-ratelimit-remaining-tokens",
                 "x-ratelimit-reset-requests",
@@ -183,9 +259,44 @@ class UsageTracker:
             ):
                 value = headers.get(key) if headers else None
                 if value is not None:
-                    self.usage.rate_limit_snapshot[key] = str(value)[:60]
+                    value = str(value).strip()
+                    if value != self.config.api_key and len(value) <= 40 and _RATE_VALUE.fullmatch(value):
+                        self.usage.rate_limit_snapshot[key] = value
         except (AttributeError, TypeError):
             pass
+
+    def record_http_error(self, response: requests.Response | None) -> dict[str, Any]:
+        details: dict[str, Any] = {"http_status": response.status_code if response is not None else 0}
+        if response is None:
+            details["message"] = "Provider HTTP response unavailable"
+        else:
+            self.record_headers(response.headers)
+            try:
+                data = response.json()
+            except ValueError:
+                data = None
+            error = data.get("error") if isinstance(data, dict) else None
+            message = error.get("message") if isinstance(error, dict) else None
+            if isinstance(error, dict):
+                for key in ("code", "type"):
+                    value = error.get(key)
+                    if isinstance(value, str) and _PROVIDER_CODE.fullmatch(value):
+                        safe = _safe_provider_message(value, self.config.api_key)
+                        if _PROVIDER_CODE.fullmatch(safe):
+                            details[key] = safe
+            if not isinstance(message, str):
+                # Do not persist an unstructured response body. Retain only known
+                # categories for retry decisions with providers that send plain text.
+                raw = response.text.lower()
+                message = next((label for marker, label in (
+                    ("quota", "provider quota exhausted"),
+                    ("daily", "provider daily limit"),
+                    ("too large", "provider request too large"),
+                    ("rate limit", "provider rate limited"),
+                ) if marker in raw), "Provider returned an unstructured error")
+            details["message"] = _safe_provider_message(message, self.config.api_key)
+        self.usage.provider_error = details
+        return details
 
 
 class VisionProvider:
@@ -433,6 +544,23 @@ class OpenAICompatibleProvider(VisionProvider):
         images: list[ImagePayload],
         tracker: UsageTracker,
     ) -> CompletionResult:
+        if self.config.bounded_acceptance:
+            tracker.pre_flight()
+            if tracker.config != self.config:
+                raise ValueError("Bounded acceptance requires a matching usage tracker")
+            if len(images) != (1 if tracker.usage.requests == 0 else 0):
+                raise ValueError("Bounded acceptance requires one MODE A image and text-only MODE B")
+            if images:
+                image = images[0]
+                if image.mime != "image/jpeg" or len(image.data) > self.config.max_image_bytes:
+                    raise ValueError("Bounded acceptance image must be a JPEG within the byte cap")
+                with Image.open(io.BytesIO(image.data)) as decoded:
+                    if decoded.format != "JPEG" or max(decoded.size) > self.config.max_image_dim:
+                        raise ValueError("Bounded acceptance image exceeds the JPEG dimension cap")
+                    decoded.verify()
+        max_output_tokens = (
+            self.config.mode_a_max_output_tokens if images else self.config.mode_b_max_output_tokens
+        )
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for image in images:
             b64 = base64.b64encode(image.data).decode("ascii")
@@ -453,9 +581,13 @@ class OpenAICompatibleProvider(VisionProvider):
             "temperature": 0.2,
             # The pipeline always requires strict JSON; this model declares
             # json_mode support. Bounded cap large enough for a full batch.
-            "max_tokens": 4000,
             "response_format": {"type": "json_object"},
         }
+        if self.config.bounded_acceptance:
+            body["max_completion_tokens"] = max_output_tokens
+            body["reasoning_effort"] = "none"
+        else:
+            body["max_tokens"] = max_output_tokens
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
@@ -477,7 +609,7 @@ class OpenAICompatibleProvider(VisionProvider):
             if due > 0:
                 self._sleep(due)
             self._last_request = time.monotonic()
-            tracker.pre_flight()
+            reservation = tracker.reserve_request(max_output_tokens, retry=attempt > 0)
             try:
                 response = self._transport(
                     {
@@ -488,11 +620,17 @@ class OpenAICompatibleProvider(VisionProvider):
                     }
                 )
                 usage_raw = response.get("usage") or {}
+                if self.config.bounded_acceptance and not all(
+                    type(usage_raw.get(key)) is int and 0 <= usage_raw[key] <= cap
+                    for key, cap in (("prompt_tokens", GROQ_ACCEPTANCE_INPUT_TOKEN_BOUND),
+                                     ("completion_tokens", max_output_tokens))
+                ):
+                    raise ValueError("Missing or out-of-bounds provider token usage")
                 usage = {
                     "input_tokens": usage_raw.get("prompt_tokens") or 0,
                     "output_tokens": usage_raw.get("completion_tokens") or 0,
                 }
-                tracker.record(usage, retries=attempt)
+                tracker.record_tokens(usage, reservation=reservation)
                 choices = response.get("choices") or []
                 if not choices:
                     raise ValueError("empty choices in provider response")
@@ -506,12 +644,14 @@ class OpenAICompatibleProvider(VisionProvider):
                 response = getattr(exc, "response", None)
                 code = int(getattr(response, "status_code", 0) or 0)
                 headers = getattr(response, "headers", {}) or {}
-                detail = scrub_secrets(str(getattr(response, "text", "") or "")[:200])
-                tracker.record_headers(headers)
+                reported = tracker.record_http_error(response)
+                detail = reported["message"]
+                if reported.get("code"):
+                    detail = f"{reported['code']}: {detail}"
                 if code == 429:
                     lowered = detail.lower()
                     if "quota" in lowered or "daily" in lowered:
-                        raise RateLimitedError(f"provider quota exhausted: {detail}") from exc
+                        raise RateLimitedError(f"provider quota exhausted: {detail}") from None
                     retry_after = 0.0
                     try:
                         retry_after = float(str(headers.get("retry-after") or "0").strip())
@@ -521,19 +661,19 @@ class OpenAICompatibleProvider(VisionProvider):
                     if attempt < self.config.max_retries:
                         self._sleep(max(retry_after, 2.0 * (2**attempt)))
                         continue
-                    raise RateLimitedError(f"provider rate limit: {detail}") from exc
+                    raise RateLimitedError(f"provider rate limit: {detail}") from None
                 if 500 <= code < 600:
                     last_error = f"HTTP {code}: {detail}"
                     if attempt < self.config.max_retries:
                         self._sleep(2.0 * (2**attempt))
                         continue
-                raise RuntimeError(f"provider HTTP error: HTTP {code} {detail}") from exc
+                raise RuntimeError(f"provider HTTP error: HTTP {code} {detail}") from None
             except (requests.Timeout, requests.RequestException, ValueError) as exc:
-                last_error = scrub_secrets(str(exc))
+                last_error = _safe_provider_message(str(exc), self.config.api_key)
                 if attempt < self.config.max_retries:
                     self._sleep(2.0 * (2**attempt))
                     continue
-                raise RuntimeError(f"provider error: {last_error}") from exc
+                raise RuntimeError(f"provider error: {last_error}") from None
         raise RuntimeError(f"provider failed after retries: {last_error}")
 
     @staticmethod
@@ -549,7 +689,10 @@ class OpenAICompatibleProvider(VisionProvider):
             json=request["body"],
             timeout=request["timeout_s"],
             verify=True,
+            allow_redirects=False,
         )
+        if 300 <= response.status_code < 400:
+            raise requests.HTTPError("Unexpected provider redirect", response=response)
         response.raise_for_status()
         return response.json()
 
