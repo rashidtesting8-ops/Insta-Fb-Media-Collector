@@ -3,8 +3,17 @@ import { execFileSync } from "node:child_process";
 import test from "node:test";
 import { admitRequest, cookieName, cookieOptions, issueSession, readObject, validSession } from "../src/lib/security.ts";
 import { submitIntake } from "../src/lib/intake.ts";
+import { curationSelection, isMockCuration } from "../src/lib/types.ts";
 
 const now = Date.now();
+
+test("dashboard reads nested selection and suppresses boolean mock output", () => {
+  const selection = { selected_asset_ids: ["sample"], rights_review_required_ids: ["sample"], analysis_coverage: { mock: false } };
+  assert.equal(curationSelection({ curation: selection }), selection);
+  assert.equal(curationSelection({ curation: selection, ai_envelope: { mock: true } }), undefined);
+  assert.ok(isMockCuration({ curation: { analysis_coverage: { mock: true } } }));
+  assert.equal(curationSelection({ status: "provider_unavailable" }), undefined);
+});
 
 test("signed session fails closed, expires and rejects tampering", () => {
   delete process.env.DASHBOARD_SESSION_SECRET;

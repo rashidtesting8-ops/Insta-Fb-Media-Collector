@@ -278,7 +278,9 @@ def derive_stage(job: Mapping[str, Any], delivery: Mapping[str, Any] | None = No
         stage, detail = "partial_success", str(job.get("error") or "Partial extraction success.")
     elif job_status == "extraction_complete":
         if run_ai:
-            if ai_status == "completed":
+            if ai_status == "completed" and ai_record.get("mock") is True:
+                stage, detail = "blocked", "Mock curation is available for QA only."
+            elif ai_status == "completed":
                 stage, detail = "awaiting_rights_approval", "AI curation completed; awaiting rights approval."
             else:
                 stage, detail = "partial_success", "AI curation requested but not completed."

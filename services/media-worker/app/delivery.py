@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from app.manifest import atomic_write_json
@@ -30,16 +30,21 @@ def sanitize_folder_name(business: str, job_id: str) -> str:
 
 
 def _safe_disk_path(job_dir: Path, rel: Any) -> Path | None:
-    if not isinstance(rel, str) or not rel or rel.startswith("/") or ".." in Path(rel).parts:
+    if not isinstance(rel, str) or not rel or "\\" in rel or PureWindowsPath(rel).drive:
         return None
-    candidate = job_dir / rel
-    return candidate if candidate.is_file() else None
+    relative = Path(rel)
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    candidate = (job_dir / relative).resolve()
+    return candidate if candidate.is_relative_to(job_dir.resolve()) and candidate.is_file() else None
 
 
 def _fixture_or_mock(envelope: dict[str, Any]) -> bool:
+    if envelope.get("ai_envelope", {}).get("mock") is not False:
+        return True
+    if envelope.get("curation", {}).get("analysis_coverage", {}).get("mock") is not False:
+        return True
     markers = [
-        str(envelope.get("ai_envelope", {}).get("mock")).lower(),
-        str(envelope.get("curation", {}).get("analysis_coverage", {}).get("mock")).lower(),
         str(envelope.get("ai_envelope", {}).get("prompt_version", "")).lower(),
         str(envelope.get("fixture", "")).lower(),
     ]
@@ -107,7 +112,10 @@ def build_delivery_plan(
             existing_delivery = json.loads(delivery_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             existing_delivery = {}
-    uploaded_keys = [str(u.get("upload_key")) for u in (existing_delivery.get("uploaded") or []) if u.get("upload_key")]
+    uploaded_keys = [
+        u["upload_key"] for u in (existing_delivery.get("uploaded") or [])
+        if u.get("upload_key") and u.get("status") == "uploaded" and u.get("drive_file_id")
+    ]
     pending_uploads = [a for a in assets if a["upload_key"] not in uploaded_keys]
     status = "ready" if assets and not errors else ("partial" if assets else "failed")
     return {
@@ -117,6 +125,7 @@ def build_delivery_plan(
         "pending_uploads": pending_uploads,
         "uploaded_keys": uploaded_keys,
         "drive_folder_id": existing_delivery.get("drive_folder_id"),
+        "drive_folder_link": existing_delivery.get("drive_folder_link"),
         "pending_rights_ids": [a["asset_id"] for a in assets if a["rights_review_required"]],
         "note": "n8n owns Google Drive credentials/uploads; files are never made public automatically.",
     }
@@ -128,6 +137,8 @@ def finalize_delivery(
     uploads: list[dict[str, Any]],
     *,
     authorization_confirmed: bool,
+    drive_folder_id: str | None = None,
+    drive_folder_link: str | None = None,
 ) -> dict[str, Any]:
     """Persist delivery.json. Rights gating: without explicit authorization,
     no upload is recorded as an approved commercial release."""
@@ -141,36 +152,24 @@ def finalize_delivery(
             existing_ledger = list((json.loads(existing_path.read_text(encoding="utf-8")) or {}).get("uploaded") or [])
         except (OSError, json.JSONDecodeError):
             existing_ledger = []
-    ledger = []
-    seen = set()
-    for upload in existing_ledger:
+    by_upload = {}
+    for upload in [*existing_ledger, *uploads]:
         key = str(upload.get("upload_key") or "")
         asset = by_key.get(key)
-        if asset is None or key in seen:
+        if asset is None:
             continue
-        seen.add(key)
-        ledger.append({
+        previous = by_upload.get(key, {})
+        if previous.get("status") == "uploaded" and previous.get("drive_file_id"):
+            continue
+        by_upload[key] = {
             "asset_id": asset["asset_id"], "upload_key": key,
             "drive_file_id": upload.get("drive_file_id"),
             "drive_link": upload.get("drive_link"),
             "status": upload.get("status", "failed"),
             "error": upload.get("error"),
             "sha256": asset["sha256"], "rights_status": asset["rights_status"],
-        })
-    for upload in uploads:
-        key = str(upload.get("upload_key") or "")
-        asset = by_key.get(key)
-        if asset is None or key in seen:  # unknown asset or duplicate retry
-            continue
-        seen.add(key)
-        ledger.append({
-            "asset_id": asset["asset_id"], "upload_key": key,
-            "drive_file_id": upload.get("drive_file_id"),
-            "drive_link": upload.get("drive_link"),
-            "status": upload.get("status", "failed"),
-            "error": str(upload.get("error") or "")[:200] or None,
-            "sha256": asset["sha256"], "rights_status": asset["rights_status"],
-        })
+        }
+    ledger = list(by_upload.values())
     ok = [u for u in ledger if u["status"] == "uploaded" and u["drive_file_id"]]
     status = "blocked_rights_review" if not authorization_confirmed else (
         "completed" if len(ok) == len(plan.get("assets", [])) and ok else
@@ -180,8 +179,8 @@ def finalize_delivery(
         "schema_version": "1.0-delivery", "job_id": plan.get("job_id"),
         "status": status,
         "folder_name": plan.get("folder_name"),
-        "drive_folder_id": plan.get("drive_folder_id"),
-        "drive_folder_link": plan.get("drive_folder_link"),
+        "drive_folder_id": plan.get("drive_folder_id") or drive_folder_id,
+        "drive_folder_link": plan.get("drive_folder_link") or drive_folder_link,
         "authorization_confirmed": bool(authorization_confirmed),
         "uploaded": ledger,
         "pending_rights_ids": plan.get("pending_rights_ids", []),

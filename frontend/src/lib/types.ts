@@ -57,15 +57,18 @@ export interface Manifest {
   source_status?: string;
 }
 
-export interface Curation {
-  status?: string;
+interface CurationSelection {
   mode?: string;
   selected_asset_ids?: string[];
   rights_review_required_ids?: string[];
+  analysis_coverage?: { mock?: boolean };
+}
+
+export interface Curation extends CurationSelection {
+  status?: string;
   ai_envelope?: { mock?: boolean; prompt_version?: string };
   fixture?: string;
-  analysis_coverage?: { mock?: boolean };
-  curation?: { analysis_coverage?: { mock?: boolean } };
+  curation?: CurationSelection;
   [k: string]: unknown;
 }
 
@@ -81,13 +84,16 @@ export interface Delivery {
 
 export function isMockCuration(c: Curation | null): boolean {
   if (!c) return false;
+  if (c.ai_envelope?.mock === true || c.analysis_coverage?.mock === true ||
+      c.curation?.analysis_coverage?.mock === true) return true;
   const markers = ["mock", "fixture", "test-only"];
   const hay = [
-    String(c.ai_envelope?.mock),
-    String(c.analysis_coverage?.mock),
     String(c.ai_envelope?.prompt_version || ""),
     String(c.fixture || ""),
-    String(c.curation?.analysis_coverage?.mock),
   ].join(" ").toLowerCase();
   return markers.some((m) => hay.includes(m));
+}
+
+export function curationSelection(c: Curation | null): CurationSelection | undefined {
+  return c && !isMockCuration(c) ? c.curation ?? (c.selected_asset_ids ? c : undefined) : undefined;
 }

@@ -57,6 +57,23 @@ def test_fixture_curation_blocked_by_default(tmp_path):
     assert plan["assets"] == []
 
 
+@pytest.mark.parametrize("field", ["envelope", "coverage", "missing"])
+def test_mock_boolean_and_unknown_provenance_are_blocked(tmp_path, field):
+    job, _ = _job(tmp_path)
+    path = job / "curation.json"
+    envelope = json.loads(path.read_text())
+    del envelope["fixture"]
+    envelope["ai_envelope"]["prompt_version"] = "v2.0"
+    if field == "envelope":
+        envelope["ai_envelope"]["mock"] = True
+    elif field == "coverage":
+        envelope["curation"]["analysis_coverage"]["mock"] = True
+    else:
+        del envelope["ai_envelope"]["mock"]
+    path.write_text(json.dumps(envelope))
+    assert build_delivery_plan(job, "job_p6")["status"] == "blocked_non_real_curation"
+
+
 def test_plan_maps_validated_files_and_rights(tmp_path):
     job, rows = _job(tmp_path)
     plan = build_delivery_plan(job, "job_p6", "Pup Palace", allow_fixture=True)
@@ -123,9 +140,31 @@ def test_partial_upload_failure(tmp_path):
         {"upload_key": plan["assets"][0]["upload_key"], "drive_file_id": "d1", "status": "uploaded"},
         {"upload_key": plan["assets"][1]["upload_key"], "status": "failed", "error": "network"},
     ]
-    result = finalize_delivery(job, plan, uploads, authorization_confirmed=True)
+    result = finalize_delivery(job, plan, uploads, authorization_confirmed=True, drive_folder_id="fixture-folder")
     assert result["status"] == "partial_success"
     assert result["uploaded"][1]["error"] == "network"
+    retry = build_delivery_plan(job, "job_p6", allow_fixture=True)
+    assert retry["drive_folder_id"] == "fixture-folder"
+    assert retry["pending_uploads"] == [plan["assets"][1]]
+    finished = finalize_delivery(job, retry, [
+        {"upload_key": plan["assets"][1]["upload_key"], "drive_file_id": "d2", "status": "uploaded"}
+    ], authorization_confirmed=True)
+    assert finished["status"] == "completed"
+    assert [item["drive_file_id"] for item in finished["uploaded"]] == ["d1", "d2"]
+
+
+def test_delivery_disk_path_rejects_symlink_escape(tmp_path):
+    job, rows = _job(tmp_path, assets=1)
+    target = tmp_path / "outside.jpg"
+    link = job / rows[0]["local_path"]
+    link.rename(target)
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("filesystem does not support symlinks")
+    plan = build_delivery_plan(job, "job_p6", allow_fixture=True)
+    assert plan["assets"] == []
+    assert any("unsafe path" in error for error in plan["errors"])
 
 
 def test_n8n_workflow_json_imports():

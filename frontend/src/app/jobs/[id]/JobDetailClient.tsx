@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
 import type { JobRecord, PipelineStatus, Manifest, Curation, Delivery } from "@/lib/types";
-import { isMockCuration } from "@/lib/types";
+import { curationSelection, isMockCuration } from "@/lib/types";
 
 const STAGES = ["queued", "collecting", "preprocessing", "ai_processing", "awaiting_rights_approval", "delivering", "completed", "partial_success", "blocked", "failed"];
 
@@ -17,29 +17,38 @@ export default function JobDetailClient({ id }: { id: string }) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  async function loadAll() {
-    setError(null);
-    try {
-      const [j, s, m, c, d] = await Promise.all([
-        api<JobRecord>(`/api/jobs/${id}`),
-        api<PipelineStatus>(`/api/jobs/${id}/status`),
-        api<Manifest>(`/api/jobs/${id}/manifest`).catch(() => null),
-        api<Curation>(`/api/jobs/${id}/curation`).catch(() => null),
-        api<Delivery>(`/api/jobs/${id}/delivery`).catch(() => null),
-      ]);
-      setJob(j); setStatus(s); setManifest(m); setCuration(c); setDelivery(d);
-    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
-    finally { setLoading(false); }
-  }
-
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+    const controller = new AbortController();
+    const options = { signal: controller.signal };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function loadAll() {
+      let terminal = false;
+      try {
+        const [j, s, m, c, d] = await Promise.all([
+          api<JobRecord>(`/api/jobs/${id}`, options),
+          api<PipelineStatus>(`/api/jobs/${id}/status`, options),
+          api<Manifest>(`/api/jobs/${id}/manifest`, options).catch(() => null),
+          api<Curation>(`/api/jobs/${id}/curation`, options).catch(() => null),
+          api<Delivery>(`/api/jobs/${id}/delivery`, options).catch(() => null),
+        ]);
+        if (controller.signal.aborted) return;
+        terminal = s.terminal;
+        setError(null);
+        setJob(j); setStatus(s); setManifest(m); setCuration(c); setDelivery(d);
+      } catch (e: unknown) {
+        if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+          if (!terminal) timer = setTimeout(loadAll, 10000);
+        }
+      }
+    }
     void loadAll();
-    const t = setInterval(() => {
-      if (status && status.terminal) return;
-      void loadAll();
-    }, 10000);
-    return () => clearInterval(t);
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
   }, [id]);
 
   if (loading) return <div className="p-4 text-sm text-slate-500">Loading…</div>;
@@ -47,6 +56,7 @@ export default function JobDetailClient({ id }: { id: string }) {
   if (!job) return <div className="p-4 text-sm text-slate-500">Job not found.</div>;
 
   const mock = isMockCuration(curation);
+  const selection = curationSelection(curation);
   const stageIdx = STAGES.indexOf(String(status?.stage));
   const progress = stageIdx >= 0 ? Math.round(((stageIdx + 1) / STAGES.length) * 100) : 0;
 
@@ -81,12 +91,12 @@ export default function JobDetailClient({ id }: { id: string }) {
       <section className="rounded-lg border border-slate-200 bg-white p-4">
         <h2 className="mb-3 font-medium">Media results</h2>
         {mock && <div className="mb-3 rounded border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">Mock/fixture curation detected — not shown as genuine AI recommendations.</div>}
-        {!curation && <div className="text-sm text-slate-500">No curation available.</div>}
-        {curation && !mock && (
+        {!selection && !mock && <div className="text-sm text-slate-500">No curation available.</div>}
+        {selection && (
           <div className="space-y-2 text-sm">
-            <div>Mode: {curation.mode ?? curation.status}</div>
-            <div>Selected assets: {(curation.selected_asset_ids || []).length}</div>
-            <div>Rights review required: {(curation.rights_review_required_ids || []).length}</div>
+            <div>Mode: {selection.mode ?? curation?.status}</div>
+            <div>Selected assets: {(selection.selected_asset_ids || []).length}</div>
+            <div>Rights review required: {(selection.rights_review_required_ids || []).length}</div>
           </div>
         )}
         {manifest?.assets && manifest.assets.length > 0 && (
