@@ -102,7 +102,7 @@
       "position": [2640, 300]
     },
     {
-      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "rg1", "leftValue": "={{ $json.stage === 'awaiting_rights_approval' }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "rg1", "leftValue": "={{ $json.stage === 'awaiting_rights_approval' || ($json.ai_status === 'completed' && ['partial_success', 'failed'].includes($json.delivery_status)) }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
       "id": "p7-0016", "name": "Rights Gate",
       "type": "n8n-nodes-base.if", "typeVersion": 2.2,
       "position": [2420, 120]
@@ -165,6 +165,12 @@
       "position": [3740, -300]
     },
     {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "ef1", "leftValue": "={{ !!$('Get Delivery Plan').first().json.drive_folder_id }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
+      "id": "p10-0001", "name": "Existing Drive Folder?",
+      "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+      "position": [3850, -480]
+    },
+    {
       "parameters": {"authentication": "oAuth2", "resource": "folder", "operation": "create", "name": "={{ $('Get Delivery Plan').item.json.folder_name }}", "parents": {"parentId": {"__rl": true, "value": "root", "mode": "id"}}, "options": {}},
       "id": "p7-0026", "name": "Create Business Drive Folder",
       "type": "n8n-nodes-base.googleDrive", "typeVersion": 3,
@@ -178,9 +184,9 @@
       "position": [4180, -300]
     },
     {
-      "parameters": {"batchSize": 1, "options": {}},
+      "parameters": {"jsCode": "const plan = $('Get Delivery Plan').first().json;\nconst folder = plan.drive_folder_id || $input.first().json.id;\nreturn plan.pending_uploads.map(asset => ({ json: { ...asset, drive_folder_id: folder }, pairedItem: { item: 0 } }));"},
       "id": "p7-0028", "name": "Split Assets",
-      "type": "n8n-nodes-base.splitInBatches", "typeVersion": 3,
+      "type": "n8n-nodes-base.code", "typeVersion": 2,
       "position": [4400, -420]
     },
     {
@@ -190,14 +196,20 @@
       "position": [4620, -420]
     },
     {
-      "parameters": {"authentication": "oAuth2", "resource": "file", "operation": "upload", "fileName": "={{ $binary.data.fileName }}", "parents": {"parentId": {"__rl": true, "value": "={{ $('Create Business Drive Folder').item.json.id }}", "mode": "id"}}, "binaryPropertyName": "data", "options": {}},
+      "parameters": {"authentication": "oAuth2", "resource": "file", "operation": "upload", "fileName": "={{ $binary.data.fileName }}", "parents": {"parentId": {"__rl": true, "value": "={{ $('Split Assets').item.json.drive_folder_id }}", "mode": "id"}}, "binaryPropertyName": "data", "options": {}},
       "id": "p7-0030", "name": "Upload Original to Drive",
       "type": "n8n-nodes-base.googleDrive", "typeVersion": 3,
       "credentials": {"googleDriveOAuth2Api": {"id": "GOOGLE_DRIVE_CREDENTIAL_ID", "name": "Google Drive account"}},
       "position": [4840, -420], "onError": "continueRegularOutput"
     },
     {
-      "parameters": {"authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/delivery-result' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ authorization_confirmed: $('Map Stage').item.json.authorization_confirmed, drive_folder_id: $('Create Business Drive Folder').item.json.id, uploads: $('Upload Original to Drive').all().map((u, i) => ({ upload_key: $('Split Assets').all()[i].json.upload_key, drive_file_id: (u.json && u.json.id) || null, drive_link: (u.json && u.json.webViewLink) || null, status: (u.json && u.json.id) ? 'uploaded' : 'failed', error: (u.json && u.json.error) ? String(u.json.error.message || u.json.error) : null })) }) }}", "options": {}},
+      "parameters": {"jsCode": "const inputs = $input.all();\nconst uploads = inputs.map(({ json }, i) => ({ upload_key: $('Split Assets').itemMatching(i).json.upload_key, drive_file_id: json.id || null, drive_link: json.webViewLink || null, status: json.id ? 'uploaded' : 'failed', error: json.error ? String(json.error.message || json.error) : null }));\nreturn [{ json: { authorization_confirmed: $('Session').first().json.authorization_confirmed === true, drive_folder_id: $('Split Assets').first().json.drive_folder_id, uploads } }];"},
+      "id": "p10-0002", "name": "Collect Upload Results",
+      "type": "n8n-nodes-base.code", "typeVersion": 2,
+      "position": [4950, -420]
+    },
+    {
+      "parameters": {"authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Session').first().json.job_id + '/delivery-result' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify($json) }}", "options": {}},
       "id": "p7-0031", "name": "Persist Delivery Ledger",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
       "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
@@ -278,18 +290,20 @@
       [{"node": "Mark Delivering", "type": "main", "index": 0}],
       [{"node": "Respond Blocked", "type": "main", "index": 0}]
     ]},
-    "Mark Delivering": {"main": [[{"node": "Create Business Drive Folder", "type": "main", "index": 0}]]},
+    "Mark Delivering": {"main": [[{"node": "Existing Drive Folder?", "type": "main", "index": 0}]]},
+    "Existing Drive Folder?": {"main": [
+      [{"node": "Split Assets", "type": "main", "index": 0}],
+      [{"node": "Create Business Drive Folder", "type": "main", "index": 0}]
+    ]},
     "Create Business Drive Folder": {"main": [[{"node": "Folder Created?", "type": "main", "index": 0}]]},
     "Folder Created?": {"main": [
       [{"node": "Split Assets", "type": "main", "index": 0}],
       [{"node": "Respond Blocked", "type": "main", "index": 0}]
     ]},
-    "Split Assets": {"main": [
-      [{"node": "Persist Delivery Ledger", "type": "main", "index": 0}],
-      [{"node": "Read Selected Original", "type": "main", "index": 0}]
-    ]},
+    "Split Assets": {"main": [[{"node": "Read Selected Original", "type": "main", "index": 0}]]},
     "Read Selected Original": {"main": [[{"node": "Upload Original to Drive", "type": "main", "index": 0}]]},
-    "Upload Original to Drive": {"main": [[{"node": "Split Assets", "type": "main", "index": 0}]]},
+    "Upload Original to Drive": {"main": [[{"node": "Collect Upload Results", "type": "main", "index": 0}]]},
+    "Collect Upload Results": {"main": [[{"node": "Persist Delivery Ledger", "type": "main", "index": 0}]]},
     "Persist Delivery Ledger": {"main": [[{"node": "Respond Final Status", "type": "main", "index": 0}]]},
     "Persist Final Status": {"main": [[{"node": "Respond Final Status", "type": "main", "index": 0}]]},
     "Status Webhook": {"main": [[{"node": "Status Job Lookup", "type": "main", "index": 0}]]},

@@ -1,0 +1,33 @@
+# Phase 10 — End-to-end QA and acceptance
+
+**Production decision: NO-GO.** QA used the Phase 9 merge `6378112` plus the fixes on `test/phase10-end-to-end-qa`. Main CI was green at baseline. Phase 10 ran offline by operator request. Live Groq, Google Drive, authorized real-media quality review and staging cutover remain acceptance gates. No existing services or data were changed.
+
+## Evidence and coverage
+
+| Check | Result and boundary |
+|---|---|
+| Worker acceptance | 131 offline tests passed. Real worker API, temporary SQLite and local website HTTP fixtures. Covered successful and failed collection, simulated Instagram rate limiting with partial results, duplicate job reuse, cross-source deduplication and mock MODE A/B. Mock selections could not be released. |
+| Dashboard | Production build, type check, six unit tests and built-dashboard HTTP smoke passed. Verified signed sessions, expiry, protected routes, same-origin writes, mock suppression, nested selection counts and intake routing against local mock upstreams. Lint passed with three warnings. |
+| n8n execution | The canonical graph ran in n8n 2.48.7 with networking disabled. The HTTP worker was a fixture and only the two Google Drive nodes were replaced with deterministic test nodes. Authenticated webhooks, invalid input, the pre-approval stop, real binary file reads, item pairing, a partial ledger and a same-folder retry passed. |
+| Delivery | Test ledger covered rights denial, fixture denial, checksum mismatch, symlink confinement, partial results and retry of failed items while preserving previously uploaded IDs. |
+| Security and recovery | Offline checks covered worker roles, rate and body limits, CORS, SSRF and file confinement. Staging Compose resolved and Caddy validated the HTTPS configuration. Fixture SQLite backup restored to a fresh path and passed integrity and authenticated-read checks. Actual host TLS trust, n8n state restore, monitoring alerts and cutover remain unverified. |
+| Existing services | Project and legacy n8n and the worker returned healthy status. The existing worker returned 404 on `/ready` and 200 on an unauthenticated `GET /jobs`; the running local image predates the hardened branch. Dashboard port 3000 did not answer readiness. The live stack was left untouched. |
+| Real media | Blocked. Fixtures covered unknown publication dates, provenance, unverified rights, technical quality and deterministic selection mechanics. Grooming relevance, authenticity, hero/gallery choices and crop advice on authorized real media were not assessed. |
+
+The offline suites exercised the dashboard, n8n and worker in separate runs with fixture boundaries. A single deployed run from dashboard through live services remains unverified.
+
+## Findings and severity
+
+- **Critical, fixed on the branch:** Boolean mock flags previously passed the delivery provenance check and could appear as genuine results in the dashboard. The plan and result API now fail closed for mock, unknown-provenance or invalid plans. The dashboard suppresses those marked mock and reads the actual selection payload. Rights approval is still required.
+- **High, fixed for recorded retries on the canonical `07` path:** Failed ledger entries previously suppressed retries, and the n8n delivery branch fed the folder output into the asset loop. It now uses pending assets, passes binary originals and preserves the existing folder and successful file IDs on retry.
+- **High, open:** Running local services are not an acceptance deployment. Stage the hardened commit with separate data and credentials per the [Phase 9 runbook](PHASE_9_REPORT.md), then verify TLS, protected endpoints, restore and monitoring on that target. Keep the legacy standalone `06` workflow unpublished for production. It has single-item delivery wiring.
+- **High, open:** External Drive writes and the local ledger are separate operations. A crash after Drive accepts a file but before ledger persistence, or concurrent retries, can still duplicate remote writes. Exercise that failure in private staging and require remote reconciliation before unattended delivery.
+- **Medium, open:** Groq can reject requests within the worker's byte cap because provider image tokens and the output budget also matter. **Low:** existing lint warnings and Pillow deprecation warnings remain.
+
+## Live gates for a later approved run
+
+**Groq.** The earlier record shows a 429 explicitly reporting excessive request size, following an earlier schema-validation failure. For the existing `qwen/qwen3.8-27b` model, Groq documents a 2,048-token charge per image and a three-image limit. Reducing resolution can reduce wire bytes without lowering this model's per-image token charge. Check the actual account tier and budget for the V2 prompt, one authorized image and the completion cap before requesting one MODE A plus one MODE B call. Stop after the first rejection without retrying or switching providers. Check that the real `curation.json` marks both mock fields false and that its selected IDs, crops and rights flags match the authorized originals. [Previous attempts](PHASE_5_REPORT.md) · [Groq vision](https://console.groq.com/docs/vision)
+
+**Google Drive.** The project n8n database contains one Google Drive OAuth2 credential record and Drive nodes with credential bindings. Only metadata counts were inspected; token validity, account access and scopes are unverified. If the credential needs replacement, enable the Drive API in Google Cloud, configure the consent screen and authorized test account, create a Web application OAuth client, and register the exact redirect URI displayed by staging n8n. Enter the Client ID and Client Secret into an n8n **Google Drive OAuth2 API** credential, connect the approved account and bind the folder and upload nodes of canonical `07`. Do not copy tokens into the repository. After separate upload approval and documented asset rights, test in a private destination, compare binary checksums or downloaded SHA-256, verify folder/file ACLs have only intended access, and confirm duplicate and partial retries. No permission changes are required for this test. [n8n OAuth setup](https://docs.n8n.io/integrations/builtin/credentials/google/oauth-single-service/) · [Drive files](https://developers.google.com/workspace/drive/api/reference/rest/v3/files) · [Drive permissions](https://developers.google.com/workspace/drive/api/reference/rest/v3/permissions/list)
+
+**Phase 11:** The offline evidence and open gates are ready for handover. Production sign-off stays blocked pending genuine MODE A/B, real-media review, private Drive acceptance including retry behavior, and hardened staging acceptance.

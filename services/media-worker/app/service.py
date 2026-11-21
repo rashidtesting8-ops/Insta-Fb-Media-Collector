@@ -623,35 +623,21 @@ def post_delivery_result(job_id: str, payload: dict[str, Any]) -> dict[str, Any]
     rec = fetch(job_id)
     if rec is None:
         raise HTTPException(404, "Unknown job")
-    from app.delivery import finalize_delivery, json_load
-    from app.manifest import atomic_write_json
-
+    from app.delivery import build_delivery_plan, finalize_delivery
     job_dir = Path(DATA_DIR) / job_id
-    plan = {}
-    if (job_dir / "delivery.json").is_file():
-        try:
-            plan = json_load(job_dir / "delivery.json")
-        except (OSError, json.JSONDecodeError):
-            plan = {}
-    if not plan.get("assets"):
-        try:
-            from app.delivery import build_delivery_plan
-
-            plan = build_delivery_plan(job_dir, job_id, str(payload.get("business_name") or ""), allow_fixture=False)
-        except Exception:  # noqa: BLE001
-            plan = plan or {}
-    result = finalize_delivery(
+    plan = build_delivery_plan(job_dir, job_id, str(payload.get("business_name") or ""))
+    if plan["status"] != "ready":
+        raise HTTPException(409, plan["status"])
+    if payload.get("authorization_confirmed") is not True:
+        raise HTTPException(403, "Explicit rights approval required")
+    return finalize_delivery(
         job_dir,
         plan,
         list(payload.get("uploads") or []),
-        authorization_confirmed=payload.get("authorization_confirmed") is True,
+        authorization_confirmed=True,
+        drive_folder_id=payload.get("drive_folder_id"),
+        drive_folder_link=payload.get("drive_folder_link"),
     )
-    if payload.get("drive_folder_id") is not None:
-        result["drive_folder_id"] = payload.get("drive_folder_id")
-    if payload.get("drive_folder_link") is not None:
-        result["drive_folder_link"] = payload.get("drive_folder_link")
-    atomic_write_json(job_dir / "delivery.json", result)
-    return result
 
 
 @app.get("/jobs/{job_id}/delivery")
