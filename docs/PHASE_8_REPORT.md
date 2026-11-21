@@ -57,4 +57,4 @@ Set `WORKER_URL`, `N8N_URL`, `MEDIA_WORKER_TOKEN`, optional `DASHBOARD_PASSWORD`
 
 ## GitHub PR
 
-Branch `feat/phase8-frontend-dashboard`; PR to be opened into `main`. CI to be verified after push.
+Branch `feat/phase8-frontend-dashboard`, PR #10 https://github.com/rashidtesting8-ops/Insta-Fb-Media-Collector/pull/10, CI run #26 success.
