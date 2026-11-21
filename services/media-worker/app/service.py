@@ -356,13 +356,16 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
         if payload.get("run_ai_curation") and manifest_file.is_file():
             try:
                 from app.ai.pipeline import run_ai_curation as run_ai
+                from app.ai.provider import AIProviderConfig
 
+                ai_config = AIProviderConfig.from_env()
                 ai = run_ai(
                     job_dir,
                     job_id,
                     business_context=payload.get("business_context") or {},
                     max_images=int(payload.get("max_selected_images") or 30),
                     max_videos=int(payload.get("max_selected_videos") or 10),
+                    batch_size=max(1, ai_config.batch_size),
                 )
                 ai_record = ai.as_dict()
                 ai_record["curation_path"] = str(job_dir / "curation.json")

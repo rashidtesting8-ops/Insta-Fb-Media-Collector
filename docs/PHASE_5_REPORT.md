@@ -196,3 +196,93 @@ rights-review flags and ranked placements a Google Drive delivery workflow
 needs. Phase 6 (n8n Drive folders, binary upload of selected ORIGINALS,
 verification ledger, rights gate) can consume it directly. No Drive, frontend,
 or production deployment work was performed here.
+
+---
+
+## 12. Live vision-provider acceptance test — **BLOCKED (no credentials)**
+
+**Attempted:** 21 November 2026, after pulling latest `main` (`595058c520bceddb693ba3e3838c0913b0506f5a`, PR #4 merged; GitHub Actions run **#12 on main: success**).
+
+**Result:** No live vision-provider test was run. Inspection found:
+- `.env`: **no `AI_*` keys at all** (only infrastructure + GitHub keys).
+- Running worker container: **no `AI_*` environment variables**.
+- Therefore `AIProviderConfig.from_env()` resolves `provider=""` → `build_provider()` returns `disabled`. A job requesting `run_ai_curation=true` correctly reports `ai_curation.status="disabled"` and `partial_success` while preserving extraction (live check, job `24ecb32b…`).
+
+**Do not treat the mock smoke (§7) as live validation** — it was explicitly labeled `mock: true`; no genuine model id, usage or cost exists to record.
+
+### Exact configuration required to unblock
+
+| Variable | Purpose | Compatibility requirement |
+|---|---|---|
+| `AI_PROVIDER` | Select provider | `openai_compatible` for a real vision endpoint (`mock` is test-only) |
+| `AI_MODEL` | Vision model id | Must accept OpenAI-style chat/completions with `image_url` data URLs (a vision-capable model id exposed by your endpoint) |
+| `AI_ENDPOINT` | Full chat/completions URL | HTTPS URL reachable from the worker container |
+| `AI_API_KEY` | Provider credential | Secret; authorized for `AI_MODEL`; store only in local `.env` or n8n credentials — never in Git |
+| `AI_TIMEOUT_S` | Per-request timeout | default 120 s |
+| `AI_MAX_RETRIES` | Bounded retries (429/5xx/timeout) | default 2, exponential backoff |
+| `AI_MAX_REQUESTS_PER_JOB` | Request ceiling | default 40 |
+| `AI_MAX_COST_USD_PER_JOB` | Cost ceiling | default 2.0 USD |
+| `AI_PRICE_IN_PER_1K` / `AI_PRICE_OUT_PER_1K` | Optional price inputs for cost estimates | 0 by default → cost recorded as 0 when unavailable |
+
+Add these to the **local** `.env` (use `.env.example` as the template), then recreate the worker so the container receives them:
+`docker compose -f compose.media.yml up -d` (no container deletion, no volume changes).
+
+### Pixel-delivery verification (static, not live)
+
+- `app/ai/payload.py::convert_for_payload` produces real JPEG **bytes** from the on-disk original (EXIF-oriented, ≤1024 px, ≤1.5 MB); `build_image_payloads` attaches them to `ImagePayload.data` with labels (`primary image` or `frame @<timestamp>s`).
+- `app/ai/provider.py::OpenAICompatibleProvider.complete` builds `content` with `{"type":"image_url","image_url":{"url":"data:<mime>;base64,<base64 of actual bytes>"}}` — filenames/metadata are **not** the payload; captions are text-context data only.
+- Offline tests prove file-backed selection, labeled frame payloads, and that only supplied assets can be analyzed.
+- **Live receipt of pixels by a real model remains UNVERIFIED until credentials are configured.**
+
+### What will be executed once credentials are set
+
+1. One small, cost-bounded job: `run_ai_curation=true`, ≤1–2 assets, `max_images=2`, a lowered per-job request ceiling, explicit business context; no Drive/frontend involvement.
+2. Verify MODE A items (real model id, `visual_analysis_status`, range-valid weighted breakdown, no invented ids), MODE B strict V2 §9 schema, `curation.json` persisted on D:, selected ids all present in the manifest, rights-review flags derived/intact, and actual provider usage (requests/tokens) + cost info recorded truthfully.
+3. Update this section with the real model id, usage and results — or with an honest auth/access failure. No mock output will be relabelled as live success.
+
+**Current status (first check, before credentials): BLOCKED — no `AI_*` variables.**
+
+---
+
+## 13. Live vision-provider acceptance test — second attempt with Groq credentials: **BLOCKED (API 403/1010 from container)**
+
+**Prepared and verified (no secret values displayed):**
+- Pulled latest `main` `595058c…` (PR #4 merged, Actions run #12 success).
+- All four required variables present in local `.env`: `AI_PROVIDER`, `AI_MODEL`, `AI_ENDPOINT`, `AI_API_KEY` (configured flags only).
+- **Model availability confirmed via Groq models API** (from host): 11 models returned; exact id `qwen/qwen3.8-27b` present; metadata declares `input_modalities: text,image` (genuine vision input), `context_window: 131072`, `max_completion_tokens: 16384`, `supported_features: tools,json_mode,reasoning`, pricing prompt `0.0000008`/token, completion `0.000004`/token.
+- Accurate cost inputs added locally: `AI_PRICE_IN_PER_1K=0.0008`, `AI_PRICE_OUT_PER_1K=0.004`; request ceiling 3, cost ceiling $0.25, retries 1 from `.env`.
+- `compose.media.yml` now forwards **only** the ten `AI_*` variables to the media worker (least privilege). `docker compose config --quiet` valid; **`--no-deps` recreate of `collector` only** — both n8n containers and legacy resources untouched; all `AI_*` keys verified present in the container by name only.
+- Provider hardened for this model's declared capabilities: JSON mode request + bounded `max_tokens=4000`; offline suite re-run **68/68 passed** after the change.
+
+**Live attempt:** one bounded script with a **single shared `UsageTracker` capped at 3 requests** — (1) a raw-pixel probe (synthetic red PNG, ask dominant color), then (2) MODE A + (3) MODE B on the real Phase 4 enriched manifest on D: for job `a46ad72…`.
+
+**Result:** the first request (pixel probe) was rejected before reaching the model:
+`urllib.error.HTTPError: HTTP Error 403: Forbidden` — provider body `error code: 1010` (Cloudflare access-control rejection). **No tokens consumed; cost $0.00; no MODE A/MODE B response; no live `curation.json` produced.** The budget cap of 3 requests was not exceeded (one failed attempt only).
+
+**Read-only diagnosis (no second inference call, no model switch):**
+- The identical GET to `https://api.groq.com/openai/v1/models` **from the host succeeds** (11 models, key valid, model available).
+- The same GET **from inside the worker container returns HTTP 403 / code 1010** with the same HTTP stack.
+- Therefore the rejection is **container egress / WAF-level** (the container's network path or client signature is blocked), **not** an invalid key, unavailable model, or missing vision support.
+- I did **not** spoof a browser signature or try another model: both would violate the project's anti-bypass / no-automatic-model-switch rules.
+
+**Guardrails confirmed:** request cap 3 + $0.25 cost ceiling with real provider pricing configured; budget checked before every call; no credentials in logs/manifests/Git; no legacy n8n, volume, backup, or container deletion.
+
+**Blocker / required next step (operator decision):** provide an authorized network path for the worker's Groq traffic (e.g. an approved proxy/egress allowlist for the container, or provider-side allowlisting of the container egress IP), then rerun the same 3-request bounded test. Until then live vision validation remains **PENDING/BLOCKED**, and the existing mock `curation.json` (job `a46ad72…`, `mock: true`) must not be relabelled as live success. Phase 6 not started.
+
+**Local uncommitted changes from this validation attempt** (preserved, not published): `compose.media.yml` AI env forwarding; `.env` price variables (secrets local-only); `app/ai/provider.py` JSON-mode/token cap; this report section.
+
+---
+
+## 14. Groq transport remediation + live attempt outcome (21 November 2026)
+
+**403/1010 resolved.** Option A (approved) replaced `urllib.request` with `requests.post` in `OpenAICompatibleProvider._http_post` (TLS verification ON, no UA override, same endpoint/auth/body/timeout/retry/usage/cost logic). The retry classifier now handles `requests.HTTPError` (429/5xx only) and `requests.Timeout`/`RequestException`/malformed responses. Secret scrubbing was tightened to redact the token after `Bearer` (a test caught the old partial redaction). With the fix, a read-only unauthenticated models GET from the worker returns **HTTP 401 with `cf-ray`** (Groq app reached) instead of 403/1010 — confirmed twice (rays `a5de98b6ac3fd4b0-KHI`, `a5de9d2f8819c4c3-KHI`).
+
+**Live attempt (3 provider requests total, cost ceiling $0.25):**
+1. A pixel-probe call was rejected by Groq's app with **400** — `"'messages' must contain the word 'json' ... to use response_format json_object"` (prompt-shape rule for this model, not an image/network problem). No tokens billed.
+2. The bounded pipeline call (MODE A on the real D: manifest for job `a46ad72…`) was rejected by Groq's app with **400** — `"Too many images provided. This model supports up to 3 images"`; with `max_retries=1` this used 2 attempts. No tokens billed.
+
+**Result:** **$0.00 cost, 0 tokens, no successful inference, no non-mock `curation.json` produced.** The earlier mock curation file was preserved on D: as `curation.mock.json` and was **not** relabelled. Total provider attempts = 3, exactly the authorized ceiling — **no further live call was made**.
+
+**Fix for the next bounded run:** MODE A batch size is now env-configurable (`AI_BATCH_SIZE`, conservative default **3** to match the model's documented image limit) and the worker service uses it. Offline suite after all changes: **78 passed** (68 prior + 10 transport/config tests). Worker recreated with `--no-deps`; both n8n instances and all data untouched.
+
+**Remaining blocker:** live MODE A/B validation needs a **fresh authorization for another ≤3-request run** with `AI_BATCH_SIZE=3` (4 assets → 2 MODE A batches + MODE B). 403/1010 is gone; the outstanding item is purely the model's per-request image limit and the exhausted request budget. Phase 6 not started.

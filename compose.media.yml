@@ -59,6 +59,18 @@ services:
     environment:
       - PROJECTS_DIR=/data/projects
       - MEDIA_WORKER_TOKEN=${MEDIA_WORKER_TOKEN:?set MEDIA_WORKER_TOKEN in .env}
+      # Phase 5 AI: only these variables are forwarded to the worker.
+      # Secrets live in local .env / n8n credentials, never in the repo.
+      - AI_PROVIDER=${AI_PROVIDER:-}
+      - AI_MODEL=${AI_MODEL:-}
+      - AI_ENDPOINT=${AI_ENDPOINT:-}
+      - AI_API_KEY=${AI_API_KEY:-}
+      - AI_TIMEOUT_S=${AI_TIMEOUT_S:-120}
+      - AI_MAX_RETRIES=${AI_MAX_RETRIES:-2}
+      - AI_MAX_REQUESTS_PER_JOB=${AI_MAX_REQUESTS_PER_JOB:-40}
+      - AI_MAX_COST_USD_PER_JOB=${AI_MAX_COST_USD_PER_JOB:-2.0}
+      - AI_PRICE_IN_PER_1K=${AI_PRICE_IN_PER_1K:-0}
+      - AI_PRICE_OUT_PER_1K=${AI_PRICE_OUT_PER_1K:-0}
     volumes:
       - D:/pgm-media-storage/jobs:/data/projects:rw
     mem_limit: 1g
