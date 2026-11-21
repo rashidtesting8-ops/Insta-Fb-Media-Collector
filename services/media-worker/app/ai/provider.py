@@ -28,16 +28,20 @@ import json
 import os
 import re
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import requests
+
 SecretPattern = re.compile(r"(?i)(authorization|api[_-]?key|bearer|token)\s*[=:]\s*\S+")
+BearerPattern = re.compile(r"(?i)\bBearer\s+\S+")
 
 
 def scrub_secrets(text: str) -> str:
-    return SecretPattern.sub(r"\1=[REDACTED]", text or "")
+    # Bearer values first: the generic rule would replace the "Bearer" marker
+    # before the value could be matched, leaving the secret in the tail.
+    cleaned = BearerPattern.sub("Bearer [REDACTED]", text or "")
+    return SecretPattern.sub(r"\1=[REDACTED]", cleaned)
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -74,6 +78,9 @@ class AIProviderConfig:
     api_key: str = ""
     timeout_s: int = 120
     max_retries: int = 2
+    # Conservative vision batch size: several real vision models (including
+    # Groq's qwen/qwen3.8-27b) accept at most 3 images per request.
+    batch_size: int = 3
     max_requests_per_job: int = 40
     max_cost_usd_per_job: float = 2.0
     price_in_per_1k: float = 0.0
@@ -89,6 +96,7 @@ class AIProviderConfig:
             api_key=(e.get("AI_API_KEY") or "").strip(),
             timeout_s=int(e.get("AI_TIMEOUT_S") or 120),
             max_retries=int(e.get("AI_MAX_RETRIES") or 2),
+            batch_size=int(e.get("AI_BATCH_SIZE") or 3),
             max_requests_per_job=int(e.get("AI_MAX_REQUESTS_PER_JOB") or 40),
             max_cost_usd_per_job=float(e.get("AI_MAX_COST_USD_PER_JOB") or 2.0),
             price_in_per_1k=float(e.get("AI_PRICE_IN_PER_1K") or 0.0),
@@ -407,7 +415,10 @@ class OpenAICompatibleProvider(VisionProvider):
                 }
             ],
             "temperature": 0.2,
-            "max_tokens": 2000,
+            # The pipeline always requires strict JSON; this model declares
+            # json_mode support. Bounded cap large enough for a full batch.
+            "max_tokens": 4000,
+            "response_format": {"type": "json_object"},
         }
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
@@ -438,15 +449,19 @@ class OpenAICompatibleProvider(VisionProvider):
                 if not text.strip():
                     raise ValueError("empty content in provider response")
                 return CompletionResult(text=text, usage=usage)
-            except urllib.error.HTTPError as exc:
-                detail = scrub_secrets(getattr(exc, "read", lambda: b"")().decode("utf-8", "replace")[:200])
-                if exc.code == 429 or 500 <= exc.code < 600:
-                    last_error = f"HTTP {exc.code}: {detail}"
+            except requests.HTTPError as exc:
+                # Retry ONLY rate limits and transient server errors; 401/403
+                # are authoritative denials. Details are scrubbed of secrets.
+                response = getattr(exc, "response", None)
+                code = int(getattr(response, "status_code", 0) or 0)
+                detail = scrub_secrets(str(getattr(response, "text", "") or "")[:200])
+                if code == 429 or 500 <= code < 600:
+                    last_error = f"HTTP {code}: {detail}"
                     if attempt < self.config.max_retries:
                         self._sleep(2.0 * (2**attempt))
                         continue
-                raise RuntimeError(f"provider HTTP error: {scrub_secrets(str(exc))} {detail}") from exc
-            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                raise RuntimeError(f"provider HTTP error: HTTP {code} {detail}") from exc
+            except (requests.Timeout, requests.RequestException, ValueError) as exc:
                 last_error = scrub_secrets(str(exc))
                 if attempt < self.config.max_retries:
                     self._sleep(2.0 * (2**attempt))
@@ -456,10 +471,20 @@ class OpenAICompatibleProvider(VisionProvider):
 
     @staticmethod
     def _http_post(request: dict[str, Any]) -> dict[str, Any]:
-        data = json.dumps(request["body"]).encode("utf-8")
-        req = urllib.request.Request(request["url"], data=data, headers=request["headers"])
-        with urllib.request.urlopen(req, timeout=request["timeout_s"]) as resp:  # noqa: S310
-            return json.loads(resp.read().decode("utf-8"))
+        """Standard `requests` transport (default headers; no UA spoofing).
+
+        TLS verification stays ON; credentials remain in headers only and are
+        never logged or persisted. Bounded timeout comes from configuration.
+        """
+        response = requests.post(
+            request["url"],
+            headers=request["headers"],
+            json=request["body"],
+            timeout=request["timeout_s"],
+            verify=True,
+        )
+        response.raise_for_status()
+        return response.json()
 
 
 def build_provider(

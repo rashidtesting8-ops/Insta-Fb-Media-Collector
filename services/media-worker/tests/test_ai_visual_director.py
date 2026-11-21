@@ -397,12 +397,14 @@ def test_rate_limit_backoff_then_success():
                 raise _make_http_error(429)
             return {"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 5, "completion_tokens": 5}}
 
-    import urllib.error
+    import requests
+
     def _make_http_error(code):
-        try:
-            raise urllib.error.HTTPError(None, code, "rate limited", {}, None)  # type: ignore[arg-type]
-        except urllib.error.HTTPError as exc:
-            return exc
+        resp = requests.Response()
+        resp.status_code = code
+        resp._content = b"rate limited"
+        resp.url = "https://api.example.test/v1/chat/completions"
+        return requests.HTTPError(f"HTTP {code}", response=resp)
 
     from app.ai.provider import OpenAICompatibleProvider
     config = _config(provider="openai_compatible", model="vision-model",
