@@ -94,17 +94,24 @@ def extract_json_text(raw: str) -> str:
     return text
 
 
-def _parse_mode_a(raw: str, batch_ids: set[str]) -> tuple[ModeAResponse | None, list[str]]:
-    """Parse + strictly validate one MODE A response against the batch."""
+def _parse_mode_a(raw: str, batch_ids: set[str]) -> tuple[ModeAResponse | None, list[str], list[str]]:
+    """Parse + strictly validate one MODE A response against the batch.
+
+    Hard failures (hallucinated ids, duplicate items) are rejected. A model
+    that reports a quality_score inconsistent with its own breakdown is
+    repaired deterministically from that breakdown (no invented values) with
+    a recorded warning.
+    """
     problems: list[str] = []
+    warnings: list[str] = []
     try:
         data = json.loads(extract_json_text(raw))
     except json.JSONDecodeError as exc:
-        return None, [f"invalid JSON: {str(exc)[:120]}"]
+        return None, [f"invalid JSON: {str(exc)[:120]}"], []
     try:
         parsed = ModeAResponse.model_validate(data)
     except Exception as exc:  # noqa: BLE001 - validation failure detail
-        return None, [f"schema violation: {str(exc)[:200]}"]
+        return None, [f"schema violation: {str(exc)[:200]}"], []
     seen: set[str] = set()
     for item in parsed.items:
         if item.asset_id not in batch_ids:
@@ -115,12 +122,26 @@ def _parse_mode_a(raw: str, batch_ids: set[str]) -> tuple[ModeAResponse | None, 
             continue
         seen.add(item.asset_id)
         if not breakdown_matches_score(item):
-            problems.append(f"score breakdown mismatch: {item.asset_id}")
+            b = item.score_breakdown
+            total = round(
+                b.technical_quality
+                + b.business_relevance_authenticity
+                + b.composition_usability
+                + b.emotion_aesthetics
+                + b.distinctiveness_collection_fit
+                + b.evidence_confidence,
+                1,
+            )
+            warnings.append(
+                f"score breakdown normalized for {item.asset_id}: model reported "
+                f"{item.quality_score}, breakdown sums to {total}"
+            )
+            item.quality_score = max(0.0, min(100.0, total))
         if item.visual_analysis_status == "analyzed" and item.video_review_status == "full_video_reviewed":
             problems.append(f"unearned full_video_reviewed: {item.asset_id}")
     if problems:
-        return None, problems
-    return parsed, []
+        return None, problems, warnings
+    return parsed, [], warnings
 
 
 def _rights_review_ids(manifest: dict[str, Any], selected: list[str]) -> list[str]:
@@ -311,7 +332,8 @@ def run_ai_curation(
             except Exception as exc:  # noqa: BLE001 — provider failure honesty
                 attempt_errors.append(scrub_secrets(str(exc))[:160])
                 continue
-            parsed, problems = _parse_mode_a(completion.text, batch_ids)
+            parsed, problems, score_warnings = _parse_mode_a(completion.text, batch_ids)
+            result.warnings.extend(score_warnings)
             if parsed is not None:
                 break
             attempt_errors.extend(problems)
@@ -342,6 +364,19 @@ def run_ai_curation(
     if not analyzed:
         result.status = "failed"
         result.errors.append("all MODE A batches failed; no curation possible")
+        result.mode_a_items = mode_a_items
+        result.usage = tracker.as_dict()
+        result.coverage = {
+            "assets_supplied": len(candidates),
+            "assets_analyzed": 0,
+            "batches_total": total_batches,
+            "batches_failed": batch_failures,
+            "mode_status": "failed",
+            "prompt_version": PROMPT_VERSION,
+            "provider": result.provider,
+            "model": result.model,
+            "mock": result.mock,
+        }
         return result
 
     # --- duplicate members inherit the representative's analysis ----------
