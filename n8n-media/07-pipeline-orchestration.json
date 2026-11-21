@@ -231,8 +231,8 @@
       [{"node": "Respond Worker Unavailable", "type": "main", "index": 0}]
     ]},
     "Session": {"main": [[{"node": "Poll Job Status", "type": "main", "index": 0}]]},
-    "Poll Job Status": {"main": [[{"node": "Track Poll", "type": "main", "index": 0}]]},
-    "Track Poll": {"main": [[{"node": "Terminal?", "type": "main", "index": 0}]]},
+    "Poll Job Status": {"main": [[{"node": "Map Stage", "type": "main", "index": 0}]]},
+    "Map Stage": {"main": [[{"node": "Terminal?", "type": "main", "index": 0}]]},
     "Terminal?": {"main": [
       [{"node": "Rights Gate", "type": "main", "index": 0}],
       [{"node": "Poll Budget Exceeded?", "type": "main", "index": 0}]
