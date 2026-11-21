@@ -9,6 +9,7 @@ no fabricated assets, no mock/fixture curation released by default.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -98,11 +99,24 @@ def build_delivery_plan(
             "rights_review_required": item.get("rights_status", "unverified") != "verified" or aid in rights_review,
             "upload_key": f"{aid}:{sha}",  # deterministic retry/idempotency key
         })
+    # Reuse prior delivery state (retry safety): never re-upload an already uploaded key.
+    existing_delivery = {}
+    delivery_path = job_dir / "delivery.json"
+    if delivery_path.is_file():
+        try:
+            existing_delivery = json.loads(delivery_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing_delivery = {}
+    uploaded_keys = [str(u.get("upload_key")) for u in (existing_delivery.get("uploaded") or []) if u.get("upload_key")]
+    pending_uploads = [a for a in assets if a["upload_key"] not in uploaded_keys]
     status = "ready" if assets and not errors else ("partial" if assets else "failed")
     return {
         "status": status, "job_id": job_id,
         "folder_name": sanitize_folder_name(business_name or manifest.get("website_url", ""), job_id),
         "assets": assets, "errors": errors[:30],
+        "pending_uploads": pending_uploads,
+        "uploaded_keys": uploaded_keys,
+        "drive_folder_id": existing_delivery.get("drive_folder_id"),
         "pending_rights_ids": [a["asset_id"] for a in assets if a["rights_review_required"]],
         "note": "n8n owns Google Drive credentials/uploads; files are never made public automatically.",
     }
@@ -119,8 +133,30 @@ def finalize_delivery(
     no upload is recorded as an approved commercial release."""
     job_dir = Path(job_dir)
     by_key = {a["upload_key"]: a for a in plan.get("assets", [])}
-    ledger: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    # Merge with any prior ledger so retries do not lose successful uploads.
+    existing_ledger = []
+    existing_path = job_dir / "delivery.json"
+    if existing_path.is_file():
+        try:
+            existing_ledger = list((json.loads(existing_path.read_text(encoding="utf-8")) or {}).get("uploaded") or [])
+        except (OSError, json.JSONDecodeError):
+            existing_ledger = []
+    ledger = []
+    seen = set()
+    for upload in existing_ledger:
+        key = str(upload.get("upload_key") or "")
+        asset = by_key.get(key)
+        if asset is None or key in seen:
+            continue
+        seen.add(key)
+        ledger.append({
+            "asset_id": asset["asset_id"], "upload_key": key,
+            "drive_file_id": upload.get("drive_file_id"),
+            "drive_link": upload.get("drive_link"),
+            "status": upload.get("status", "failed"),
+            "error": upload.get("error"),
+            "sha256": asset["sha256"], "rights_status": asset["rights_status"],
+        })
     for upload in uploads:
         key = str(upload.get("upload_key") or "")
         asset = by_key.get(key)
