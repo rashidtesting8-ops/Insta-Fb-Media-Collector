@@ -327,3 +327,17 @@ Add these to the **local** `.env` (use `.env.example` as the template), then rec
 - **No non-mock `curation.json` produced.** The earlier mock curation on D: remains labeled `mock: true` and was not relabelled.
 
 **Offline regression suite:** new tests cover 512 px resizing, JPEG byte target, base64 expansion, full-body preflight, 413 no-retry, 429 Retry-After, quota exhaustion, request pacing, and the two new MODE B honesty fixes, plus all Phase 1–5 regressions (final count recorded after the rebuild). **Phase 6 not started; MODE B live curation remains pending a fresh bounded run with the fixed validator.**
+
+---
+
+## 17. FINAL live MODE A/B acceptance (merged `d5396cd…`) — **BLOCKED: provider payload-size rejection returned as 429**
+
+**Environment verified:** clean tree pulled to `d5396cdd90b73acb9271922516320bccb366caee`; worker rebuilt no-cache from merged main; model `qwen/qwen3.8-27b` available (models GET 200); config active: `AI_BATCH_SIZE=1`, `AI_MAX_IMAGE_DIM=512`, `AI_MAX_IMAGE_BYTES=300000`, `AI_MAX_REQUEST_BYTES=1000000`, `AI_MIN_REQUEST_SPACING_S=2`, request cap 3, cost ceiling $0.25. Minimal job `phase5-live-one` holds one real D: image (`fb_0001_67c48d0bed10`, `rights_status: unverified`).
+
+**Attempt 1 (before score-normalization fix):** MODE A reached MODE B but the model's `quality_score` disagreed with its own 25/25/20/15/10/5 breakdown; strict validation rejected it. Fix applied: derive the score deterministically from the model's breakdown (no invented values) and record a warning; all-batch-failure now preserves usage/coverage instead of returning empty results. Offline suite: **90 passed**.
+
+**Attempt 2 (with fix):** MODE A was rejected by Groq with **HTTP 429** whose body begins `"Request too large for model qwen/qwen3.8-27b in organization … service tier on_demand"` — a payload-size rejection delivered with a rate-limit status. Rate headers showed full quota (`x-ratelimit-remaining-requests: 1000`, `x-ratelimit-remaining-tokens: 8000`, reset `1ms`), so this was **not quota exhaustion**, but it *was* a 429: per the approval I stopped immediately. **No third request, no model switch, no proxy/UA workaround, no mock substitution.**
+
+**Genuine results:** provider `openai_compatible`, model `qwen/qwen3.8-27b`, `mock: false`; job `phase5-live-one`; **1 request in this attempt, 0 tokens billed, $0.00 cost**; `visual_analysis_status: unavailable` for the single asset; no MODE B call, no `curation.json` produced. The pre-existing mock curation on D: remains labeled `mock: true`.
+
+**Remaining blocker:** this model/service tier rejects the multimodal request size even with 512 px / 300 KB local limits (prompt + image tokens exceed its on-demand allowance). A fresh approval would be needed to test a substantially smaller payload (e.g. 256 px / ≤100 KB and a shorter MODE A prompt). **Live MODE A/B success is NOT demonstrated; Phase 6 remains unstarted.** Offline suite 90/90; worker + both n8n healthy; all data preserved.

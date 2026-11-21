@@ -670,6 +670,30 @@ def test_mode_b_failure_keeps_mode_a_results_and_usage(tmp_path):
     assert result.coverage.get("mode_b_status") == "failed"
 
 
+def test_mode_a_score_normalized_when_model_breakdown_disagrees(tmp_path):
+    class BadArithmeticMock(MockVisionProvider):
+        def complete(self, prompt, images, tracker):
+            result = super().complete(prompt, images, tracker)
+            data = json.loads(result.text)
+            if data.get("mode") == "ANALYZE_BATCH" and data["items"]:
+                data["items"][0]["quality_score"] = 99.0  # breakdown sums elsewhere
+                result = CompletionResult(text=json.dumps(data), usage=result.usage)
+            return result
+
+    job = _full_ai_job(tmp_path, count=3)
+    result = _run(job, provider=BadArithmeticMock(), config=_config(max_retries=0))
+    assert result.status == "completed"
+    assert any("score breakdown normalized" in w for w in result.warnings)
+    item = result.mode_a_items[0]
+    b = item["score_breakdown"]
+    expected = round(
+        b["technical_quality"] + b["business_relevance_authenticity"]
+        + b["composition_usability"] + b["emotion_aesthetics"]
+        + b["distinctiveness_collection_fit"] + b["evidence_confidence"], 1
+    )
+    assert abs(item["quality_score"] - expected) <= 0.1
+
+
 def test_build_provider_factory():
     mock, status = build_provider(AIProviderConfig(provider="mock"))
     assert status == "mock" and isinstance(mock, MockVisionProvider)
