@@ -483,12 +483,45 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
         slots.release()
 
 
-@app.get("/jobs/{job_id}")
-def get_job(job_id: str) -> dict[str, Any]:
+@app.get("/jobs")
+def list_jobs() -> dict[str, Any]:
+    records = _all_job_records()
+    items = []
+    for rec in records:
+        if not isinstance(rec, dict) or not rec.get("job_id"):
+            continue
+        items.append(
+            {
+                "job_id": rec.get("job_id"),
+                "status": rec.get("status"),
+                "website_url": rec.get("website_url"),
+                "created_at": rec.get("created_at"),
+                "updated_at": rec.get("updated_at"),
+            }
+        )
+    items.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    return {"jobs": items, "total": len(items)}
+
+
+@app.get("/jobs/{job_id}/file")
+def get_job_file(job_id: str, path: str) -> Any:
+    from fastapi.responses import FileResponse
+
     rec = fetch(job_id)
     if rec is None:
         raise HTTPException(404, "Unknown job")
-    return rec
+    job_dir = (Path(DATA_DIR) / job_id).resolve()
+    if not job_dir.is_dir():
+        raise HTTPException(404, "Job directory missing")
+    # Strict traversal guard: only files inside the job directory.
+    candidate = (job_dir / (path or "")).resolve()
+    try:
+        candidate.relative_to(job_dir)
+    except ValueError:
+        raise HTTPException(400, "Invalid path")
+    if not candidate.is_file():
+        raise HTTPException(404, "File not found")
+    return FileResponse(candidate)
 
 
 
