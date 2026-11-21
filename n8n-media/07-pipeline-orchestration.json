@@ -1,0 +1,282 @@
+{
+  "name": "07 - Phase 7 Pipeline Orchestration (status + rights + delivery)",
+  "nodes": [
+    {
+      "parameters": {"httpMethod": "POST", "path": "pipeline-intake", "responseMode": "responseNode", "options": {}},
+      "id": "p7-0001", "name": "Pipeline Intake Webhook",
+      "type": "n8n-nodes-base.webhook", "typeVersion": 2.1,
+      "position": [220, 300], "webhookId": "p7wh-intake"
+    },
+    {
+      "parameters": {"method": "POST", "url": "http://collector:8787/intake/validate", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify($json.body || {}) }}", "options": {}},
+      "id": "p7-0002", "name": "Validate Intake",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "v1", "leftValue": "={{ $json.valid }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
+      "id": "p7-0003", "name": "Intake Valid?",
+      "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ ok: false, stage: 'failed', errors: $json.errors || [] }) }}", "options": {"responseCode": 400}},
+      "id": "p7-0004", "name": "Respond Invalid Input",
+      "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4,
+      "position": [880, 480]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "r1", "leftValue": "={{ $json.resume }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
+      "id": "p7-0005", "name": "Resume Job?",
+      "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+      "position": [880, 240]
+    },
+    {
+      "parameters": {"method": "POST", "url": "http://collector:8787/jobs", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify($json.create || {}) }}", "options": {}},
+      "id": "p7-0006", "name": "Create Worker Job",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [1100, 360], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "c1", "leftValue": "={{ !!$json.job_id }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
+      "id": "p7-0007", "name": "Created?",
+      "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+      "position": [1320, 360]
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ stage: 'blocked', detail: String($json.error || $json.message || 'worker unavailable') }) }}", "options": {"responseCode": 200}},
+      "id": "p7-0008", "name": "Respond Worker Unavailable",
+      "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4,
+      "position": [1540, 480]
+    },
+    {
+      "parameters": {"jsCode": "const v = $('Validate Intake').item.json;\nconst sd = $getWorkflowStaticData('global');\nsd.pollAttempts = sd.pollAttempts || {};\nconst jobId = $json.job_id;\nsd.pollAttempts[jobId] = 0;\nreturn [{ json: { job_id: jobId, authorization_confirmed: !!v.authorization_confirmed, business_name: v.business_name || '', idempotency_key: v.idempotency_key || '', attempts: 0 } }];"},
+      "id": "p7-0009", "name": "Session",
+      "type": "n8n-nodes-base.code", "typeVersion": 2,
+      "position": [1540, 240]
+    },
+    {
+      "parameters": {"method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $json.job_id + '/pipeline-status' }}", "options": {}},
+      "id": "p7-0010", "name": "Poll Job Status",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [1760, 240], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"jsCode": "const sd = $getWorkflowStaticData('global');\nsd.pollAttempts = sd.pollAttempts || {};\nconst j = $json || {};\nconst id = j.job_id;\nsd.pollAttempts[id] = (sd.pollAttempts[id] || 0) + 1;\nconst attempts = sd.pollAttempts[id];\nconst sess = $('Session').item.json || {};\nreturn [{ json: Object.assign({}, j, { attempts: attempts, max_attempts: 120, authorization_confirmed: !!sess.authorization_confirmed, business_name: sess.business_name || '' }) }];"},
+      "id": "p7-0011", "name": "Track Poll",
+      "type": "n8n-nodes-base.code", "typeVersion": 2,
+      "position": [1980, 240]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "t1", "leftValue": "={{ $json.terminal === true }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
+      "id": "p7-0012", "name": "Terminal?",
+      "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+      "position": [2200, 240]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "b1", "leftValue": "={{ $json.attempts >= $json.max_attempts }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
+      "id": "p7-0013", "name": "Poll Budget Exceeded?",
+      "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+      "position": [2420, 420]
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ job_id: $('Track Poll').item.json.job_id, stage: 'blocked', detail: 'polling_timeout', last_stage: $('Track Poll').item.json.stage }) }}", "options": {"responseCode": 200}},
+      "id": "p7-0014", "name": "Respond Polling Timeout",
+      "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4,
+      "position": [2640, 540]
+    },
+    {
+      "parameters": {"resume": "timeInterval", "amount": 10, "unit": "seconds"},
+      "id": "p7-0015", "name": "Wait Before Retry",
+      "type": "n8n-nodes-base.wait", "typeVersion": 1.0,
+      "position": [2640, 300]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "rg1", "leftValue": "={{ $json.stage === 'awaiting_rights_approval' }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
+      "id": "p7-0016", "name": "Rights Gate",
+      "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+      "position": [2420, 120]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "ac1", "leftValue": "={{ $json.authorization_confirmed === true }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
+      "id": "p7-0017", "name": "Authorization Confirmed?",
+      "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+      "position": [2640, 60]
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ job_id: $('Track Poll').item.json.job_id, stage: 'awaiting_rights_approval', detail: 'Rights approval required before Drive delivery.', authorization_confirmed: false }) }}", "options": {"responseCode": 200}},
+      "id": "p7-0018", "name": "Respond Awaiting Rights",
+      "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4,
+      "position": [2860, 180]
+    },
+    {
+      "parameters": {"method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $('Track Poll').item.json.job_id + '/delivery' }}", "options": {}},
+      "id": "p7-0019", "name": "Check Existing Delivery",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [2860, -60], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "dd1", "leftValue": "={{ $json.status === 'completed' }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
+      "id": "p7-0020", "name": "Delivery Already Done?",
+      "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+      "position": [3080, -60]
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify($json) }}", "options": {"responseCode": 200}},
+      "id": "p7-0021", "name": "Respond Final Status",
+      "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4,
+      "position": [3300, 60]
+    },
+    {
+      "parameters": {"method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $('Track Poll').item.json.job_id + '/delivery-plan?business_name=' + encodeURIComponent($('Track Poll').item.json.business_name || '') }}", "options": {}},
+      "id": "p7-0022", "name": "Get Delivery Plan",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [3300, -180]
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "pr1", "leftValue": "={{ $json.status === 'ready' }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
+      "id": "p7-0023", "name": "Plan Ready?",
+      "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+      "position": [3520, -180]
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ job_id: $('Track Poll').item.json.job_id, stage: 'blocked', detail: ($json.errors && $json.errors[0]) || $json.status || 'delivery blocked', plan_status: $json.status }) }}", "options": {"responseCode": 200}},
+      "id": "p7-0024", "name": "Respond Blocked",
+      "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4,
+      "position": [3740, -60]
+    },
+    {
+      "parameters": {"method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Track Poll').item.json.job_id + '/orchestration' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ stage: 'delivering', detail: 'Drive delivery in progress.' }) }}", "options": {}},
+      "id": "p7-0025", "name": "Mark Delivering",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [3740, -300]
+    },
+    {
+      "parameters": {"authentication": "oAuth2", "resource": "folder", "operation": "create", "name": "={{ $('Get Delivery Plan').item.json.folder_name }}", "parents": {"parentId": {"__rl": true, "value": "root", "mode": "id"}}, "options": {}},
+      "id": "p7-0026", "name": "Create Business Drive Folder",
+      "type": "n8n-nodes-base.googleDrive", "typeVersion": 3,
+      "credentials": {"googleDriveOAuth2Api": {"id": "GOOGLE_DRIVE_CREDENTIAL_ID", "name": "Google Drive account"}},
+      "position": [3960, -300], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2}, "conditions": [{"id": "fc1", "leftValue": "={{ !!$json.id }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}},
+      "id": "p7-0027", "name": "Folder Created?",
+      "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+      "position": [4180, -300]
+    },
+    {
+      "parameters": {"batchSize": 1, "options": {}},
+      "id": "p7-0028", "name": "Split Assets",
+      "type": "n8n-nodes-base.splitInBatches", "typeVersion": 3,
+      "position": [4400, -420]
+    },
+    {
+      "parameters": {"operation": "read", "fileSelector": "={{ $json.n8n_path }}", "options": {"dataPropertyName": "data"}},
+      "id": "p7-0029", "name": "Read Selected Original",
+      "type": "n8n-nodes-base.readWriteFile", "typeVersion": 1,
+      "position": [4620, -420]
+    },
+    {
+      "parameters": {"authentication": "oAuth2", "resource": "file", "operation": "upload", "fileName": "={{ $binary.data.fileName }}", "parents": {"parentId": {"__rl": true, "value": "={{ $('Create Business Drive Folder').item.json.id }}", "mode": "id"}}, "binaryPropertyName": "data", "options": {}},
+      "id": "p7-0030", "name": "Upload Original to Drive",
+      "type": "n8n-nodes-base.googleDrive", "typeVersion": 3,
+      "credentials": {"googleDriveOAuth2Api": {"id": "GOOGLE_DRIVE_CREDENTIAL_ID", "name": "Google Drive account"}},
+      "position": [4840, -420], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Track Poll').item.json.job_id + '/delivery-result' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ authorization_confirmed: $('Track Poll').item.json.authorization_confirmed, drive_folder_id: $('Create Business Drive Folder').item.json.id, uploads: $('Upload Original to Drive').all().map((u, i) => ({ upload_key: $('Split Assets').all()[i].json.upload_key, drive_file_id: (u.json && u.json.id) || null, drive_link: (u.json && u.json.webViewLink) || null, status: (u.json && u.json.id) ? 'uploaded' : 'failed', error: (u.json && u.json.error) ? String(u.json.error.message || u.json.error) : null })) }) }}", "options": {}},
+      "id": "p7-0031", "name": "Persist Delivery Ledger",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [5060, -300]
+    },
+    {
+      "parameters": {"method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Track Poll').item.json.job_id + '/orchestration' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ stage: $json.stage, detail: $json.detail || '' }) }}", "options": {}},
+      "id": "p7-0032", "name": "Persist Final Status",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [2640, 60]
+    },
+    {
+      "parameters": {"httpMethod": "GET", "path": "pipeline-status", "responseMode": "responseNode", "options": {}},
+      "id": "p7-0033", "name": "Status Webhook",
+      "type": "n8n-nodes-base.webhook", "typeVersion": 2.1,
+      "position": [220, 700], "webhookId": "p7wh-status"
+    },
+    {
+      "parameters": {"method": "GET", "url": "={{ 'http://collector:8787/jobs/' + ($json.query && $json.query.job_id ? $json.query.job_id : '') + '/pipeline-status' }}", "options": {}},
+      "id": "p7-0034", "name": "Status Job Lookup",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [440, 700], "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify($json) }}", "options": {"responseCode": 200}},
+      "id": "p7-0035", "name": "Respond Status",
+      "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4,
+      "position": [660, 700]
+    }
+  ],
+  "connections": {
+    "Pipeline Intake Webhook": {"main": [[{"node": "Validate Intake", "type": "main", "index": 0}]]},
+    "Validate Intake": {"main": [[{"node": "Intake Valid?", "type": "main", "index": 0}]]},
+    "Intake Valid?": {"main": [
+      [{"node": "Resume Job?", "type": "main", "index": 0}],
+      [{"node": "Respond Invalid Input", "type": "main", "index": 0}]
+    ]},
+    "Resume Job?": {"main": [
+      [{"node": "Session", "type": "main", "index": 0}],
+      [{"node": "Create Worker Job", "type": "main", "index": 0}]
+    ]},
+    "Create Worker Job": {"main": [[{"node": "Created?", "type": "main", "index": 0}]]},
+    "Created?": {"main": [
+      [{"node": "Session", "type": "main", "index": 0}],
+      [{"node": "Respond Worker Unavailable", "type": "main", "index": 0}]
+    ]},
+    "Session": {"main": [[{"node": "Poll Job Status", "type": "main", "index": 0}]]},
+    "Poll Job Status": {"main": [[{"node": "Track Poll", "type": "main", "index": 0}]]},
+    "Track Poll": {"main": [[{"node": "Terminal?", "type": "main", "index": 0}]]},
+    "Terminal?": {"main": [
+      [{"node": "Rights Gate", "type": "main", "index": 0}],
+      [{"node": "Poll Budget Exceeded?", "type": "main", "index": 0}]
+    ]},
+    "Poll Budget Exceeded?": {"main": [
+      [{"node": "Respond Polling Timeout", "type": "main", "index": 0}],
+      [{"node": "Wait Before Retry", "type": "main", "index": 0}]
+    ]},
+    "Wait Before Retry": {"main": [[{"node": "Poll Job Status", "type": "main", "index": 0}]]},
+    "Rights Gate": {"main": [
+      [{"node": "Authorization Confirmed?", "type": "main", "index": 0}],
+      [{"node": "Persist Final Status", "type": "main", "index": 0}]
+    ]},
+    "Authorization Confirmed?": {"main": [
+      [{"node": "Check Existing Delivery", "type": "main", "index": 0}],
+      [{"node": "Respond Awaiting Rights", "type": "main", "index": 0}]
+    ]},
+    "Check Existing Delivery": {"main": [[{"node": "Delivery Already Done?", "type": "main", "index": 0}]]},
+    "Delivery Already Done?": {"main": [
+      [{"node": "Respond Final Status", "type": "main", "index": 0}],
+      [{"node": "Get Delivery Plan", "type": "main", "index": 0}]
+    ]},
+    "Get Delivery Plan": {"main": [[{"node": "Plan Ready?", "type": "main", "index": 0}]]},
+    "Plan Ready?": {"main": [
+      [{"node": "Mark Delivering", "type": "main", "index": 0}],
+      [{"node": "Respond Blocked", "type": "main", "index": 0}]
+    ]},
+    "Mark Delivering": {"main": [[{"node": "Create Business Drive Folder", "type": "main", "index": 0}]]},
+    "Create Business Drive Folder": {"main": [[{"node": "Folder Created?", "type": "main", "index": 0}]]},
+    "Folder Created?": {"main": [
+      [{"node": "Split Assets", "type": "main", "index": 0}],
+      [{"node": "Respond Blocked", "type": "main", "index": 0}]
+    ]},
+    "Split Assets": {"main": [
+      [{"node": "Persist Delivery Ledger", "type": "main", "index": 0}],
+      [{"node": "Read Selected Original", "type": "main", "index": 0}]
+    ]},
+    "Read Selected Original": {"main": [[{"node": "Upload Original to Drive", "type": "main", "index": 0}]]},
+    "Upload Original to Drive": {"main": [[{"node": "Split Assets", "type": "main", "index": 0}]]},
+    "Persist Delivery Ledger": {"main": [[{"node": "Respond Final Status", "type": "main", "index": 0}]]},
+    "Persist Final Status": {"main": [[{"node": "Respond Final Status", "type": "main", "index": 0}]]},
+    "Status Webhook": {"main": [[{"node": "Status Job Lookup", "type": "main", "index": 0}]]},
+    "Status Job Lookup": {"main": [[{"node": "Respond Status", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1"},
+  "active": false
+}

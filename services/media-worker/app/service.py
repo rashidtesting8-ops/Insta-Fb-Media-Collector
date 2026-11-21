@@ -67,6 +67,18 @@ def fetch(job_id: str) -> dict[str, Any] | None:
     return json.loads(row[0]) if row else None
 
 
+def _all_job_records() -> list[dict[str, Any]]:
+    with connect() as con:
+        rows = con.execute("SELECT payload FROM jobs").fetchall()
+    out: list[dict[str, Any]] = []
+    for (blob,) in rows:
+        try:
+            out.append(json.loads(blob))
+        except (TypeError, json.JSONDecodeError):
+            continue
+    return out
+
+
 # Recover jobs left running/queued across a restart (fail-closed: mark interrupted).
 with connect() as _db:
     for _id, _blob in _db.execute("SELECT id, payload FROM jobs").fetchall():
@@ -117,6 +129,12 @@ class CreateJobRequest(BaseModel):
             "visual_preferences. Never fabricated by the pipeline."
         ),
     )
+    idempotency_key: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Optional client-supplied idempotency key for duplicate webhook protection.",
+    )
+
 
 
 @app.get("/health")
@@ -150,9 +168,24 @@ def status(request: Request) -> object:
 
 
 @app.post("/jobs", status_code=202)
-def create_job(req: CreateJobRequest) -> dict[str, str]:
+def create_job(req: CreateJobRequest) -> dict[str, Any]:
     if not slots.acquire(blocking=False):
         raise HTTPException(429, "Worker busy; retry later")
+    if req.idempotency_key:
+        try:
+            from app.orchestration import find_idempotent_job
+
+            existing_id = find_idempotent_job(_all_job_records(), str(req.idempotency_key))
+        except Exception:  # noqa: BLE001
+            existing_id = None
+        if existing_id:
+            slots.release()
+            rec = fetch(existing_id)
+            return {
+                "job_id": existing_id,
+                "status": (rec or {}).get("status", "queued"),
+                "idempotent_reuse": True,
+            }
     job_id = uuid.uuid4().hex
     now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
     payload: dict[str, Any] = {
@@ -171,7 +204,7 @@ def create_job(req: CreateJobRequest) -> dict[str, str]:
         "max_social_files": req.max_social_files,
         "run_ai_curation": req.run_ai_curation,
         "business_context": req.business_context,
-        "created_at": now_iso,
+        "idempotency_key": req.idempotency_key,
         "updated_at": now_iso,
         "sources": {
             "website": {"status": "queued"},
@@ -215,7 +248,7 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             sources[platform] = {
                 "status": "running" if payload.get(f"{platform}_url") else "not_requested"
             }
-        store({**payload, "status": "running", "sources": sources, "updated_at": _now()})
+        store({**payload, "status": "running", "sources": sources, "pipeline_stage": "collecting", "updated_at": _now()})
 
         job_dir = Path(DATA_DIR) / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -319,6 +352,7 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             except Exception as exc:  # noqa: BLE001 — manifest failure is recorded
                 sources["manifest"] = {"status": "failed", "error": str(exc)[:240]}
 
+        store({**payload, "status": "running", "sources": {**sources, "website": website_status}, "pipeline_stage": "preprocessing", "updated_at": _now()})
         # --- Phase 4 media preprocessing (isolated; partial-failure safe) --
         preprocessing_record: dict[str, Any] = {"status": "not_run"}
         if manifest_file.is_file():
@@ -351,6 +385,8 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             except Exception as exc:  # noqa: BLE001 — preprocessing failure is recorded
                 preprocessing_record = {"status": "failed", "error": str(exc)[:240]}
 
+        if payload.get("run_ai_curation") and manifest_file.is_file():
+            store({**payload, "status": "running", "sources": {**sources, "website": website_status}, "pipeline_stage": "ai_processing", "updated_at": _now()})
         # --- Phase 5 AI curation (optional; isolated; honest failure) ------
         ai_record: dict[str, Any] = {"status": "not_requested"}
         if payload.get("run_ai_curation") and manifest_file.is_file():
@@ -455,6 +491,56 @@ def get_job(job_id: str) -> dict[str, Any]:
     return rec
 
 
+
+
+@app.post("/intake/validate")
+def validate_intake_endpoint(body: dict[str, Any]) -> dict[str, Any]:
+    from app.orchestration import validate_intake
+
+    return validate_intake(body or {})
+
+
+@app.get("/jobs/{job_id}/pipeline-status")
+def get_pipeline_status(job_id: str) -> dict[str, Any]:
+    rec = fetch(job_id)
+    if rec is None:
+        raise HTTPException(404, "Unknown job")
+    from app.orchestration import derive_stage
+
+    delivery = None
+    job_dir = Path(DATA_DIR) / job_id
+    delivery_path = job_dir / "delivery.json"
+    if delivery_path.is_file():
+        try:
+            delivery = json.loads(delivery_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            delivery = None
+    return derive_stage(rec, delivery)
+
+
+@app.post("/jobs/{job_id}/orchestration")
+def post_orchestration(job_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    rec = fetch(job_id)
+    if rec is None:
+        raise HTTPException(404, "Unknown job")
+    from app.orchestration import STAGES
+
+    stage = str((body or {}).get("stage") or "").strip()
+    if stage not in STAGES:
+        raise HTTPException(400, "Unknown stage: " + stage)
+    detail = str((body or {}).get("detail") or "")[:500]
+    job_dir = Path(DATA_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    orch = rec.get("orchestration") if isinstance(rec.get("orchestration"), dict) else {}
+    history = list(orch.get("history") or [])
+    history.append({"stage": stage, "detail": detail, "at": _dt.datetime.now(_dt.timezone.utc).isoformat()})
+    history = history[-20:]
+    orch = {"stage": stage, "detail": detail, "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "history": history}
+    rec["orchestration"] = orch
+    rec["updated_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    store(rec)
+    return {"ok": True, "job_id": job_id, "stage": stage}
+
 @app.get("/jobs/{job_id}/delivery-plan")
 def get_delivery_plan(job_id: str, business_name: str = "") -> dict[str, Any]:
     rec = fetch(job_id)
@@ -474,16 +560,29 @@ def post_delivery_result(job_id: str, payload: dict[str, Any]) -> dict[str, Any]
     from app.manifest import atomic_write_json
 
     job_dir = Path(DATA_DIR) / job_id
-    plan = json_load(job_dir / "delivery.json") if (job_dir / "delivery.json").is_file() else {}
-    plan = plan.get("plan") or plan  # tolerate a plan echoed back by n8n
+    plan = {}
+    if (job_dir / "delivery.json").is_file():
+        try:
+            plan = json_load(job_dir / "delivery.json")
+        except (OSError, json.JSONDecodeError):
+            plan = {}
+    if not plan.get("assets"):
+        try:
+            from app.delivery import build_delivery_plan
+
+            plan = build_delivery_plan(job_dir, job_id, str(payload.get("business_name") or ""), allow_fixture=False)
+        except Exception:  # noqa: BLE001
+            plan = plan or {}
     result = finalize_delivery(
         job_dir,
         plan,
         list(payload.get("uploads") or []),
         authorization_confirmed=bool(payload.get("authorization_confirmed")),
     )
-    result["drive_folder_id"] = payload.get("drive_folder_id")
-    result["drive_folder_link"] = payload.get("drive_folder_link")
+    if payload.get("drive_folder_id") is not None:
+        result["drive_folder_id"] = payload.get("drive_folder_id")
+    if payload.get("drive_folder_link") is not None:
+        result["drive_folder_link"] = payload.get("drive_folder_link")
     atomic_write_json(job_dir / "delivery.json", result)
     return result
 
