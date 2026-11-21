@@ -45,7 +45,7 @@
 
 ## GitHub PR URL and CI status
 
-Branch `feat/phase7-n8n-orchestration`, PR to be opened into `main`; CI `tests` workflow to be verified after push.
+Branch `feat/phase7-n8n-orchestration`, PR #9 https://github.com/rashidtesting8-ops/Insta-Fb-Media-Collector/pull/9, CI run #23 success (merge commit sha b6eecd9).
 
 ## Phase 8 readiness
 
