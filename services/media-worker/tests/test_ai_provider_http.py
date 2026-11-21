@@ -124,7 +124,8 @@ def test_429_retries_exponentially_then_succeeds():
     result = provider.complete("p", [], UsageTracker(_config()))
     assert result.text.startswith('{"mode"')
     assert calls["n"] == 3
-    assert sleeps == [2.0, 4.0]
+    # pacing adds spacing sleeps; the 429 backoff values must still appear
+    assert 2.0 in sleeps and 4.0 in sleeps
 
 
 def test_5xx_bounded_retry_then_failure():

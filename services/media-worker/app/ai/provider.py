@@ -52,6 +52,14 @@ class BudgetExceededError(RuntimeError):
     """Raised when the per-job AI budget (requests/cost) is exhausted."""
 
 
+class RequestTooLargeError(RuntimeError):
+    """Raised locally before any HTTP call when the full JSON body is oversized."""
+
+
+class RateLimitedError(RuntimeError):
+    """Raised when the provider signals an exhausted quota window; no retries."""
+
+
 @dataclass
 class AIUsage:
     requests: int = 0
@@ -59,15 +67,19 @@ class AIUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    rate_limit_snapshot: dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "requests": self.requests,
             "retries": self.retries,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "estimated_cost_usd": round(self.estimated_cost_usd, 6),
         }
+        if self.rate_limit_snapshot:
+            result["rate_limit_snapshot"] = self.rate_limit_snapshot
+        return result
 
 
 @dataclass
@@ -83,6 +95,10 @@ class AIProviderConfig:
     batch_size: int = 3
     max_requests_per_job: int = 40
     max_cost_usd_per_job: float = 2.0
+    max_image_dim: int = 512          # conservative multimodal payload
+    max_image_bytes: int = 300_000    # encoded JPEG target per image
+    max_request_bytes: int = 1_000_000  # FULL JSON body incl. base64 expansion
+    min_request_spacing_s: float = 2.0  # gentle pacing for free-tier RPM/TPM
     price_in_per_1k: float = 0.0
     price_out_per_1k: float = 0.0
 
@@ -99,6 +115,10 @@ class AIProviderConfig:
             batch_size=int(e.get("AI_BATCH_SIZE") or 3),
             max_requests_per_job=int(e.get("AI_MAX_REQUESTS_PER_JOB") or 40),
             max_cost_usd_per_job=float(e.get("AI_MAX_COST_USD_PER_JOB") or 2.0),
+            max_image_dim=int(e.get("AI_MAX_IMAGE_DIM") or 512),
+            max_image_bytes=int(e.get("AI_MAX_IMAGE_BYTES") or 300_000),
+            max_request_bytes=int(e.get("AI_MAX_REQUEST_BYTES") or 1_000_000),
+            min_request_spacing_s=float(e.get("AI_MIN_REQUEST_SPACING_S") or 2.0),
             price_in_per_1k=float(e.get("AI_PRICE_IN_PER_1K") or 0.0),
             price_out_per_1k=float(e.get("AI_PRICE_OUT_PER_1K") or 0.0),
         )
@@ -151,6 +171,21 @@ class UsageTracker:
 
     def as_dict(self) -> dict[str, Any]:
         return self.usage.as_dict()
+
+    def record_headers(self, headers: Any) -> None:
+        """Non-secret rate-limit header snapshot (Groq documents these)."""
+        try:
+            for key in (
+                "x-ratelimit-remaining-requests",
+                "x-ratelimit-remaining-tokens",
+                "x-ratelimit-reset-requests",
+                "x-ratelimit-reset-tokens",
+            ):
+                value = headers.get(key) if headers else None
+                if value is not None:
+                    self.usage.rate_limit_snapshot[key] = str(value)[:60]
+        except (AttributeError, TypeError):
+            pass
 
 
 class VisionProvider:
@@ -390,6 +425,7 @@ class OpenAICompatibleProvider(VisionProvider):
         self.config = config
         self._sleep = sleep
         self._transport = transport or self._http_post
+        self._last_request = -1e9  # pacing: no wait on first call
 
     def complete(
         self,
@@ -424,8 +460,23 @@ class OpenAICompatibleProvider(VisionProvider):
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
 
+        # LOCAL PREFLIGHT: reject oversized requests before any HTTP call.
+        # The measurement includes base64-expanded pixels and the full body.
+        estimated = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        if int(len(estimated) * 1.05) > self.config.max_request_bytes:
+            raise RequestTooLargeError(
+                f"request body {len(estimated)} bytes exceeds local cap "
+                f"{self.config.max_request_bytes}; reduce AI_MAX_IMAGE_DIM/"
+                f"AI_MAX_IMAGE_BYTES or AI_BATCH_SIZE"
+            )
+
         last_error = ""
         for attempt in range(self.config.max_retries + 1):
+            # Gentle pacing between calls (free-tier RPM/TPM friendliness).
+            due = self.config.min_request_spacing_s - (time.monotonic() - self._last_request)
+            if due > 0:
+                self._sleep(due)
+            self._last_request = time.monotonic()
             tracker.pre_flight()
             try:
                 response = self._transport(
@@ -450,12 +501,28 @@ class OpenAICompatibleProvider(VisionProvider):
                     raise ValueError("empty content in provider response")
                 return CompletionResult(text=text, usage=usage)
             except requests.HTTPError as exc:
-                # Retry ONLY rate limits and transient server errors; 401/403
-                # are authoritative denials. Details are scrubbed of secrets.
+                # Retry ONLY rate limits (bounded, honoring retry-after) and
+                # transient 5xx. 401/403/413 are authoritative: no retry.
                 response = getattr(exc, "response", None)
                 code = int(getattr(response, "status_code", 0) or 0)
+                headers = getattr(response, "headers", {}) or {}
                 detail = scrub_secrets(str(getattr(response, "text", "") or "")[:200])
-                if code == 429 or 500 <= code < 600:
+                tracker.record_headers(headers)
+                if code == 429:
+                    lowered = detail.lower()
+                    if "quota" in lowered or "daily" in lowered:
+                        raise RateLimitedError(f"provider quota exhausted: {detail}") from exc
+                    retry_after = 0.0
+                    try:
+                        retry_after = float(str(headers.get("retry-after") or "0").strip())
+                    except (TypeError, ValueError):
+                        retry_after = 0.0
+                    last_error = f"HTTP 429: {detail}"
+                    if attempt < self.config.max_retries:
+                        self._sleep(max(retry_after, 2.0 * (2**attempt)))
+                        continue
+                    raise RateLimitedError(f"provider rate limit: {detail}") from exc
+                if 500 <= code < 600:
                     last_error = f"HTTP {code}: {detail}"
                     if attempt < self.config.max_retries:
                         self._sleep(2.0 * (2**attempt))

@@ -416,7 +416,8 @@ def test_rate_limit_backoff_then_success():
     result = provider.complete("prompt", [ImagePayload(asset_id="x", mime="image/png", data=b"x")], tracker)
     assert result.text == "ok"
     assert calls["n"] == 3
-    assert sleeps == [2.0, 4.0]  # exponential backoff
+    # pacing adds spacing sleeps; the 429 backoff values must still appear
+    assert 2.0 in sleeps and 4.0 in sleeps
 
 
 def test_budget_exceeded_stops_honestly():
@@ -628,6 +629,46 @@ def test_end_to_end_pipeline_produces_curation_file(tmp_path):
 # ---------------------------------------------------------------------------
 # Provider factory
 # ---------------------------------------------------------------------------
+
+def test_mode_b_invalid_missing_asset_category_dropped_with_warning(tmp_path):
+    class BadCategoryMock(MockVisionProvider):
+        def complete(self, prompt, images, tracker):
+            result = super().complete(prompt, images, tracker)
+            data = json.loads(result.text)
+            if data.get("mode") == "FINAL_CURATE":
+                data["missing_assets"] = [
+                    {"category": "invented_category", "note": "model invented this"}
+                ]
+                result = CompletionResult(text=json.dumps(data), usage=result.usage)
+            return result
+
+    job = _full_ai_job(tmp_path, count=3)
+    result = _run(job, provider=BadCategoryMock())
+    assert result.status == "completed"
+    assert any("dropped 1 missing_assets" in w for w in result.warnings)
+    assert all(
+        m["category"] != "invented_category"
+        for m in result.mode_b["missing_assets"]
+    )
+
+
+def test_mode_b_failure_keeps_mode_a_results_and_usage(tmp_path):
+    class BrokenModeBMock(MockVisionProvider):
+        def complete(self, prompt, images, tracker):
+            result = super().complete(prompt, images, tracker)
+            data = json.loads(result.text)
+            if data.get("mode") == "FINAL_CURATE":
+                data["mode"] = "WRONG_MODE"
+                result = CompletionResult(text=json.dumps(data), usage=result.usage)
+            return result
+
+    job = _full_ai_job(tmp_path, count=3)
+    result = _run(job, provider=BrokenModeBMock(), config=_config(max_retries=0))
+    assert result.status == "failed"
+    assert len(result.mode_a_items) >= 1  # real MODE A work is preserved
+    assert result.usage["requests"] >= 1
+    assert result.coverage.get("mode_b_status") == "failed"
+
 
 def test_build_provider_factory():
     mock, status = build_provider(AIProviderConfig(provider="mock"))
