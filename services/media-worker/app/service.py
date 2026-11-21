@@ -101,6 +101,22 @@ class CreateJobRequest(BaseModel):
         ),
     )
     max_social_files: int = Field(default=20, ge=1, le=60, description="Per-platform social media download cap")
+    run_ai_curation: bool = Field(
+        default=False,
+        description=(
+            "Run the Phase 5 AI Visual Director (MODE A + MODE B) after preprocessing. "
+            "Requires AI provider configuration (AI_PROVIDER env). When false or when "
+            "the provider is unavailable, extraction results are preserved unchanged."
+        ),
+    )
+    business_context: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Operator-supplied verified business context for curation: "
+            "business_name, business_type, services, location, brand_notes, "
+            "visual_preferences. Never fabricated by the pipeline."
+        ),
+    )
 
 
 @app.get("/health")
@@ -153,6 +169,8 @@ def create_job(req: CreateJobRequest) -> dict[str, str]:
         "max_media": req.max_media,
         "social_permission_confirmed": req.social_permission_confirmed,
         "max_social_files": req.max_social_files,
+        "run_ai_curation": req.run_ai_curation,
+        "business_context": req.business_context,
         "created_at": now_iso,
         "updated_at": now_iso,
         "sources": {
@@ -333,6 +351,26 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             except Exception as exc:  # noqa: BLE001 — preprocessing failure is recorded
                 preprocessing_record = {"status": "failed", "error": str(exc)[:240]}
 
+        # --- Phase 5 AI curation (optional; isolated; honest failure) ------
+        ai_record: dict[str, Any] = {"status": "not_requested"}
+        if payload.get("run_ai_curation") and manifest_file.is_file():
+            try:
+                from app.ai.pipeline import run_ai_curation as run_ai
+
+                ai = run_ai(
+                    job_dir,
+                    job_id,
+                    business_context=payload.get("business_context") or {},
+                    max_images=int(payload.get("max_selected_images") or 30),
+                    max_videos=int(payload.get("max_selected_videos") or 10),
+                )
+                ai_record = ai.as_dict()
+                ai_record["curation_path"] = str(job_dir / "curation.json")
+            except Exception as exc:  # noqa: BLE001 — AI failure is recorded, extraction preserved
+                ai_record = {"status": "failed", "error": str(exc)[:240]}
+        elif payload.get("run_ai_curation"):
+            ai_record = {"status": "failed", "error": "no manifest available for AI curation"}
+
         # --- Honest overall status -------------------------------------------
         # NOTE: compute from the SAME merged dict the record stores, otherwise a
         # stale "running" placeholder in `sources` can override the real result.
@@ -366,6 +404,7 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             "status": job_status,
             "sources": final_sources,
             "preprocessing": preprocessing_record,
+            "ai_curation": ai_record,
             "updated_at": _now(),
         }
         if manifest_file.is_file():
@@ -379,6 +418,14 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             # honest downgrade: collection succeeded, post-processing failed
             record["status"] = job_status = "partial_success"
             record["error"] = "Media preprocessing failed; see preprocessing.error."
+        elif (
+            ai_record.get("status") in ("failed", "provider_unavailable", "disabled")
+            and job_status == "extraction_complete"
+        ):
+            # AI was REQUESTED and could not run: extraction is preserved and
+            # the job is honestly NOT marked fully complete.
+            record["status"] = job_status = "partial_success"
+            record["error"] = "AI curation failed or provider unavailable; extraction preserved."
         store(record)
     except Exception as exc:  # noqa: BLE001 — record failure and keep worker up
         store(
@@ -403,6 +450,28 @@ def get_job(job_id: str) -> dict[str, Any]:
     if rec is None:
         raise HTTPException(404, "Unknown job")
     return rec
+
+
+@app.get("/jobs/{job_id}/curation")
+def get_curation(job_id: str) -> dict[str, Any]:
+    """Serve the Phase 5 curation result (MODE B envelope) for a job."""
+    rec = fetch(job_id)
+    if rec is None:
+        raise HTTPException(404, "Unknown job")
+    curation_file = Path(DATA_DIR) / job_id / "curation.json"
+    if curation_file.is_file():
+        try:
+            return json.loads(curation_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(500, f"Curation unreadable: {exc}") from exc
+    return {
+        "job_id": job_id,
+        "status": rec.get("ai_curation", {}).get("status", "not_requested")
+        if isinstance(rec.get("ai_curation"), dict)
+        else "not_requested",
+        "note": "No AI curation was produced for this job (not requested, provider "
+        "unavailable, or analysis failed). See the job record's ai_curation field.",
+    }
 
 
 @app.get("/jobs/{job_id}/manifest")

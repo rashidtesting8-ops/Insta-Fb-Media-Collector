@@ -1,0 +1,95 @@
+{
+  "name": "05 - Phase 5 AI Curation Probe (read-only status)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "ai-curation-probe",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a5000000-0000-4000-8000-000000000001",
+      "name": "Curation Probe Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [240, 300],
+      "webhookId": "b5500000-0000-4000-8000-000000000001"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "p1",
+              "name": "job_id",
+              "value": "={{ ($json.query && $json.query.job_id) ? String($json.query.job_id).trim() : '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a5000000-0000-4000-8000-000000000002",
+      "name": "Extract Job ID",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'http://collector:8788/jobs/' + $json.job_id }}",
+        "options": {}
+      },
+      "id": "a5000000-0000-4000-8000-000000000003",
+      "name": "Job Status (incl. ai_curation)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'http://collector:8788/jobs/' + $('Extract Job ID').item.json.job_id + '/curation' }}",
+        "options": {}
+      },
+      "id": "a5000000-0000-4000-8000-000000000004",
+      "name": "Curation Result (JSON only, no binaries)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ job_id: $('Extract Job ID').item.json.job_id, job_status: $json.status || null, ai_curation: $('Job Status (incl. ai_curation)').item.json.ai_curation || null, curation_mode: ($json.curation && $json.curation.mode) || null, selected_count: ($json.curation && $json.curation.selected_asset_ids) ? $json.curation.selected_asset_ids.length : 0, rights_review_count: ($json.curation && $json.curation.rights_review_required_ids) ? $json.curation.rights_review_required_ids.length : 0 }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "a5000000-0000-4000-8000-000000000005",
+      "name": "Respond With Curation Summary",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [1120, 300]
+    }
+  ],
+  "connections": {
+    "Curation Probe Webhook": {
+      "main": [[{"node": "Extract Job ID", "type": "main", "index": 0}]]
+    },
+    "Extract Job ID": {
+      "main": [[{"node": "Job Status (incl. ai_curation)", "type": "main", "index": 0}]]
+    },
+    "Job Status (incl. ai_curation)": {
+      "main": [[{"node": "Curation Result (JSON only, no binaries)", "type": "main", "index": 0}]]
+    },
+    "Curation Result (JSON only, no binaries)": {
+      "main": [[{"node": "Respond With Curation Summary", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}
