@@ -63,7 +63,7 @@
     },
     {
       "parameters": {"jsCode": "const sd = $getWorkflowStaticData('global');\nsd.pollAttempts = sd.pollAttempts || {};\nconst j = $json || {};\nconst id = j.job_id;\nsd.pollAttempts[id] = (sd.pollAttempts[id] || 0) + 1;\nconst attempts = sd.pollAttempts[id];\nconst sess = $('Session').item.json || {};\nreturn [{ json: Object.assign({}, j, { attempts: attempts, max_attempts: 120, authorization_confirmed: !!sess.authorization_confirmed, business_name: sess.business_name || '' }) }];"},
-      "id": "p7-0011", "name": "Track Poll",
+      "id": "p7-0011", "name": "Map Stage",
       "type": "n8n-nodes-base.code", "typeVersion": 2,
       "position": [1980, 240]
     },
@@ -80,7 +80,7 @@
       "position": [2420, 420]
     },
     {
-      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ job_id: $('Track Poll').item.json.job_id, stage: 'blocked', detail: 'polling_timeout', last_stage: $('Track Poll').item.json.stage }) }}", "options": {"responseCode": 200}},
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ job_id: $('Map Stage').item.json.job_id, stage: 'blocked', detail: 'polling_timeout', last_stage: $('Map Stage').item.json.stage }) }}", "options": {"responseCode": 200}},
       "id": "p7-0014", "name": "Respond Polling Timeout",
       "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4,
       "position": [2640, 540]
@@ -104,13 +104,13 @@
       "position": [2640, 60]
     },
     {
-      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ job_id: $('Track Poll').item.json.job_id, stage: 'awaiting_rights_approval', detail: 'Rights approval required before Drive delivery.', authorization_confirmed: false }) }}", "options": {"responseCode": 200}},
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ job_id: $('Map Stage').item.json.job_id, stage: 'awaiting_rights_approval', detail: 'Rights approval required before Drive delivery.', authorization_confirmed: false }) }}", "options": {"responseCode": 200}},
       "id": "p7-0018", "name": "Respond Awaiting Rights",
       "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4,
       "position": [2860, 180]
     },
     {
-      "parameters": {"method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $('Track Poll').item.json.job_id + '/delivery' }}", "options": {}},
+      "parameters": {"method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/delivery' }}", "options": {}},
       "id": "p7-0019", "name": "Check Existing Delivery",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
       "position": [2860, -60], "onError": "continueRegularOutput"
@@ -128,7 +128,7 @@
       "position": [3300, 60]
     },
     {
-      "parameters": {"method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $('Track Poll').item.json.job_id + '/delivery-plan?business_name=' + encodeURIComponent($('Track Poll').item.json.business_name || '') }}", "options": {}},
+      "parameters": {"method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/delivery-plan?business_name=' + encodeURIComponent($('Map Stage').item.json.business_name || '') }}", "options": {}},
       "id": "p7-0022", "name": "Get Delivery Plan",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
       "position": [3300, -180]
@@ -140,13 +140,13 @@
       "position": [3520, -180]
     },
     {
-      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ job_id: $('Track Poll').item.json.job_id, stage: 'blocked', detail: ($json.errors && $json.errors[0]) || $json.status || 'delivery blocked', plan_status: $json.status }) }}", "options": {"responseCode": 200}},
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ job_id: $('Map Stage').item.json.job_id, stage: 'blocked', detail: ($json.errors && $json.errors[0]) || $json.status || 'delivery blocked', plan_status: $json.status }) }}", "options": {"responseCode": 200}},
       "id": "p7-0024", "name": "Respond Blocked",
       "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4,
       "position": [3740, -60]
     },
     {
-      "parameters": {"method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Track Poll').item.json.job_id + '/orchestration' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ stage: 'delivering', detail: 'Drive delivery in progress.' }) }}", "options": {}},
+      "parameters": {"method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/orchestration' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ stage: 'delivering', detail: 'Drive delivery in progress.' }) }}", "options": {}},
       "id": "p7-0025", "name": "Mark Delivering",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
       "position": [3740, -300]
@@ -184,13 +184,13 @@
       "position": [4840, -420], "onError": "continueRegularOutput"
     },
     {
-      "parameters": {"method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Track Poll').item.json.job_id + '/delivery-result' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ authorization_confirmed: $('Track Poll').item.json.authorization_confirmed, drive_folder_id: $('Create Business Drive Folder').item.json.id, uploads: $('Upload Original to Drive').all().map((u, i) => ({ upload_key: $('Split Assets').all()[i].json.upload_key, drive_file_id: (u.json && u.json.id) || null, drive_link: (u.json && u.json.webViewLink) || null, status: (u.json && u.json.id) ? 'uploaded' : 'failed', error: (u.json && u.json.error) ? String(u.json.error.message || u.json.error) : null })) }) }}", "options": {}},
+      "parameters": {"method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/delivery-result' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ authorization_confirmed: $('Map Stage').item.json.authorization_confirmed, drive_folder_id: $('Create Business Drive Folder').item.json.id, uploads: $('Upload Original to Drive').all().map((u, i) => ({ upload_key: $('Split Assets').all()[i].json.upload_key, drive_file_id: (u.json && u.json.id) || null, drive_link: (u.json && u.json.webViewLink) || null, status: (u.json && u.json.id) ? 'uploaded' : 'failed', error: (u.json && u.json.error) ? String(u.json.error.message || u.json.error) : null })) }) }}", "options": {}},
       "id": "p7-0031", "name": "Persist Delivery Ledger",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
       "position": [5060, -300]
     },
     {
-      "parameters": {"method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Track Poll').item.json.job_id + '/orchestration' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ stage: $json.stage, detail: $json.detail || '' }) }}", "options": {}},
+      "parameters": {"method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/orchestration' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ stage: $json.stage, detail: $json.detail || '' }) }}", "options": {}},
       "id": "p7-0032", "name": "Persist Final Status",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
       "position": [2640, 60]
