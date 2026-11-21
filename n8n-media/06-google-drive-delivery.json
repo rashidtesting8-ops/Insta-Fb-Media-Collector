@@ -3,7 +3,7 @@
   "nodes": [
     {
       "parameters": {
-        "httpMethod": "POST",
+        "authentication": "headerAuth", "httpMethod": "POST",
         "path": "drive-delivery",
         "responseMode": "responseNode",
         "options": {}
@@ -11,6 +11,7 @@
       "id": "a6000000-0000-4000-8000-000000000001",
       "name": "Delivery Webhook",
       "type": "n8n-nodes-base.webhook",
+      "credentials": {"httpHeaderAuth":{"name":"Media Admin Webhook Token"}},
       "typeVersion": 2.1,
       "position": [220, 300],
       "webhookId": "b6600000-0000-4000-8000-000000000001"
@@ -21,7 +22,7 @@
           "assignments": [
             {"id": "j1", "name": "job_id", "value": "={{ ($json.body && $json.body.job_id) ? String($json.body.job_id).trim() : '' }}", "type": "string"},
             {"id": "j2", "name": "business_name", "value": "={{ ($json.body && $json.body.business_name) ? String($json.body.business_name).trim() : 'Pet Grooming Business' }}", "type": "string"},
-            {"id": "j3", "name": "authorization_confirmed", "value": "={{ Boolean($json.body && $json.body.authorization_confirmed) }}", "type": "boolean"}
+            {"id": "j3", "name": "authorization_confirmed", "value": "={{ $json.body?.authorization_confirmed === true }}", "type": "boolean"}
           ]
         },
         "options": {}
@@ -34,13 +35,14 @@
     },
     {
       "parameters": {
-        "method": "GET",
-        "url": "={{ 'http://collector:8788/jobs/' + $json.job_id + '/delivery-plan?business_name=' + encodeURIComponent($json.business_name) }}",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "GET",
+        "url": "={{ 'http://collector:8787/jobs/' + $json.job_id + '/delivery-plan?business_name=' + encodeURIComponent($json.business_name) }}",
         "options": {}
       },
       "id": "a6000000-0000-4000-8000-000000000003",
       "name": "Validated Delivery Plan (worker)",
       "type": "n8n-nodes-base.httpRequest",
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "typeVersion": 4.2,
       "position": [660, 300]
     },
@@ -49,7 +51,7 @@
         "conditions": {
           "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
           "conditions": [
-            {"id": "ready", "leftValue": "={{ $json.status }}", "rightValue": "ready", "operator": {"type": "string", "operation": "equals"}}
+            {"id": "ready", "leftValue": "={{ $json.status === 'ready' && $('Validate Delivery Request').item.json.authorization_confirmed === true }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}
           ],
           "combinator": "and"
         },
@@ -108,8 +110,8 @@
     },
     {
       "parameters": {
-        "method": "POST",
-        "url": "={{ 'http://collector:8788/jobs/' + $('Validate Delivery Request').item.json.job_id + '/delivery-result' }}",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "POST",
+        "url": "={{ 'http://collector:8787/jobs/' + $('Validate Delivery Request').item.json.job_id + '/delivery-result' }}",
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({ authorization_confirmed: $('Validate Delivery Request').item.json.authorization_confirmed, drive_folder_id: $('Create Business Drive Folder').item.json.id, uploads: [{ upload_key: $('Validated Delivery Plan (worker)').item.json.assets[0].upload_key, drive_file_id: $json.id, drive_link: $json.webViewLink, status: 'uploaded' }] }) }}",
@@ -118,6 +120,7 @@
       "id": "a6000000-0000-4000-8000-000000000008",
       "name": "Persist Delivery Ledger",
       "type": "n8n-nodes-base.httpRequest",
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "typeVersion": 4.2,
       "position": [1700, 240]
     },

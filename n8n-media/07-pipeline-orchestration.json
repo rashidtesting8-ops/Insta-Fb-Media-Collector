@@ -2,15 +2,17 @@
   "name": "07 - Phase 7 Pipeline Orchestration (status + rights + delivery)",
   "nodes": [
     {
-      "parameters": {"httpMethod": "POST", "path": "pipeline-intake", "responseMode": "responseNode", "options": {}},
+      "parameters": {"authentication": "headerAuth", "httpMethod": "POST", "path": "pipeline-intake", "responseMode": "responseNode", "options": {}},
       "id": "p7-0001", "name": "Pipeline Intake Webhook",
       "type": "n8n-nodes-base.webhook", "typeVersion": 2.1,
+      "credentials": {"httpHeaderAuth":{"name":"Media Pipeline Webhook Token"}},
       "position": [220, 300], "webhookId": "p7wh-intake"
     },
     {
-      "parameters": {"method": "POST", "url": "http://collector:8787/intake/validate", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify($json.body || {}) }}", "options": {}},
+      "parameters": {"authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "POST", "url": "http://collector:8787/intake/validate", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify($json.body || {}) }}", "options": {}},
       "id": "p7-0002", "name": "Validate Intake",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "position": [440, 300]
     },
     {
@@ -32,9 +34,10 @@
       "position": [880, 240]
     },
     {
-      "parameters": {"method": "POST", "url": "http://collector:8787/jobs", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify($json.create || {}) }}", "options": {}},
+      "parameters": {"authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "POST", "url": "http://collector:8787/jobs", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify($json.create || {}) }}", "options": {}},
       "id": "p7-0006", "name": "Create Worker Job",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "position": [1100, 360], "onError": "continueRegularOutput"
     },
     {
@@ -44,25 +47,32 @@
       "position": [1320, 360]
     },
     {
-      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ stage: 'blocked', detail: String($json.error || $json.message || 'worker unavailable') }) }}", "options": {"responseCode": 200}},
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ stage: 'blocked', detail: 'Worker unavailable' }) }}", "options": {"responseCode": 503}},
       "id": "p7-0008", "name": "Respond Worker Unavailable",
       "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4,
       "position": [1540, 480]
     },
     {
-      "parameters": {"jsCode": "const v = $('Validate Intake').item.json;\nconst sd = $getWorkflowStaticData('global');\nsd.pollAttempts = sd.pollAttempts || {};\nconst jobId = $json.job_id;\nsd.pollAttempts[jobId] = 0;\nreturn [{ json: { job_id: jobId, authorization_confirmed: !!v.authorization_confirmed, business_name: v.business_name || '', idempotency_key: v.idempotency_key || '', attempts: 0 } }];"},
+      "parameters": {"jsCode": "const v = $('Validate Intake').item.json;\nreturn [{ json: { job_id: $json.job_id, authorization_confirmed: !!v.authorization_confirmed, business_name: v.business_name || '' } }];"},
       "id": "p7-0009", "name": "Session",
       "type": "n8n-nodes-base.code", "typeVersion": 2,
       "position": [1540, 240]
     },
     {
-      "parameters": {"method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $json.job_id + '/pipeline-status' }}", "options": {}},
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({ job_id: $json.job_id, status: 'accepted' }) }}", "options": {"responseCode": 202}},
+      "id": "p9-ack", "name": "Respond Accepted",
+      "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.4,
+      "position": [1660, 140]
+    },
+    {
+      "parameters": {"authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $json.job_id + '/pipeline-status' }}", "options": {}},
       "id": "p7-0010", "name": "Poll Job Status",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "position": [1760, 240], "onError": "continueRegularOutput"
     },
     {
-      "parameters": {"jsCode": "const sd = $getWorkflowStaticData('global');\nsd.pollAttempts = sd.pollAttempts || {};\nconst j = $json || {};\nconst id = j.job_id;\nsd.pollAttempts[id] = (sd.pollAttempts[id] || 0) + 1;\nconst attempts = sd.pollAttempts[id];\nconst sess = $('Session').item.json || {};\nreturn [{ json: Object.assign({}, j, { attempts: attempts, max_attempts: 120, authorization_confirmed: !!sess.authorization_confirmed, business_name: sess.business_name || '' }) }];"},
+      "parameters": {"jsCode": "const sess = $('Session').first().json;\nreturn [{ json: { ...$json, job_id: sess.job_id, attempts: $runIndex + 1, max_attempts: 120, authorization_confirmed: !!sess.authorization_confirmed, business_name: sess.business_name || '' } }];"},
       "id": "p7-0011", "name": "Map Stage",
       "type": "n8n-nodes-base.code", "typeVersion": 2,
       "position": [1980, 240]
@@ -110,9 +120,10 @@
       "position": [2860, 180]
     },
     {
-      "parameters": {"method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/delivery' }}", "options": {}},
+      "parameters": {"authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/delivery' }}", "options": {}},
       "id": "p7-0019", "name": "Check Existing Delivery",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "position": [2860, -60], "onError": "continueRegularOutput"
     },
     {
@@ -128,9 +139,10 @@
       "position": [3300, 60]
     },
     {
-      "parameters": {"method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/delivery-plan?business_name=' + encodeURIComponent($('Map Stage').item.json.business_name || '') }}", "options": {}},
+      "parameters": {"authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "GET", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/delivery-plan?business_name=' + encodeURIComponent($('Map Stage').item.json.business_name || '') }}", "options": {}},
       "id": "p7-0022", "name": "Get Delivery Plan",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "position": [3300, -180]
     },
     {
@@ -146,9 +158,10 @@
       "position": [3740, -60]
     },
     {
-      "parameters": {"method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/orchestration' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ stage: 'delivering', detail: 'Drive delivery in progress.' }) }}", "options": {}},
+      "parameters": {"authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/orchestration' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ stage: 'delivering', detail: 'Drive delivery in progress.' }) }}", "options": {}},
       "id": "p7-0025", "name": "Mark Delivering",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "position": [3740, -300]
     },
     {
@@ -184,27 +197,31 @@
       "position": [4840, -420], "onError": "continueRegularOutput"
     },
     {
-      "parameters": {"method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/delivery-result' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ authorization_confirmed: $('Map Stage').item.json.authorization_confirmed, drive_folder_id: $('Create Business Drive Folder').item.json.id, uploads: $('Upload Original to Drive').all().map((u, i) => ({ upload_key: $('Split Assets').all()[i].json.upload_key, drive_file_id: (u.json && u.json.id) || null, drive_link: (u.json && u.json.webViewLink) || null, status: (u.json && u.json.id) ? 'uploaded' : 'failed', error: (u.json && u.json.error) ? String(u.json.error.message || u.json.error) : null })) }) }}", "options": {}},
+      "parameters": {"authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/delivery-result' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ authorization_confirmed: $('Map Stage').item.json.authorization_confirmed, drive_folder_id: $('Create Business Drive Folder').item.json.id, uploads: $('Upload Original to Drive').all().map((u, i) => ({ upload_key: $('Split Assets').all()[i].json.upload_key, drive_file_id: (u.json && u.json.id) || null, drive_link: (u.json && u.json.webViewLink) || null, status: (u.json && u.json.id) ? 'uploaded' : 'failed', error: (u.json && u.json.error) ? String(u.json.error.message || u.json.error) : null })) }) }}", "options": {}},
       "id": "p7-0031", "name": "Persist Delivery Ledger",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "position": [5060, -300]
     },
     {
-      "parameters": {"method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/orchestration' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ stage: $json.stage, detail: $json.detail || '' }) }}", "options": {}},
+      "parameters": {"authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "POST", "url": "={{ 'http://collector:8787/jobs/' + $('Map Stage').item.json.job_id + '/orchestration' }}", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ JSON.stringify({ stage: $json.stage, detail: $json.detail || '' }) }}", "options": {}},
       "id": "p7-0032", "name": "Persist Final Status",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "position": [2640, 60]
     },
     {
-      "parameters": {"httpMethod": "GET", "path": "pipeline-status", "responseMode": "responseNode", "options": {}},
+      "parameters": {"authentication": "headerAuth", "httpMethod": "GET", "path": "pipeline-status", "responseMode": "responseNode", "options": {}},
       "id": "p7-0033", "name": "Status Webhook",
       "type": "n8n-nodes-base.webhook", "typeVersion": 2.1,
+      "credentials": {"httpHeaderAuth":{"name":"Media Pipeline Webhook Token"}},
       "position": [220, 700], "webhookId": "p7wh-status"
     },
     {
-      "parameters": {"method": "GET", "url": "={{ 'http://collector:8787/jobs/' + ($json.query && $json.query.job_id ? $json.query.job_id : '') + '/pipeline-status' }}", "options": {}},
+      "parameters": {"authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "GET", "url": "={{ 'http://collector:8787/jobs/' + ($json.query && $json.query.job_id ? $json.query.job_id : '') + '/pipeline-status' }}", "options": {}},
       "id": "p7-0034", "name": "Status Job Lookup",
       "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "position": [440, 700], "onError": "continueRegularOutput"
     },
     {
@@ -230,7 +247,8 @@
       [{"node": "Session", "type": "main", "index": 0}],
       [{"node": "Respond Worker Unavailable", "type": "main", "index": 0}]
     ]},
-    "Session": {"main": [[{"node": "Poll Job Status", "type": "main", "index": 0}]]},
+    "Session": {"main": [[{"node": "Respond Accepted", "type": "main", "index": 0}]]},
+    "Respond Accepted": {"main": [[{"node": "Poll Job Status", "type": "main", "index": 0}]]},
     "Poll Job Status": {"main": [[{"node": "Map Stage", "type": "main", "index": 0}]]},
     "Map Stage": {"main": [[{"node": "Terminal?", "type": "main", "index": 0}]]},
     "Terminal?": {"main": [

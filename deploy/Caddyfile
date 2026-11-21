@@ -1,0 +1,12 @@
+{
+	auto_https disable_redirects
+}
+
+https://{$STAGING_HOST} {
+	bind 0.0.0.0
+	tls internal
+	request_body {
+		max_size 16KB
+	}
+	reverse_proxy dashboard:3000
+}

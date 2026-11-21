@@ -5,7 +5,7 @@ businesses. An operator supplies a business website URL (required) plus
 optional public Instagram/Facebook URLs; a bounded, permission-gated worker
 collects **publicly accessible, permitted** media, records honest provenance
 (sha256, source URLs, dates or explicit `unknown`, unverified rights), and
-produces a unified, disk-validated manifest. Planned stages add AI-assisted
+produces a unified, disk-validated manifest. The pipeline includes AI-assisted
 visual selection and Google Drive delivery, orchestrated by n8n.
 
 > **Honesty first.** This project never fabricates coverage. Social platforms
@@ -21,8 +21,8 @@ visual selection and Google Drive delivery, orchestrated by n8n.
 A nontechnical operator's goal: enter business URLs, get the best real,
 permitted media for that business. The platform separates concerns:
 
-- **n8n** (self-hosted, Docker) owns orchestration: job intake, AI curation
-  prompts, Google Drive delivery, status APIs.
+- **n8n** (self-hosted, Docker) owns orchestration: job intake, status polling
+  and Google Drive delivery. The worker calls the vision provider when opted in.
 - **Python/Docker media worker** owns collection & processing: a vendored,
   SSRF-hardened website crawler; gallery-dl (primary social tool) with
   Instaloader / yt-dlp fallbacks; and deterministic Phase 4 media
@@ -39,47 +39,19 @@ permitted media for that business. The platform separates concerns:
 | Website media collector + unified manifest (Phase 2) | ✅ Done | 10 offline tests + bounded live smoke (`docs/PHASE_2_REPORT.md`) |
 | Instagram/Facebook collection engine (Phase 3) | ✅ Done | 13 offline mocked tests + bounded consent-gated live smoke (`docs/PHASE_3_REPORT.md`) |
 | Media preprocessing: dedupe, quality metrics, video frames, date categories (Phase 4) | ✅ Done | 14 offline tests + live end-to-end evidence (`docs/PHASE_4_REPORT.md`) |
-| AI Visual Director V2.0 MODE A/B, provider adapter, strict validation (Phase 5) | ✅ Implemented (mock-tested; **live provider validation pending — no AI credentials configured**) | `docs/PHASE_5_REPORT.md` |
-| Google Drive delivery (Phase 6) | ⏳ Planned | — |
-| Frontend (Phase 7) | ⏳ Planned | — |
-| Production hardening (Phase 8) | ⏳ Planned | — |
+| AI Visual Director V2 (Phase 5) | Implemented and mock-tested. Live Groq MODE A/B acceptance pending. | [Report](docs/PHASE_5_REPORT.md) |
+| Drive delivery (Phase 6) | Implemented and fixture-tested. OAuth and live upload pending. | [Report](docs/PHASE_6_REPORT.md) |
+| n8n orchestration (Phase 7) | Intake, bounded polling, rights checks and status. | [Report](docs/PHASE_7_REPORT.md) |
+| Dashboard (Phase 8) | Local Next.js dashboard for collection and job review. | [Report](docs/PHASE_8_REPORT.md) |
+| Security and staging (Phase 9) | Signed dashboard sessions, internal API roles, safe intake and private HTTPS Compose configuration. | [Runbook](docs/PHASE_9_REPORT.md) |
 
-**Not implemented and not claimed:** AI image/video selection, Google Drive
-uploads, any frontend, production deployment. Social collection is live but
-**partial by design** under anonymous access (see Known limitations).
+## 3. Architecture
 
-## 3. Planned features
-
-1. Two-stage AI Creative Director (MODE A batch analysis / MODE B final
-   curation) using the preserved `docs/AI_VISUAL_DIRECTOR_V2.md` prompt, with
-   strict JSON schema validation outside the model (Phase 5).
-2. Google Drive business-folder delivery of selected originals with
-   verification and rights gates (Phase 6, via n8n credentials).
-3. Nontechnical frontend: URL form, live progress, per-source errors,
-   previews, Drive link (Phase 7).
-4. End-to-end QA, concurrency/disk testing, hardening (Phase 8).
-
-## 4. Architecture overview
-
-```text
-Frontend (planned)                 n8n (Docker, workflow controller)
-   | POST /api/jobs  ─────────────▶  WF01 intake → WF02 extraction
-   |                                WF03 AI selection → WF04 Drive
-   |                                WF05 status
-   v                                        | HTTP on the Docker network
-Python media worker (FastAPI)  ◀───────────┘
-   /health  /status (token)  POST /jobs
-   GET /jobs/{id}  GET /jobs/{id}/manifest
-   ├─ website crawler (vendored legacy module, SSRF-hardened)
-   ├─ gallery-dl subprocess  ── Instagram / Facebook (consent-gated)
-   ├─ Instaloader fallback (Instagram only)
-   ├─ yt-dlp fallback (single Facebook post/video URLs only)
-   └─ unified manifest builder + disk validation
-        |
-        v
-Shared bind-mounted storage: <storage>/jobs/<job_id>/
-   website/  instagram/  facebook/  research/  manifest.json
-```
+The browser calls the authenticated Next.js dashboard. Dashboard submissions go to
+n8n's authenticated intake webhook, which validates and starts a worker job,
+responds with a job ID and continues polling. Dashboard reads use a scoped worker
+token. The worker stores jobs in SQLite and writes media and manifests on the shared
+volume. n8n gets read-only access to selected originals for rights-gated Drive delivery.
 
 ## 5. Technology stack
 
@@ -88,7 +60,7 @@ Shared bind-mounted storage: <storage>/jobs/<job_id>/
 - **External media tools (invoked as argument-array subprocesses; no source
   incorporated):** gallery-dl 1.32.20 (primary social), Instaloader
   (Instagram fallback), yt-dlp (Facebook single-video fallback), FFmpeg
-  (installed for planned frame extraction).
+  for bounded frame extraction.
 - **Orchestration:** n8n (self-hosted Docker image, pinned in `.env`).
 - **Storage:** host bind mount shared worker-RW / n8n-RO.
 - **Testing:** pytest (offline, in-process HTTP fixtures, mocked tool
@@ -102,7 +74,7 @@ Shared bind-mounted storage: <storage>/jobs/<job_id>/
 - n8n credentials: an n8n **Credential** of type `httpHeaderAuth` named
   `Media Worker API Token` (its value must match `MEDIA_WORKER_TOKEN` in
   `.env`) for authenticated workflow calls.
-- Google Drive / AI provider credentials: **not required yet** (Phases 5–6).
+- AI and Drive credentials are optional for local fixture tests. Live provider and Drive acceptance remain pending.
 
 ## 7. Local Docker setup
 
@@ -111,20 +83,27 @@ Shared bind-mounted storage: <storage>/jobs/<job_id>/
 Copy-Item .env.example .env      # then edit values (see next section)
 
 # 2) validate + start
-docker compose -f compose.media.yml config   # must exit 0
+docker compose -f compose.media.yml config -q
 docker compose -f compose.media.yml up -d
 docker compose -f compose.media.yml ps       # both services healthy
 
-# 3) import the n8n workflow and credential (n8n CLI, one-off)
-docker compose -f compose.media.yml exec n8n n8n import:workflow \
-  --input=/data/n8n-workflows/00-health-probe.json
-# credential import is documented in docs/PHASE_1_REPORT.md §7
+# 3) Import the workflow JSONs from n8n-media/ in the project n8n editor.
+# Bind credentials and publish the health and intake workflows per the Phase 9 runbook.
 
 # 4) probe end-to-end (webhook → worker health → auth → file mount)
 Invoke-WebRequest http://127.0.0.1:5679/webhook/phase1-probe
 ```
 
 ## 8. Environment variable setup
+
+For Phase 9 local development, configure the worker and dashboard with
+a shared read-scoped `MEDIA_WORKER_DASHBOARD_TOKEN`. Configure the frontend
+server environment with `DASHBOARD_ORIGIN` (exact origin), `DASHBOARD_PASSWORD`,
+`DASHBOARD_SESSION_SECRET` (independent random key of 32+ characters) and
+`N8N_PIPELINE_TOKEN`. Bind the n8n workflow credentials before testing intake.
+Use a separate staging instance for the rollout described in the
+[Phase 9 staging runbook](docs/PHASE_9_REPORT.md).
+
 
 Copy `.env.example` → `.env` and set:
 
@@ -144,6 +123,7 @@ default — worker authentication uses an **n8n Credential**, not env vars.
 |---|---|---|
 | **Project n8n** | `http://localhost:5679` | this repo's stack (host port 5679 → container 5678) |
 | **Python worker** | `http://localhost:8788` | host 8788 → container 8787 |
+| Dashboard | `http://localhost:3000` | run in `frontend/` |
 | Legacy n8n (pre-existing, unrelated) | `http://localhost:5678` | a separate older instance on this machine — **not part of this repository** |
 
 Host ports 5679/8788 were chosen because 5678/8787 were already occupied
@@ -174,9 +154,7 @@ docker compose -f compose.media.yml up -d              # recreate worker
 
 # quick checks
 Invoke-WebRequest http://localhost:8788/health
-Invoke-RestMethod -Method Post -Uri http://localhost:8788/jobs `
-  -ContentType application/json `
-  -Body '{"website_url":"https://example-pet-groomer.com"}'
+Invoke-WebRequest http://localhost:8788/ready
 ```
 
 `POST /jobs` accepts: `website_url` (required), `instagram_url`,
@@ -191,7 +169,7 @@ false, no social collection is attempted at all.
 
 ```powershell
 docker compose -f compose.media.yml exec collector python -m pytest tests -q
-# → 23 passed (10 website regression + 13 social, fully offline)
+# Workflow JSON tests need the repository layout available in the test runtime.
 ```
 
 All tests are offline: in-process HTTP fixtures and mocked
@@ -200,16 +178,17 @@ beyond the worker itself, no secrets. CI runs the same suite on Python 3.12.
 
 ## 13. Current API endpoints
 
-| Method & path | Auth | Description |
-|---|---|---|
-| `GET /health` | none | worker liveness (loopback-bound) |
-| `GET /status` | `X-API-Key` (`MEDIA_WORKER_TOKEN`, constant-time compare) | authenticated worker status |
-| `POST /jobs` | loopback-only (auth gate is a Phase-3+ roadmap item) | create a bounded extraction job; returns `job_id` immediately |
-| `GET /jobs/{job_id}` | none | durable job record with per-source statuses |
-| `GET /jobs/{job_id}/manifest` | none | unified multi-source manifest (schema `3.0-unified`) |
+- Dashboard with a signed session: `POST /api/jobs` returns the accepted job ID;
+  `GET /api/jobs` and per-job routes return status, previews and manifests.
+- Worker: `GET /health` and `GET /ready` are probe endpoints. The dashboard token
+  may read jobs and call `POST /intake/validate`. Job creation, operations
+  status, delivery planning and updates require the n8n worker token.
+- n8n: `POST /webhook/pipeline-intake` and `GET /webhook/pipeline-status` use
+  header authentication. `POST /webhook/drive-delivery` uses an admin credential
+  and requires explicit rights approval.
 
-n8n webhook (Phase 1 proof): `GET /webhook/phase1-probe` → verifies worker
-health, credential-authenticated status, and the read-only shared mount.
+Frontend checks run from `frontend/` with `npm test`, `npm run lint`,
+`npm run build`, `npx tsc --noEmit` and `npm run test:integration` after building.
 
 ## 14. Security and privacy considerations
 
@@ -242,31 +221,14 @@ health, credential-authenticated status, and the read-only shared mount.
    requires platform-authorized access (deliberately not implemented).
 2. Website asset publication dates are generally unverifiable → recorded as
    `unknown`, never invented.
-3. Social items may include low-value assets (e.g. profile pictures);
-   relevance judgement is deferred to the planned AI selection stage.
-4. Cross-platform duplicate detection was delivered in Phase 4 (exact
-   sha256 + perceptual groups with recorded decisions; see
-   `docs/PHASE_4_REPORT.md`).
-5. `POST /jobs` is loopback-only without token auth; an n8n-side auth gate
-   is on the roadmap.
-6. gallery-dl extractor sites (Instagram/Facebook) drift frequently; the pin
-   (1.32.20) requires periodic re-review.
-7. No AI, Drive, or frontend yet — do not assume end-to-end completion.
+3. Live Groq MODE A/B and Google Drive OAuth/upload acceptance remain open.
+4. Commercial distribution requires explicit rights approval.
 
 ## 16. Development roadmap
 
-- **Phase 4** — ✅ delivered: deterministic media preprocessing (cross-source
-  dedupe, technical quality metrics, FFmpeg frames, verified-date
-  categorization) enriching the unified manifest additively.
-- **Phase 5** — AI Visual Director (two-stage MODE A/B per
-  `docs/AI_VISUAL_DIRECTOR_V2.md`, strict schema validation, no invented
-  assets).
-- **Phase 6** — Google Drive delivery of selected originals (n8n
-  credentials, verification ledger, rights gate).
-- **Phase 7** — nontechnical frontend.
-- **Phase 8** — end-to-end QA, concurrency/disk tests, hardening.
-
-Phase reports, the reuse audit and all recorded decisions live in `docs/`.
+Phases 0–8 delivered the existing pipeline and dashboard. Phase 9 provides
+local hardening and the staging runbook. Phase 10 covers live end-to-end
+acceptance after approval. Phase 11 completes documentation and handover.
 
 ## 17. Upstream dependencies and attribution
 

@@ -1,11 +1,9 @@
-# n8n media workflows (Phase 3+)
+# n8n media workflows
 
-Placeholder directory for the five media-only n8n workflows:
+- `00` verifies worker health, worker authentication and shared storage.
+- `05` reads curated job status from the worker.
+- `06` delivers selected originals after rights approval.
+- `07` validates intake, responds with a job ID and continues orchestration.
 
-- WF01 Intake & Job Registration
-- WF02 Extract & Prepare Media
-- WF03 AI Visual Selection (Visual Director V2)
-- WF04 Google Drive Delivery
-- WF05 Status & Error API
-
-Not implemented in Phase 1. Do not commit real n8n credentials here.
+Configure and bind instance-specific credentials before publishing. See the
+[Phase 9 staging runbook](../docs/PHASE_9_REPORT.md). Never commit real credentials.
