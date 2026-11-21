@@ -188,11 +188,11 @@ def _encode_jpeg_under(im: Image.Image, max_bytes: int) -> bytes:
         buffer = io.BytesIO()
         im.save(buffer, format="JPEG", quality=quality)
         data = buffer.getvalue()
-        if len(data) <= max_bytes or im.size[0] <= 256:
+        if len(data) <= max_bytes:
             return data
         quality -= 15
-        im.thumbnail((int(im.size[0] * 0.7), int(im.size[1] * 0.7)), Image.Resampling.BILINEAR)
-    return data
+        im.thumbnail((max(1, int(im.size[0] * 0.7)), max(1, int(im.size[1] * 0.7))), Image.Resampling.BILINEAR)
+    raise ValueError("Could not encode JPEG within the configured byte cap")
 
 
 def build_image_payloads(

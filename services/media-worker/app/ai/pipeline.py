@@ -249,6 +249,12 @@ def run_ai_curation(
     cfg = config or AIProviderConfig.from_env()
     max_image_dim = max_image_dim if max_image_dim is not None else cfg.max_image_dim
     max_image_bytes = max_image_bytes if max_image_bytes is not None else cfg.max_image_bytes
+    if cfg.bounded_acceptance:
+        max_image_dim = min(max_image_dim, cfg.max_image_dim)
+        max_image_bytes = min(max_image_bytes, cfg.max_image_bytes)
+        if (job_dir / "curation.json").exists():
+            result.errors.append("Bounded acceptance requires a fresh job directory")
+            return result
     if provider is None:
         provider, status = build_provider(cfg)
         if provider is None:
@@ -279,6 +285,11 @@ def run_ai_curation(
         result.warnings.append(f"overflow cut (asset cap {max_assets}): {aid}")
 
     candidates: list[Candidate] = selection.candidates
+    if cfg.bounded_acceptance and (
+        len(manifest_ids) != 1 or len(candidates) != 1 or candidates[0].kind != "image"
+    ):
+        result.errors.append("Bounded acceptance requires exactly one eligible image in the manifest")
+        return result
     if not candidates:
         result.status = "failed"
         result.errors.append("no AI-ready assets (all excluded, corrupted, or unavailable)")
@@ -320,6 +331,9 @@ def run_ai_curation(
 
         parsed: ModeAResponse | None = None
         attempt_errors: list[str] = []
+        if cfg.bounded_acceptance and len(payloads) != 1:
+            result.errors.append("Could not prepare the one bounded acceptance image")
+            return result
         for attempt in range(cfg.max_retries + 1):
             try:
                 completion = provider.complete(prompt, payloads, tracker)
@@ -400,6 +414,7 @@ def run_ai_curation(
         business_context,
         max_images=max_images,
         max_videos=max_videos,
+        asset_metadata=manifest_ids,
     )
     mode_b: ModeBResponse | None = None
     mode_b_errors: list[str] = []
@@ -417,7 +432,7 @@ def run_ai_curation(
             # The model occasionally emits a non-V2 category in missing_assets.
             # Drop those items with a recorded warning rather than inventing a
             # valid value — no silent relabeling, no fabricated data.
-            if isinstance(data, dict) and isinstance(data.get("missing_assets"), list):
+            if not cfg.bounded_acceptance and isinstance(data, dict) and isinstance(data.get("missing_assets"), list):
                 allowed = set(Category.__args__)
                 invalid = [
                     m for m in data["missing_assets"]
