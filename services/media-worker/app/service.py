@@ -16,7 +16,6 @@ per-source statuses and a unified manifest. No AI or Google Drive yet.
 from __future__ import annotations
 
 import datetime as _dt
-import hmac
 import json
 import os
 import sqlite3
@@ -26,15 +25,27 @@ from pathlib import Path
 from threading import BoundedSemaphore, Lock
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from app.security import WorkerSecurity
 
-app = FastAPI(title="Pet Grooming Media Worker", version="0.1.0-phase1")
+app = FastAPI(title="Pet Grooming Media Worker", version="0.9.0", docs_url=None, redoc_url=None, openapi_url=None)
+app.add_middleware(WorkerSecurity)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(_request, error: RequestValidationError) -> JSONResponse:
+    return JSONResponse({"detail": [
+        {"loc": item["loc"], "type": item["type"], "msg": item["msg"]}
+        for item in error.errors()
+    ]}, status_code=422)
 
 executor = ThreadPoolExecutor(max_workers=2)
 slots = BoundedSemaphore(4)
 lock = Lock()
+submission_lock = Lock()
 
 DATA_DIR = Path(os.environ.get("PROJECTS_DIR", "./storage/jobs"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -95,7 +106,7 @@ with connect() as _db:
 
 
 class CreateJobRequest(BaseModel):
-    website_url: str = Field(min_length=1, description="Required pet grooming business website URL")
+    website_url: str = Field(min_length=1, max_length=2048, description="Required pet grooming business website URL")
     instagram_url: str | None = Field(default=None, description="Optional public Instagram URL")
     facebook_url: str | None = Field(default=None, description="Optional public Facebook Page URL")
     lookback_days: int = Field(default=365, ge=1, le=366)
@@ -135,6 +146,19 @@ class CreateJobRequest(BaseModel):
         description="Optional client-supplied idempotency key for duplicate webhook protection.",
     )
 
+    @field_validator("website_url", "instagram_url", "facebook_url")
+    @classmethod
+    def validate_url(cls, value: str | None) -> str | None:
+        from app.orchestration import _check_url
+
+        if not value:
+            return value
+        errors: list[str] = []
+        normalized = _check_url(value, "source", errors)
+        if errors or normalized is None:
+            raise ValueError("Expected an HTTP(S) URL without credentials")
+        return normalized
+
 
 
 @app.get("/health")
@@ -142,26 +166,24 @@ def health() -> dict[str, bool]:
     return {"ok": True}
 
 
-_MEDIA_WORKER_TOKEN = os.environ.get("MEDIA_WORKER_TOKEN", "").strip()
+@app.get("/ready")
+def ready() -> JSONResponse:
+    try:
+        from contextlib import closing
+        with closing(sqlite3.connect(DB.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)) as connection:
+            connection.execute("SELECT id FROM jobs LIMIT 1").fetchone()
+    except (ValueError, sqlite3.Error):
+        return JSONResponse({"ok": False}, status_code=503)
+    return JSONResponse({"ok": True})
 
 
 @app.get("/status")
-def status(request: Request) -> object:
-    """Authenticated worker status (used by the n8n Phase 1 probe workflow).
-
-    Fails closed when MEDIA_WORKER_TOKEN is unset or mismatched; constant-time
-    comparison adapted from the legacy `src/engine/auth.py`.
-    """
-    supplied = request.headers.get("x-api-key", "").strip()
-    if not _MEDIA_WORKER_TOKEN or not hmac.compare_digest(supplied, _MEDIA_WORKER_TOKEN):
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Unauthorized: MEDIA_WORKER_TOKEN required"},
-        )
+def status() -> object:
+    """Authenticated worker status used by the n8n health probe."""
     return {
         "ok": True,
         "service": "media-worker",
-        "phase": 1,
+        "phase": 9,
         "auth": "verified",
         "token_configured": True,
     }
@@ -169,23 +191,24 @@ def status(request: Request) -> object:
 
 @app.post("/jobs", status_code=202)
 def create_job(req: CreateJobRequest) -> dict[str, Any]:
-    if not slots.acquire(blocking=False):
-        raise HTTPException(429, "Worker busy; retry later")
-    if req.idempotency_key:
-        try:
-            from app.orchestration import find_idempotent_job
+    with submission_lock:
+        return register_job(req)
 
-            existing_id = find_idempotent_job(_all_job_records(), str(req.idempotency_key))
-        except Exception:  # noqa: BLE001
-            existing_id = None
+
+def register_job(req: CreateJobRequest) -> dict[str, Any]:
+    if req.idempotency_key:
+        from app.orchestration import find_idempotent_job
+
+        existing_id = find_idempotent_job(_all_job_records(), req.idempotency_key)
         if existing_id:
-            slots.release()
             rec = fetch(existing_id)
             return {
                 "job_id": existing_id,
                 "status": (rec or {}).get("status", "queued"),
                 "idempotent_reuse": True,
             }
+    if not slots.acquire(blocking=False):
+        raise HTTPException(429, "Worker busy; retry later")
     job_id = uuid.uuid4().hex
     now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
     payload: dict[str, Any] = {
@@ -205,6 +228,7 @@ def create_job(req: CreateJobRequest) -> dict[str, Any]:
         "run_ai_curation": req.run_ai_curation,
         "business_context": req.business_context,
         "idempotency_key": req.idempotency_key,
+        "created_at": now_iso,
         "updated_at": now_iso,
         "sources": {
             "website": {"status": "queued"},
@@ -212,8 +236,8 @@ def create_job(req: CreateJobRequest) -> dict[str, Any]:
             "facebook": {"status": "queued" if req.facebook_url else "not_requested"},
         },
     }
-    store(payload)
     try:
+        store(payload)
         executor.submit(_process_job, job_id, payload)
     except Exception:
         slots.release()
@@ -511,6 +535,8 @@ def get_job_file(job_id: str, path: str) -> Any:
     if rec is None:
         raise HTTPException(404, "Unknown job")
     job_dir = (Path(DATA_DIR) / job_id).resolve()
+    if not job_dir.is_relative_to(DATA_DIR.resolve()):
+        raise HTTPException(400, "Invalid job directory")
     if not job_dir.is_dir():
         raise HTTPException(404, "Job directory missing")
     # Strict traversal guard: only files inside the job directory.
@@ -521,7 +547,15 @@ def get_job_file(job_id: str, path: str) -> Any:
         raise HTTPException(400, "Invalid path")
     if not candidate.is_file():
         raise HTTPException(404, "File not found")
-    return FileResponse(candidate)
+    return FileResponse(candidate, headers={"X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str) -> dict[str, Any]:
+    record = fetch(job_id)
+    if record is None:
+        raise HTTPException(404, "Unknown job")
+    return record
 
 
 
@@ -610,7 +644,7 @@ def post_delivery_result(job_id: str, payload: dict[str, Any]) -> dict[str, Any]
         job_dir,
         plan,
         list(payload.get("uploads") or []),
-        authorization_confirmed=bool(payload.get("authorization_confirmed")),
+        authorization_confirmed=payload.get("authorization_confirmed") is True,
     )
     if payload.get("drive_folder_id") is not None:
         result["drive_folder_id"] = payload.get("drive_folder_id")

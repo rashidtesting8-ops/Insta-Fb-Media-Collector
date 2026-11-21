@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as _dt
 import re
 import urllib.parse
+from hashlib import sha256
 from typing import Any, Iterable, Mapping
 
 # Phase 7 pipeline stages (must match the n8n workflow's routing).
@@ -86,7 +87,7 @@ def _check_url(value: Any, field: str, errors: list[str]) -> str | None:
     if not parsed.hostname:
         errors.append(f"{field}: URL must include a hostname")
         return None
-    if parsed.username or parsed.password:
+    if parsed.username is not None or parsed.password is not None:
         errors.append(f"{field}: URLs must not embed credentials")
         return None
     # Normalize: drop fragments, keep path/query.
@@ -149,7 +150,7 @@ def validate_intake(payload: Any) -> dict[str, Any]:
 
     social_permission_confirmed = _as_bool(payload.get("social_permission_confirmed"), False)
     run_ai_curation = _as_bool(payload.get("run_ai_curation"), False)
-    authorization_confirmed = _as_bool(payload.get("authorization_confirmed"), False)
+    authorization_confirmed = payload.get("authorization_confirmed") is True
 
     business_name = payload.get("business_name", "")
     if not isinstance(business_name, str):
@@ -174,8 +175,7 @@ def validate_intake(payload: Any) -> dict[str, Any]:
     idempotency_key = payload.get("idempotency_key")
     if idempotency_key is None or str(idempotency_key).strip() == "":
         seed = f"{website_url or ''}|{instagram_url or ''}|{facebook_url or ''}|{business_name}"
-        # Stable, non-cryptographic key (length bounded). n8n/worker treat it as opaque.
-        idempotency_key = "auto-" + str(abs(hash(seed)))[:16]
+        idempotency_key = "auto-" + sha256(seed.encode()).hexdigest()
     else:
         idempotency_key = str(idempotency_key).strip()
         if len(idempotency_key) > 128:

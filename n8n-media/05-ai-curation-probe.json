@@ -3,7 +3,7 @@
   "nodes": [
     {
       "parameters": {
-        "httpMethod": "GET",
+        "authentication": "headerAuth", "httpMethod": "GET",
         "path": "ai-curation-probe",
         "responseMode": "responseNode",
         "options": {}
@@ -11,6 +11,7 @@
       "id": "a5000000-0000-4000-8000-000000000001",
       "name": "Curation Probe Webhook",
       "type": "n8n-nodes-base.webhook",
+      "credentials": {"httpHeaderAuth":{"name":"Media Admin Webhook Token"}},
       "typeVersion": 2.1,
       "position": [240, 300],
       "webhookId": "b5500000-0000-4000-8000-000000000001"
@@ -37,25 +38,27 @@
     },
     {
       "parameters": {
-        "method": "GET",
-        "url": "={{ 'http://collector:8788/jobs/' + $json.job_id }}",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "GET",
+        "url": "={{ 'http://collector:8787/jobs/' + $json.job_id }}",
         "options": {}
       },
       "id": "a5000000-0000-4000-8000-000000000003",
       "name": "Job Status (incl. ai_curation)",
       "type": "n8n-nodes-base.httpRequest",
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "typeVersion": 4.2,
       "position": [680, 300]
     },
     {
       "parameters": {
-        "method": "GET",
-        "url": "={{ 'http://collector:8788/jobs/' + $('Extract Job ID').item.json.job_id + '/curation' }}",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "GET",
+        "url": "={{ 'http://collector:8787/jobs/' + $('Extract Job ID').item.json.job_id + '/curation' }}",
         "options": {}
       },
       "id": "a5000000-0000-4000-8000-000000000004",
       "name": "Curation Result (JSON only, no binaries)",
       "type": "n8n-nodes-base.httpRequest",
+      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
       "typeVersion": 4.2,
       "position": [900, 300]
     },

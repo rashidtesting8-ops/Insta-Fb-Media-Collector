@@ -1,0 +1,93 @@
+name: pgm-media-staging
+
+x-runtime: &runtime
+  restart: unless-stopped
+  init: true
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
+services:
+  collector:
+    <<: *runtime
+    build: ../services/media-worker
+    mem_limit: 1g
+    environment:
+      PROJECTS_DIR: /data/projects
+      MEDIA_WORKER_TOKEN: ${MEDIA_WORKER_TOKEN:?set the staging worker token}
+      MEDIA_WORKER_DASHBOARD_TOKEN: ${MEDIA_WORKER_DASHBOARD_TOKEN:?set a separate staging dashboard token}
+    volumes:
+      - ${STAGING_MEDIA_DIR:?select a fresh staging-only directory}:/data/projects:rw
+    networks: [worker]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/ready', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  n8n:
+    <<: *runtime
+    image: ${N8N_IMAGE:?set a pinned n8n image}
+    mem_limit: 1g
+    ports:
+      - "127.0.0.1:${STAGING_N8N_ADMIN_PORT:-5680}:5678"
+    environment:
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set a fresh staging encryption key}
+      N8N_RESTRICT_FILE_ACCESS_TO: /data/media
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "true"
+      N8N_PAYLOAD_SIZE_MAX: "1"
+      N8N_FORMDATA_FILE_SIZE_MAX: "1"
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: none
+      EXECUTIONS_DATA_SAVE_ON_ERROR: none
+      EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS: "false"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+    volumes:
+      - n8n_state:/home/node/.n8n
+      - ${STAGING_MEDIA_DIR:?select a fresh staging-only directory}:/data/media:ro
+      - ../n8n-media:/opt/media-workflows:ro
+    networks: [worker]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz/readiness || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  dashboard:
+    <<: *runtime
+    build: ../frontend
+    mem_limit: 512m
+    environment:
+      DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:?set the canonical staging HTTPS origin}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set the staging operator password}
+      DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:?set an independent random signing secret}
+      MEDIA_WORKER_DASHBOARD_TOKEN: ${MEDIA_WORKER_DASHBOARD_TOKEN:?set a separate staging dashboard token}
+      N8N_PIPELINE_TOKEN: ${N8N_PIPELINE_TOKEN:?set the staging pipeline webhook token}
+      WORKER_URL: http://collector:8787
+      N8N_URL: http://n8n:5678
+    networks: [edge, worker]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  https:
+    <<: *runtime
+    image: ${CADDY_IMAGE:?set a pinned Caddy image}
+    environment:
+      STAGING_HOST: ${STAGING_HOST:?set the staging hostname without a port}
+    ports:
+      - "127.0.0.1:${STAGING_HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_state:/data
+    networks: [edge]
+
+networks:
+  edge:
+  worker:
+
+volumes:
+  n8n_state:
+  caddy_state:

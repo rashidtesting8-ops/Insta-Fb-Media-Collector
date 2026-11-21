@@ -59,6 +59,7 @@ services:
     environment:
       - PROJECTS_DIR=/data/projects
       - MEDIA_WORKER_TOKEN=${MEDIA_WORKER_TOKEN:?set MEDIA_WORKER_TOKEN in .env}
+      - MEDIA_WORKER_DASHBOARD_TOKEN=${MEDIA_WORKER_DASHBOARD_TOKEN:-}
       # Phase 5 AI: only these variables are forwarded to the worker.
       # Secrets live in local .env / n8n credentials, never in the repo.
       - AI_PROVIDER=${AI_PROVIDER:-}

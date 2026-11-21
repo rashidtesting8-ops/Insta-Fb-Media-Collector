@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
 
@@ -19,6 +19,7 @@ export default function NewCollection() {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
+  const previousSubmission = useRef<{ payload: string; key: string } | null>(null);
 
   function validate() {
     const e: Record<string, string> = {};
@@ -41,9 +42,7 @@ export default function NewCollection() {
     setSubmitting(true);
     setServerError(null);
     try {
-      const v = await api<{ valid: boolean; errors: string[]; create: Record<string, unknown> }>("/api/intake/validate", {
-        method: "POST",
-        body: JSON.stringify({
+      const payload = {
           website_url: form.website_url.trim(),
           instagram_url: form.instagram_url.trim() || null,
           facebook_url: form.facebook_url.trim() || null,
@@ -53,10 +52,15 @@ export default function NewCollection() {
           run_ai_curation: form.run_ai_curation,
           social_permission_confirmed: form.social_permission_confirmed,
           business_context: form.visual_preferences ? { visual_preferences: form.visual_preferences } : undefined,
-        }),
+      };
+      const fingerprint = JSON.stringify(payload);
+      if (previousSubmission.current?.payload !== fingerprint) {
+        previousSubmission.current = { payload: fingerprint, key: crypto.randomUUID() };
+      }
+      const job = await api<{ job_id: string }>("/api/jobs", {
+        method: "POST",
+        body: JSON.stringify({ ...payload, idempotency_key: previousSubmission.current.key }),
       });
-      if (!v.valid) { setServerError((v.errors || []).join("; ")); return; }
-      const job = await api<{ job_id: string }>("/api/jobs", { method: "POST", body: JSON.stringify(v.create) });
       router.push(`/jobs/${job.job_id}`);
     } catch (err: unknown) {
       setServerError(err instanceof Error ? err.message : String(err));
