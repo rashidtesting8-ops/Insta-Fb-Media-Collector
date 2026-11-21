@@ -2,7 +2,7 @@ name: tests
 
 on:
   push:
-    branches: [main, "chore/**"]
+    branches: [main, "chore/**", feat/phase9-production-hardening]
   pull_request:
     branches: [main]
 
