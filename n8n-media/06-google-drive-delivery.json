@@ -1,0 +1,164 @@
+{
+  "name": "06 - Phase 6 Google Drive Delivery (rights-gated)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "drive-delivery",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000001",
+      "name": "Delivery Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [220, 300],
+      "webhookId": "b6600000-0000-4000-8000-000000000001"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {"id": "j1", "name": "job_id", "value": "={{ ($json.body && $json.body.job_id) ? String($json.body.job_id).trim() : '' }}", "type": "string"},
+            {"id": "j2", "name": "business_name", "value": "={{ ($json.body && $json.body.business_name) ? String($json.body.business_name).trim() : 'Pet Grooming Business' }}", "type": "string"},
+            {"id": "j3", "name": "authorization_confirmed", "value": "={{ Boolean($json.body && $json.body.authorization_confirmed) }}", "type": "boolean"}
+          ]
+        },
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000002",
+      "name": "Validate Delivery Request",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'http://collector:8788/jobs/' + $json.job_id + '/delivery-plan?business_name=' + encodeURIComponent($json.business_name) }}",
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000003",
+      "name": "Validated Delivery Plan (worker)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+          "conditions": [
+            {"id": "ready", "leftValue": "={{ $json.status }}", "rightValue": "ready", "operator": {"type": "string", "operation": "equals"}}
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000004",
+      "name": "Plan Ready Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [880, 300]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "resource": "folder",
+        "operation": "create",
+        "name": "={{ $('Validated Delivery Plan (worker)').item.json.folder_name }}",
+        "parents": {"parentId": {"__rl": true, "value": "root", "mode": "id"}},
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000005",
+      "name": "Create Business Drive Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "credentials": {"googleDriveOAuth2Api": {"id": "GOOGLE_DRIVE_CREDENTIAL_ID", "name": "Google Drive account"}},
+      "position": [1100, 240]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "={{ '/data/media/' + $('Validate Delivery Request').item.json.job_id + '/' + $json.local_path }}",
+        "options": {"dataPropertyName": "data"}
+      },
+      "id": "a6000000-0000-4000-8000-000000000006",
+      "name": "Read Selected Original (binary)",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [1300, 240]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "resource": "file",
+        "operation": "upload",
+        "fileName": "={{ $json.fileName || $binary.data.fileName }}",
+        "parents": {"parentId": {"__rl": true, "value": "={{ $('Create Business Drive Folder').item.json.id }}", "mode": "id"}},
+        "binaryPropertyName": "data",
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000007",
+      "name": "Upload Original to Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "credentials": {"googleDriveOAuth2Api": {"id": "GOOGLE_DRIVE_CREDENTIAL_ID", "name": "Google Drive account"}},
+      "position": [1500, 240]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'http://collector:8788/jobs/' + $('Validate Delivery Request').item.json.job_id + '/delivery-result' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ authorization_confirmed: $('Validate Delivery Request').item.json.authorization_confirmed, drive_folder_id: $('Create Business Drive Folder').item.json.id, uploads: [{ upload_key: $('Validated Delivery Plan (worker)').item.json.assets[0].upload_key, drive_file_id: $json.id, drive_link: $json.webViewLink, status: 'uploaded' }] }) }}",
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000008",
+      "name": "Persist Delivery Ledger",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1700, 240]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {"responseCode": 200}
+      },
+      "id": "a6000000-0000-4000-8000-000000000009",
+      "name": "Respond With Delivery Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [1900, 240]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'blocked', reason: 'delivery plan not ready or rights/mock gate blocked' }) }}",
+        "options": {"responseCode": 200}
+      },
+      "id": "a6000000-0000-4000-8000-000000000010",
+      "name": "Return Blocked Status",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [1100, 480]
+    }
+  ],
+  "connections": {
+    "Delivery Webhook": {"main": [[{"node": "Validate Delivery Request", "type": "main", "index": 0}]]},
+    "Validate Delivery Request": {"main": [[{"node": "Validated Delivery Plan (worker)", "type": "main", "index": 0}]]},
+    "Validated Delivery Plan (worker)": {"main": [[{"node": "Plan Ready Gate", "type": "main", "index": 0}]]},
+    "Plan Ready Gate": {"main": [
+      [{"node": "Create Business Drive Folder", "type": "main", "index": 0}],
+      [{"node": "Return Blocked Status", "type": "main", "index": 0}]
+    ]},
+    "Create Business Drive Folder": {"main": [[{"node": "Read Selected Original (binary)", "type": "main", "index": 0}]]},
+    "Read Selected Original (binary)": {"main": [[{"node": "Upload Original to Drive", "type": "main", "index": 0}]]},
+    "Upload Original to Drive": {"main": [[{"node": "Persist Delivery Ledger", "type": "main", "index": 0}]]},
+    "Persist Delivery Ledger": {"main": [[{"node": "Respond With Delivery Result", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1"},
+  "active": false
+}
