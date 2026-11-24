@@ -6,8 +6,12 @@ import { join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import { deliverWithReconciliation } from "../private-drive-jpeg-preflight.mjs";
 import adapter from "../private-drive-n8n-adapter.cjs";
+import { createDiagnostics } from "./qa_diagnostics.mjs";
 
 const loopback = process.env.PGM_QA_LOOPBACK === "1";
+const diagnostics = createDiagnostics("drive", loopback && !process.env.PGM_QA_DIAGNOSTICS_ROOT
+  ? { root: join(tmpdir(), "pgm-qa-diagnostics") }
+  : {});
 const worker = loopback ? "http://127.0.0.1:8877" : "http://pgm-qa-worker:8787";
 const workerToken = loopback ? process.env.PGM_QA_WORKER_TOKEN : "fixture-admin";
 const expectedToken = Buffer.from(process.env.PGM_QA_DRIVE_TOKEN ?? "");
@@ -85,6 +89,8 @@ async function deliver({ job_id, upload_keys }) {
     scenario: new URL(job.website_url).pathname.split("/")[1],
     attempts: [], files: new Map(), refreshes: 0, reconciled: 0 };
   jobs.set(job_id, state);
+  diagnostics.setJobId(job_id);
+  diagnostics.recordStage("mock_drive_deliver_start", { job_id, eligible: eligible.map((a) => a.asset_id), folder_id: state.folderId });
   const uploads = [];
   for (const asset of eligible) {
     const original = await getWorker("/jobs/" + job_id + "/file?" + new URLSearchParams({ path: asset.local_path }));
@@ -112,6 +118,7 @@ async function deliver({ job_id, upload_keys }) {
       uploads.push({ upload_key: asset.upload_key, status: "failed" });
     }
   }
+  diagnostics.recordStage("mock_drive_deliver_result", { job_id, folder_id: state.folderId, uploads });
   return { job_id, uploads, drive_folder_id: state.folderId };
 }
 
