@@ -152,7 +152,7 @@ class PublicHTTP:
                     self._clock()
                     yield chunk
 
-            return Download(size, chunks(), start, strong, close=response.close)
+            return Download(size, chunks(), start, strong, close=response.close, mime=content_type)
         except (KeyError, ValueError) as exc:
             response.close()
             raise ValueError("Incomplete or invalid HTTP download metadata") from exc
@@ -253,6 +253,7 @@ def collect_public_job(
     session_factory=build_collector_session,
     social_runner=None,
     clock=time.monotonic,
+    run_preprocessing: bool = False,
 ):
     """Run the checkpoint path for an explicitly scoped job. Curation is held."""
     if configuration.get("offline_only") or configuration.get("fixture_only"):
@@ -289,7 +290,7 @@ def collect_public_job(
                     permission_confirmed=job.get("social_permission_confirmed") is True,
                     window_start_utc=job.get("window_start_utc"),
                     item_limit=limit(config, "entry_limit"),
-                    request_budget=limit(config, "request_budget"),
+                    request_budget=limit(config, "cli_request_budget") if "cli_request_budget" in config else limit(config, "request_budget"),
                     time_budget_seconds=limit(config, "time_budget_seconds"),
                     allow_fallbacks=bool(config.get("allow_fallbacks", True)),
                     runner=social_runner,
@@ -299,21 +300,45 @@ def collect_public_job(
                                 "sitemaps": config.get("sitemaps", []),
                                 **({"discovery_mode": config["discovery_mode"]} if config.get("discovery_mode") else {})},
                                sort_keys=True)
+            requested_transfer = limit(config, "transfer_budget", minimum=0)
+            download_blocked = (
+                source != "website"
+                and config.get("discovery_mode") == "open_source_cli"
+                and requested_transfer > 0
+                and config.get("download_authorized") is not True
+            )
+            effective_transfer = 0 if download_blocked else requested_transfer
             try:
                 if hasattr(inventory, "check_access"):
                     inventory.check_access()
                 report = state.run_source(source, scope, inventory, transport.download,
                                           page_budget=limit(config, "page_budget"),
-                                          transfer_budget=limit(config, "transfer_budget", minimum=0),
+                                          transfer_budget=effective_transfer,
                                           byte_limit=limit(config, "byte_limit"))
             except SourceStop as exc:
                 report = state.hold_source(source, scope, str(exc))
+            if download_blocked:
+                report["issues"] = list(dict.fromkeys([*report["issues"], "download_authorization_required"]))
+                report["coverage"] = "incomplete"
             if getattr(inventory, "tools_executed", None):
                 tools_by_source[source] = list(inventory.tools_executed)
         reports[source] = report
-    return publish_checkpoint_manifest(
+    manifest = publish_checkpoint_manifest(
         job_dir, job, reports, mode="public_checkpoint", tools_by_source=tools_by_source,
     )
+    if (run_preprocessing or configuration.get("run_preprocessing") is True) and any(
+        asset.get("extraction_status") == "downloaded" and asset.get("local_path")
+        for asset in manifest.get("assets", [])
+    ):
+        from app.preprocessing import run_media_preprocessing
+
+        run_media_preprocessing(
+            job_dir,
+            job["job_id"],
+            cutoff_date=(job.get("window_start_utc") or "")[:10] or None,
+        )
+        manifest = json.loads((job_dir / "manifest.json").read_text(encoding="utf-8"))
+    return manifest
 
 
 def publish_checkpoint_manifest(job_dir, job, reports, *, mode, tools_by_source=None):
@@ -341,6 +366,8 @@ def publish_checkpoint_manifest(job_dir, job, reports, *, mode, tools_by_source=
             }
             if items[asset["item"]].get("shortcode") is not None:
                 normalized["source_shortcode"] = items[asset["item"]]["shortcode"]
+            if items[asset["item"]].get("caption"):
+                normalized["source_caption"] = items[asset["item"]]["caption"]
             if asset["status"] == "verified" and asset.get("digest"):
                 by_digest.setdefault(asset["digest"], []).append(asset["asset_id"])
             if mode == "recorded_extractor":

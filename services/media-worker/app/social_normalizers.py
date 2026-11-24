@@ -15,15 +15,27 @@ from typing import Any
 
 from app.collection_checkpoint import Attachment, SourceItem
 from app.legacy_social_collect import check_social_url
-from app.publication import publication_evidence
+from app.publication import GALLERY_DL_FACEBOOK_UTC_FIELD, publication_evidence
 
 IMAGE_EXTS = frozenset({"jpg", "jpeg", "png", "webp", "gif", "avif"})
 VIDEO_EXTS = frozenset({"mp4", "webm", "mov"})
 _SHORTCODE_RE = re.compile(r"^[\w-]+$")
+_FB_NUMERIC_ID_RE = re.compile(r"^\d{6,30}$")
+_FB_SET_ID_RE = re.compile(r"^[A-Za-z0-9._-]{2,120}$")
+_FB_ATTRIBUTABLE_SUBCATEGORIES = frozenset({"photos", "photo", "set", "albums", "video"})
 
 
-def media_record(media_id: Any, url: str, kind: str, *dates: tuple[str, Any]) -> dict[str, Any]:
-    return {"id": media_id, "url": url, "kind": kind, "dates": dates}
+def media_record(
+    media_id: Any,
+    url: str,
+    kind: str,
+    *dates: tuple[str, Any],
+    raw_date: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {"id": media_id, "url": url, "kind": kind, "dates": dates}
+    if raw_date is not None:
+        record["raw_date"] = raw_date
+    return record
 
 
 def parse_gallery_json(raw_output: str) -> list[Any]:
@@ -64,8 +76,32 @@ def gallery_error_codes(records: list[Any]) -> list[str]:
     return sorted(codes)
 
 
+def _valid_fb_numeric_id(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    text = str(value).strip()
+    return text if _FB_NUMERIC_ID_RE.fullmatch(text) else None
+
+
+def _valid_fb_set_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if _FB_SET_ID_RE.fullmatch(text) else None
+
+
+def _sanitize_caption(value: Any, *, max_len: int = 500) -> str | None:
+    """Store bounded inert caption text as untrusted metadata (never executable)."""
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.split())
+    if not cleaned:
+        return None
+    return cleaned[:max_len]
+
+
 def gallery_posts(records: list[Any]) -> list[dict[str, Any]]:
-    """Normalize gallery-dl --dump-json records into post dicts with child media."""
+    """Normalize gallery-dl --resolve-json/--dump-json records into post dicts with child media."""
     posts: dict[str, dict[str, Any]] = {}
     for entry in records:
         if not isinstance(entry, list) or len(entry) != 3 or entry[0] != 3 or not isinstance(entry[2], dict):
@@ -73,17 +109,8 @@ def gallery_posts(records: list[Any]) -> list[dict[str, Any]]:
         _, url, meta = entry
         if not isinstance(url, str) or not url:
             continue
-        post_url = meta.get("post_url") or meta.get("original_post_url")
-        post_id = meta.get("post_id") or meta.get("sidecar_media_id")
-        shortcode = meta.get("post_shortcode") or meta.get("sidecar_shortcode")
-        if not post_url and isinstance(shortcode, str) and _SHORTCODE_RE.fullmatch(shortcode):
-            if str(meta.get("category") or "").lower() == "instagram":
-                post_url = f"https://www.instagram.com/p/{shortcode}/"
-        key = str(post_id or shortcode or post_url or url)
-        post = posts.setdefault(
-            key,
-            {"id": post_id or shortcode, "url": post_url, "shortcode": shortcode, "media": []},
-        )
+        category = str(meta.get("category") or "").lower()
+        subcategory = str(meta.get("subcategory") or "").lower()
         ext = str(meta.get("extension", "")).lower().lstrip(".")
         if meta.get("media_type") == "thumbnail":
             kind = "thumbnail"
@@ -93,16 +120,62 @@ def gallery_posts(records: list[Any]) -> list[dict[str, Any]]:
             kind = "image"
         else:
             kind = "unsupported"
-        # A generic gallery-dl "date" can come from capture/"seen"; require attributable post fields.
-        post["media"].append(
-            media_record(
-                meta.get("media_id") or meta.get("attachment_id"),
-                url,
-                kind,
-                ("post_date", meta.get("post_date")),
-                ("taken_at_timestamp", meta.get("taken_at_timestamp")),
-            )
+
+        fb_id = _valid_fb_numeric_id(meta.get("id")) if category == "facebook" else None
+        fb_set_id = _valid_fb_set_id(meta.get("set_id")) if category == "facebook" else None
+        fb_attributable = category == "facebook" and subcategory in _FB_ATTRIBUTABLE_SUBCATEGORIES and fb_id is not None
+
+        post_url = meta.get("post_url") or meta.get("original_post_url")
+        post_id = meta.get("post_id") or meta.get("sidecar_media_id")
+        shortcode = meta.get("post_shortcode") or meta.get("sidecar_shortcode")
+        media_id = meta.get("media_id") or meta.get("attachment_id")
+
+        if category == "instagram" and not post_url and isinstance(shortcode, str) and _SHORTCODE_RE.fullmatch(shortcode):
+            post_url = f"https://www.instagram.com/p/{shortcode}/"
+        elif category == "facebook" and fb_id is not None and subcategory != "avatar":
+            post_id = post_id or fb_id
+            media_id = media_id or fb_id
+            if not post_url and fb_attributable:
+                if subcategory == "video" or kind == "video" or str(meta.get("type") or "").lower() == "video":
+                    post_url = f"https://www.facebook.com/watch/?v={fb_id}"
+                elif fb_set_id:
+                    post_url = f"https://www.facebook.com/photo/?fbid={fb_id}&set={fb_set_id}"
+                else:
+                    post_url = f"https://www.facebook.com/photo/?fbid={fb_id}"
+
+        key = str(post_id or shortcode or post_url or url)
+        caption = _sanitize_caption(meta.get("caption") or meta.get("description"))
+        post = posts.setdefault(
+            key,
+            {"id": post_id or shortcode, "url": post_url, "shortcode": shortcode, "caption": caption, "media": []},
         )
+        if caption and not post.get("caption"):
+            post["caption"] = caption
+        # Preserve strict attributable fields across platforms; only accept gallery-dl Facebook "date"
+        # when category/subcategory/id trace directly to facebook.py publish_time/created_time (gmtime UTC).
+        dates: list[tuple[str, Any]] = [
+            ("post_date", meta.get("post_date")),
+            ("taken_at_timestamp", meta.get("taken_at_timestamp")),
+        ]
+        raw_date: dict[str, Any] | None = None
+        raw_fb_date = meta.get("date")
+        if category == "facebook" and raw_fb_date is not None:
+            if fb_attributable:
+                dates.append((GALLERY_DL_FACEBOOK_UTC_FIELD, raw_fb_date))
+                raw_date = {
+                    "field": "date",
+                    "raw_value": str(raw_fb_date),
+                    "subcategory": subcategory,
+                    "reason": "unverified_timezone_or_format",
+                }
+            else:
+                raw_date = {
+                    "field": "date",
+                    "raw_value": str(raw_fb_date),
+                    "subcategory": subcategory or "unknown",
+                    "reason": "unverified_timezone_or_provenance",
+                }
+        post["media"].append(media_record(media_id, url, kind, *dates, raw_date=raw_date))
     return list(posts.values())
 
 
@@ -135,8 +208,12 @@ def instaloader_posts(records: list[Any]) -> list[dict[str, Any]]:
                     media.append(media_record(None, image_url, "thumbnail", *dates))
             elif image_url:
                 media.append(media_record(child.get("id"), image_url, "image", *dates))
+        cap_edges = (node.get("edge_media_to_caption") or {}).get("edges")
+        caption = None
+        if isinstance(cap_edges, list) and cap_edges and isinstance(cap_edges[0], dict):
+            caption = _sanitize_caption((cap_edges[0].get("node") or {}).get("text"))
         post_url = f"https://www.instagram.com/p/{code}/" if isinstance(code, str) and _SHORTCODE_RE.fullmatch(code) else None
-        out.append({"id": node.get("id") or code, "shortcode": code, "url": post_url, "media": media})
+        out.append({"id": node.get("id") or code, "shortcode": code, "url": post_url, "caption": caption, "media": media})
     return out
 
 
@@ -156,7 +233,8 @@ def ytdlp_posts(records: list[Any]) -> list[dict[str, Any]]:
                 media.append(media_record(item.get("id"), item["url"], "video", date))
             if isinstance(item.get("thumbnail"), str) and item["thumbnail"]:
                 media.append(media_record(None, item["thumbnail"], "thumbnail", date))
-            out.append({"id": item.get("id"), "url": item.get("webpage_url"), "media": media})
+            caption = _sanitize_caption(item.get("title") or item.get("description"))
+            out.append({"id": item.get("id"), "url": item.get("webpage_url"), "caption": caption, "media": media})
     return out
 
 
@@ -210,8 +288,13 @@ def build_source_item(
                     raw,
                     source_url=explicit_url,
                     field=field,
-                    attribution=attribution,
+                    attribution=(
+                        "gallery-dl facebook publish_time/created_time (gmtime UTC)"
+                        if field == GALLERY_DL_FACEBOOK_UTC_FIELD
+                        else attribution
+                    ),
                     unix_seconds=field in ("taken_at_timestamp", "release_timestamp"),
+                    gallery_dl_facebook_gmtime_utc=field == GALLERY_DL_FACEBOOK_UTC_FIELD,
                 )
             )
         ]
@@ -220,12 +303,14 @@ def build_source_item(
             issue_list.append("ambiguous_publication_evidence")
         child_id = child["id"] if kind != "thumbnail" else None
         fallback = ("thumbnail:" if kind == "thumbnail" else "") + child["url"]
+        raw_date_evidence = child.get("raw_date") if date is None else None
         item = Attachment(
             str(child_id) if child_id else fallback,
             child["url"],
             kind,
             date,
             "source_supplied" if child_id else "derived",
+            raw_date_evidence=raw_date_evidence,
         )
         previous = attachments.get(item.id)
         if previous and previous.publication_evidence != item.publication_evidence:
@@ -246,4 +331,5 @@ def build_source_item(
         identity_status="source_supplied" if native_id else "derived",
         expected_count=count,
         shortcode=post.get("shortcode"),
+        caption=post.get("caption"),
     )

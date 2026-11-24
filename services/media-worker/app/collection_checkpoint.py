@@ -25,6 +25,7 @@ class Attachment:
     kind: str
     publication_evidence: dict | None = None
     identity_status: str = "derived"
+    raw_date_evidence: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class SourceItem:
     identity_status: str = "derived"
     expected_count: int | None = None
     shortcode: str | None = None
+    caption: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ class Download:
     revision: str | None = None
     sha256: str | None = None
     close: Callable[[], None] | None = None
+    mime: str | None = None
 
 
 class SourceStop(Exception):
@@ -104,9 +107,13 @@ class CollectionCheckpoint:
                 source TEXT, id TEXT, expected_count INTEGER, PRIMARY KEY (source,id))""")
             db.execute("""CREATE TABLE IF NOT EXISTS item_shortcode (
                 source TEXT, id TEXT, shortcode TEXT, PRIMARY KEY (source,id))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS item_caption (
+                source TEXT, id TEXT, caption TEXT, PRIMARY KEY (source,id))""")
             db.execute("""CREATE TABLE IF NOT EXISTS media (
                 key TEXT PRIMARY KEY, source TEXT, item TEXT, native_id TEXT,
                 metadata TEXT, status TEXT, size INTEGER, revision TEXT, expected TEXT, digest TEXT)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS media_mime (
+                key TEXT PRIMARY KEY, mime TEXT)""")
             scope = json.dumps({"job_id": self.job_id, **self.window}, sort_keys=True)
             db.execute("INSERT OR IGNORE INTO job VALUES (1, ?)", (scope,))
             if db.execute("SELECT scope FROM job WHERE id=1").fetchone()[0] != scope:
@@ -163,6 +170,9 @@ class CollectionCheckpoint:
                     if item.shortcode:
                         db.execute("INSERT OR IGNORE INTO item_shortcode VALUES (?,?,?)",
                                    (source, item.id, item.shortcode))
+                    if item.caption:
+                        db.execute("INSERT OR IGNORE INTO item_caption VALUES (?,?,?)",
+                                   (source, item.id, item.caption))
                     db.execute("""INSERT INTO item VALUES (?, ?, ?, ?)
                         ON CONFLICT(source,id) DO UPDATE SET status=excluded.status""",
                         (source, item.id, item.url, item.status))
@@ -246,6 +256,7 @@ class CollectionCheckpoint:
             offset = part.stat().st_size if part.is_file() and row["revision"] else 0
             revision = row["revision"] if offset else None
         response = None
+        committed_digest = False
         try:
             response = fetch(url, offset, revision)
             if offset and (response.offset != offset or response.revision != revision
@@ -257,6 +268,7 @@ class CollectionCheckpoint:
                     response = None
                     response = fetch(url, 0, None)
             if response.offset != offset or not 0 <= offset <= response.size <= byte_limit:
+                part.unlink(missing_ok=True)
                 self._download_status(key, "byte_limit_or_invalid_range")
                 return "byte_limit_or_invalid_range"
             if not offset:
@@ -265,6 +277,8 @@ class CollectionCheckpoint:
             with self._transaction() as db:
                 db.execute("UPDATE media SET size=?,revision=?,expected=?,digest=NULL,status='downloading' WHERE key=?",
                            (response.size, response.revision, response.sha256, key))
+                if response.mime:
+                    db.execute("INSERT OR REPLACE INTO media_mime VALUES (?, ?)", (key, response.mime))
             with part.open("ab" if offset else "wb") as out:
                 count = offset
                 for chunk in response.chunks:
@@ -284,13 +298,18 @@ class CollectionCheckpoint:
             # Store the digest before publishing the file. A restart can reconcile either side of the rename.
             with self._transaction() as db:
                 db.execute("UPDATE media SET digest=?,status='committing' WHERE key=?", (digest, key))
+            committed_digest = True
             os.replace(part, final)
             self._download_status(key, "verified")
             return "verified"
         except SourceStop as exc:
+            if not offset and not committed_digest:
+                part.unlink(missing_ok=True)
             self._download_status(key, str(exc))
             return str(exc)
         except (OSError, ValueError):
+            if not committed_digest and (response is None or not response.revision):
+                part.unlink(missing_ok=True)
             self._download_status(key, "download_interrupted")
             return "download_interrupted"
         finally:
@@ -304,23 +323,34 @@ class CollectionCheckpoint:
     def report(self, source: str) -> dict:
         with self._transaction() as db:
             state = dict(db.execute("SELECT * FROM source WHERE name=?", (source,)).fetchone())
-            rows = [dict(row) for row in db.execute("SELECT * FROM media WHERE source=? ORDER BY key", (source,))]
+            rows = [dict(row) for row in db.execute("""
+                SELECT media.*, media_mime.mime AS mime
+                FROM media LEFT JOIN media_mime USING (key)
+                WHERE media.source=? ORDER BY media.key
+            """, (source,))]
             items = [dict(row) for row in db.execute("""
                 SELECT item.id,item.url,item.status,COALESCE(item_identity.status,'unknown') AS identity_status,
-                       item_expectation.expected_count,item_shortcode.shortcode
+                       item_expectation.expected_count,item_shortcode.shortcode,item_caption.caption
                 FROM item LEFT JOIN item_identity USING (source,id)
                 LEFT JOIN item_expectation USING (source,id)
-                LEFT JOIN item_shortcode USING (source,id) WHERE item.source=? ORDER BY item.id
+                LEFT JOIN item_shortcode USING (source,id)
+                LEFT JOIN item_caption USING (source,id) WHERE item.source=? ORDER BY item.id
             """, (source,))]
         assets = []
         for row in rows:
+            mime = row.pop("mime", None)
             metadata = json.loads(row.pop("metadata") or "{}")
+            if metadata.get("raw_date_evidence") is None:
+                metadata.pop("raw_date_evidence", None)
             evidence = metadata.get("publication_evidence")
-            assets.append({**row, "identity_status": "unknown", **metadata, "asset_id": row["key"],
-                           "local_path": "collection/" + row["key"] + ".media" if row["status"] == "verified" else None,
-                           "post_date": evidence["timestamp_utc"] if evidence else None,
-                           "date_status": "verified" if evidence else "unknown_date",
-                           "extraction_status": "downloaded" if row["status"] == "verified" else row["status"]})
+            asset = {**row, "identity_status": "unknown", **metadata, "asset_id": row["key"],
+                     "local_path": "collection/" + row["key"] + ".media" if row["status"] == "verified" else None,
+                     "post_date": evidence["timestamp_utc"] if evidence else None,
+                     "date_status": "verified" if evidence else "unknown_date",
+                     "extraction_status": "downloaded" if row["status"] == "verified" else row["status"]}
+            if mime:
+                asset["mime"] = mime
+            assets.append(asset)
         manifest = {"job_id": self.job_id, "assets": assets}
         record_publication_review(manifest, self.window)
         manifest["unknown_date_review"] = [

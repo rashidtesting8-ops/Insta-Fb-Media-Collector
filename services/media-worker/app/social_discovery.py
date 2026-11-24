@@ -70,9 +70,11 @@ _AUTH_ERROR_PATTERNS = ("authenticationerror", "authenticationrequired", "author
 _EXTRACTOR_RUNTIME_ERRORS = ("unboundlocalerror", "indexerror", "valueerror", "runtimeerror", "parseerror")
 _RATE_LIMIT_RE = re.compile(r"(?:\b429\b|too many requests|rate[_ ]?limit|ratelimit|please wait a few minutes)")
 _NOT_FOUND_RE = re.compile(r"(?:\b404\b|not found|unsupported url)")
+_GDL_USER_NOT_FOUND_RE = re.compile(r"notfounderror.{0,120}(?:requested user could not be found|user)|requested user could not be found")
+_INSTALOADER_NOT_EXISTS_RE = re.compile(r"profilenotexistsexception|profile\s+\S+\s+does not exist|does not exist\.")
 _GALLERY_ERROR_TEXT_RE = re.compile(r"\[\s*(-1|4|6)\s*,")
-_ELIGIBLE_FALLBACK_REASONS = frozenset({"gallery_dl_error_6", "extractor_broken", "tool_unavailable"})
-_HARD_STOP_REASONS = frozenset({"rate_limited", "restricted", "access_blocked", "request_budget", "time_budget"})
+_ELIGIBLE_FALLBACK_REASONS = frozenset({"gallery_dl_error_6", "extractor_broken", "tool_unavailable", "user_lookup_not_found"})
+_HARD_STOP_REASONS = frozenset({"rate_limited", "restricted", "access_blocked", "request_budget", "time_budget", "profile_not_found"})
 
 
 @dataclass
@@ -219,6 +221,10 @@ def classify_cli_outcome(
         return "rate_limited"
     if base == "login_required":
         return "restricted"
+    if tool == "gallery-dl" and _GDL_USER_NOT_FOUND_RE.search(low):
+        return "user_lookup_not_found"
+    if tool == "instaloader" and _INSTALOADER_NOT_EXISTS_RE.search(low):
+        return "profile_not_found"
     if base == "extractor_broken" or any(token in low for token in _EXTRACTOR_RUNTIME_ERRORS):
         return "extractor_broken"
     if tool == "gallery-dl":
@@ -457,6 +463,8 @@ class OpenSourceSocialInventory:
             issues.append("gallery_dl_error_4")
         if "-1" in error_codes:
             issues.append("gallery_dl_error_envelope")
+        if reason == "user_lookup_not_found":
+            issues.append("gallery_dl_user_lookup_unverified")
         self.tools_executed.append({
             "tool": "gallery-dl",
             "outcome": reason or f"discovered_{len(items)}",
@@ -535,6 +543,10 @@ class OpenSourceSocialInventory:
             return None
         if reason == "gallery_dl_error_6":
             return "restricted"
+        if reason == "profile_not_found":
+            return "access_blocked"
+        if reason == "user_lookup_not_found":
+            return "source_stopped"
         if reason in ("rate_limited", "restricted", "access_blocked", "request_budget", "time_budget", "listing_cap"):
             return reason
         return "source_stopped"

@@ -353,7 +353,8 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             store({
                 **payload, "status": "partial_success", "sources": manifest["sources"],
                 "collection_gate": COLLECTION_HOLD, "ai_curation": {"status": COLLECTION_HOLD},
-                "preprocessing": {"status": "not_run"}, "manifest_path": str(job_dir / "manifest.json"),
+                "preprocessing": manifest.get("preprocessing") or {"status": "not_run"},
+                "manifest_path": str(job_dir / "manifest.json"),
                 "error": "Public inventory is unverified and held for per-job owner review.",
                 "updated_at": _now(),
             }, collection_base=collection_base)

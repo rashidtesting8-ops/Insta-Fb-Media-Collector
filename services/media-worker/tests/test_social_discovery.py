@@ -24,7 +24,7 @@ from app.ai.pipeline import run_ai_curation
 from app.collection_checkpoint import CollectionCheckpoint, SourceStop
 from app.delivery import build_delivery_plan
 from app.public_collection import collect_public_job
-from app.publication import frozen_window
+from app.publication import GALLERY_DL_FACEBOOK_UTC_FIELD, frozen_window, publication_evidence, verified_publication
 from app.social_discovery import (
     OpenSourceSocialInventory,
     build_gallery_dl_discovery_cmd,
@@ -464,7 +464,7 @@ def test_public_collection_integration_preserves_provenance_duplicates_snapshot_
                 "transfer_budget": 4, "byte_limit": 1024, "time_budget_seconds": 30,
             },
             "instagram": {
-                "url": IG, "discovery_mode": "open_source_cli", "media_origins": [CDN],
+                "url": IG, "discovery_mode": "open_source_cli", "download_authorized": True, "media_origins": [CDN],
                 "request_budget": 2, "page_budget": 1, "entry_limit": 5,
                 "transfer_budget": 4, "byte_limit": 1024, "time_budget_seconds": 30,
             },
@@ -676,7 +676,7 @@ def test_real_installed_cli_binaries_accept_generated_flags_offline(tmp_path, mo
     cp = CollectionCheckpoint(job_dir, {"job_id": job_dir.name, **WINDOW})
     inv = OpenSourceSocialInventory(
         "facebook", FB_PEOPLE, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
-        item_limit=5, request_budget=2, time_budget_seconds=15, http_timeout=5, runner=None,
+        item_limit=5, request_budget=2, time_budget_seconds=25, http_timeout=10, runner=None,
     )
     rep = cp.run_source("facebook", FB_PEOPLE, inv, lambda *_: None, page_budget=1, transfer_budget=0, byte_limit=1)
     assert inv.tools_executed == [{"tool": "gallery-dl", "outcome": "source_stopped", "items": 0}]
@@ -705,3 +705,283 @@ def test_real_installed_cli_binaries_accept_generated_flags_offline(tmp_path, mo
     assert parsed.ydl_opts.get("cachedir") is False
     y_res = subprocess.run(y_cmd, capture_output=True, text=True, timeout=15)
     assert "no such option" not in (y_res.stdout + "\n" + y_res.stderr).lower()
+
+
+def test_stage_3b4_facebook_photo_normalization_ids_canonical_urls_and_utc_dates(tmp_path):
+    # Exact sanitized Stage 3B.4 Facebook gallery-dl record schema (job 2316b085c43142e892c02c366b69cdd5).
+    fb_window = frozen_window(datetime(2026, 11, 24, 12, 18, 41, tzinfo=UTC))
+    payload = [
+        [2, {"category": "facebook", "subcategory": "photos", "set_id": "pb.61564648418385.-2207520000"}],
+        [3, "https://scontent.fkhi22-1.fna.fbcdn.net/v/t51.82787-15/photo1.jpg?oh=TOKEN_A&oe=EXP_A", {
+            "category": "facebook",
+            "subcategory": "photos",
+            "id": "122230723652488280",
+            "set_id": "pb.61564648418385.-2207520000",
+            "caption": "We're already taking the spookiest complimentary\nHalloween photos! Lily's Club Harrow & Wood Green.",
+            "date": "2026-10-21 08:35:34",
+            "extension": "jpg",
+            "filename": "859082278_18125464087928802_3121580397243551685_n",
+        }],
+        [3, "https://scontent.fkhi22-1.fna.fbcdn.net/v/t51.82787-15/old_photo.jpg?oh=TOKEN_B&oe=EXP_B", {
+            "category": "facebook",
+            "subcategory": "photos",
+            "id": "122100000000000001",
+            "set_id": "pb.61564648418385.-2207520000",
+            "date": "2024-05-01 10:00:00",
+            "extension": "jpg",
+        }],
+        [3, "https://scontent.fkhi22-1.fna.fbcdn.net/v/t51.82787-15/no_set_photo.jpg", {
+            "category": "facebook",
+            "subcategory": "photo",
+            "id": "122230999999999999",
+            "date": "2026-10-22 14:00:00",
+            "extension": "jpg",
+        }],
+        [3, "https://video.fkhi22-1.fna.fbcdn.net/v/t42/clip.mp4", {
+            "category": "facebook",
+            "subcategory": "video",
+            "id": "99887766554433",
+            "date": "2026-11-01 09:15:00",
+            "extension": "mp4",
+            "type": "video",
+        }],
+    ]
+
+    job_dir = tmp_path / ("a" * 32)
+    job_dir.mkdir()
+    cp = CollectionCheckpoint(job_dir, {"job_id": job_dir.name, **fb_window})
+    inv = OpenSourceSocialInventory(
+        "facebook", FB_PEOPLE, permission_confirmed=True, window_start_utc=fb_window["window_start_utc"],
+        item_limit=5, request_budget=2, time_budget_seconds=25,
+        runner=lambda _c, _s: (0, json.dumps(payload)),
+    )
+    rep = cp.run_source(
+        "facebook", FB_PEOPLE, inv, lambda *_: pytest.fail("transfer_budget=0 must never download"),
+        page_budget=1, transfer_budget=0, byte_limit=1,
+    )
+
+    assert rep["coverage"] == "incomplete" and rep["coverage_percentage"] is None
+    items_by_id = {item["id"]: item for item in rep["items"]}
+    assets_by_native = {asset["native_id"]: asset for asset in rep["assets"]}
+
+    # Native source-supplied IDs and canonical Facebook URLs preserved (not expiring CDN URLs).
+    recent = assets_by_native["122230723652488280"]
+    assert recent["identity_status"] == "source_supplied"
+    assert items_by_id["122230723652488280"]["identity_status"] == "source_supplied"
+    assert items_by_id["122230723652488280"]["url"] == (
+        "https://www.facebook.com/photo/?fbid=122230723652488280&set=pb.61564648418385.-2207520000"
+    )
+    assert "Halloween photos" in (items_by_id["122230723652488280"].get("caption") or "")
+    assert recent["post_date"] == "2026-10-21T08:35:34+00:00"
+    assert recent["date_status"] == "verified" and recent["date_eligibility"] == "in_window"
+    assert recent["publication_evidence"]["field"] == GALLERY_DL_FACEBOOK_UTC_FIELD
+    assert recent["publication_evidence"]["original_timestamp"] == "2026-10-21 08:35:34"
+    assert recent["publication_evidence"]["original_timezone"] == "UTC (gallery-dl time.gmtime)"
+    assert verified_publication(recent) == datetime(2026, 10, 21, 8, 35, 34, tzinfo=UTC)
+    assert "raw_date_evidence" not in recent
+
+    # Out-of-window photo, no-set photo, and video canonical URLs + eligibility.
+    assert assets_by_native["122100000000000001"]["date_eligibility"] == "out_of_window"
+    assert items_by_id["122230999999999999"]["url"] == "https://www.facebook.com/photo/?fbid=122230999999999999"
+    assert assets_by_native["122230999999999999"]["date_eligibility"] == "in_window"
+    assert items_by_id["99887766554433"]["url"] == "https://www.facebook.com/watch/?v=99887766554433"
+    assert assets_by_native["99887766554433"]["kind"] == "video"
+    assert assets_by_native["99887766554433"]["date_eligibility"] == "in_window"
+    assert rep["unknown_date_review"] == []
+
+    # Re-discovering the same Facebook photo with rotated CDN query tokens yields the exact same asset_id.
+    rotated_payload = [[3, "https://scontent.fkhi17-3.fna.fbcdn.net/v/t51.82787-15/photo1.jpg?oh=ROTATED&oe=NEW", {
+        "category": "facebook",
+        "subcategory": "photos",
+        "id": "122230723652488280",
+        "set_id": "pb.61564648418385.-2207520000",
+        "date": "2026-10-21 08:35:34",
+        "extension": "jpg",
+    }]]
+    job_dir2 = tmp_path / ("b" * 32)
+    job_dir2.mkdir()
+    cp2 = CollectionCheckpoint(job_dir2, {"job_id": job_dir2.name, **fb_window})
+    inv2 = OpenSourceSocialInventory(
+        "facebook", FB_PEOPLE, permission_confirmed=True, window_start_utc=fb_window["window_start_utc"],
+        item_limit=5, request_budget=2, time_budget_seconds=25,
+        runner=lambda _c, _s: (0, json.dumps(rotated_payload)),
+    )
+    rep2 = cp2.run_source("facebook", FB_PEOPLE, inv2, lambda *_: None, page_budget=1, transfer_budget=0, byte_limit=1)
+    assert rep2["assets"][0]["asset_id"] == recent["asset_id"]
+
+
+def test_facebook_uncertain_dates_avatar_malformed_ids_and_instagram_strict_dates(tmp_path):
+    fb_window = frozen_window(datetime(2026, 11, 24, 12, 18, 41, tzinfo=UTC))
+    payload = [
+        # 1. Date-only string (uncertain precision/timezone) -> preserved in raw_date_evidence, NOT in_window.
+        [3, f"{CDN}/date-only.jpg", {
+            "category": "facebook", "subcategory": "photos", "id": "122230000000000010",
+            "set_id": "pb.61564648418385.-2207520000", "date": "2026-10-21", "extension": "jpg",
+        }],
+        # 2. Profile avatar subcategory -> never treated as attributable historical post or verified UTC.
+        [3, f"{CDN}/avatar.jpg", {
+            "category": "facebook", "subcategory": "avatar", "id": "122230000000000011",
+            "date": "2026-10-21 08:35:34", "extension": "jpg",
+        }],
+        # 3. Missing/unknown subcategory -> uncertain provenance; preserve raw date, stay unknown_date.
+        [3, f"{CDN}/unknown-sub.jpg", {
+            "category": "facebook", "id": "122230000000000012",
+            "date": "2026-10-21 08:35:34", "extension": "jpg",
+        }],
+        # 4. Malformed non-numeric Facebook ID -> do not fabricate canonical URL or verify date.
+        [3, f"{CDN}/bad-id.jpg", {
+            "category": "facebook", "subcategory": "photos", "id": "not-a-numeric-id",
+            "date": "2026-10-21 08:35:34", "extension": "jpg",
+        }],
+    ]
+
+    job_dir = tmp_path / ("c" * 32)
+    job_dir.mkdir()
+    cp = CollectionCheckpoint(job_dir, {"job_id": job_dir.name, **fb_window})
+    inv = OpenSourceSocialInventory(
+        "facebook", FB_PEOPLE, permission_confirmed=True, window_start_utc=fb_window["window_start_utc"],
+        item_limit=5, request_budget=2, time_budget_seconds=25,
+        runner=lambda _c, _s: (0, json.dumps(payload)),
+    )
+    rep = cp.run_source("facebook", FB_PEOPLE, inv, lambda *_: None, page_budget=1, transfer_budget=0, byte_limit=1)
+
+    assert len(rep["assets"]) == 4
+    assert len(rep["unknown_date_review"]) == 4
+    for asset in rep["assets"]:
+        assert asset["post_date"] is None
+        assert asset["date_status"] == "unknown_date"
+        assert asset["date_eligibility"] == "unknown_date"
+        assert asset["publication_evidence"] is None
+        assert asset["raw_date_evidence"]["field"] == "date"
+
+    items_by_id = {item["id"]: item for item in rep["items"]}
+    # Valid numeric photo with uncertain date keeps native ID & canonical URL, while avatar/malformed do NOT.
+    assert items_by_id["122230000000000010"]["identity_status"] == "source_supplied"
+    assert items_by_id[f"{CDN}/avatar.jpg"]["url"] == FB_PEOPLE
+    assert items_by_id[f"{CDN}/bad-id.jpg"]["url"] == FB_PEOPLE
+
+    # Instagram and non-Facebook URLs can NEVER use gallery_dl_facebook_utc_date naive UTC parsing.
+    assert publication_evidence(
+        "2026-10-21 08:35:34",
+        source_url="https://www.instagram.com/p/TestCode/",
+        field=GALLERY_DL_FACEBOOK_UTC_FIELD,
+        attribution="attempt",
+        gallery_dl_facebook_gmtime_utc=True,
+    ) is None
+    assert publication_evidence(
+        "2026-10-21 08:35:34",
+        source_url="https://www.facebook.com/photo/?fbid=122230723652488280",
+        field="date",
+        attribution="generic date rejected",
+        gallery_dl_facebook_gmtime_utc=False,
+    ) is None
+
+
+def test_instagram_not_found_error_classification_and_bounded_instaloader_crosscheck(tmp_path):
+    gdl_not_found = json.dumps([[-1, {"error": "NotFoundError", "message": "Requested user could not be found"}]])
+    post_ts = int(datetime.fromisoformat(WINDOW["window_end_utc"]).timestamp())
+
+    # 1. Exact Stage 3B.4 NotFoundError -> ONE bounded Instaloader cross-check on unchanged handle succeeds.
+    calls_ok: list[list[str]] = []
+
+    def crosscheck_success(cmd: list[str], stage: Path) -> tuple[int, str]:
+        _assert_no_bypass_flags(cmd)
+        calls_ok.append(cmd)
+        if cmd[0] == "gallery-dl":
+            return 0, gdl_not_found
+        assert cmd[0] == "instaloader" and cmd[-2:] == ["--", "lilysclubuk"]
+        sidecar = {
+            "instaloader": {"version": "4.16", "node_type": "Post"},
+            "node": {
+                "id": "ig-cc-1", "shortcode": "IgCc1", "taken_at_timestamp": post_ts,
+                "is_video": False, "display_url": f"{CDN}/ig-cc-1.jpg",
+            },
+        }
+        (stage / "2026-11-20_12-00-00_UTC.json").write_text(json.dumps(sidecar), encoding="utf-8")
+        return 0, ""
+
+    d1 = tmp_path / ("d" * 32)
+    d1.mkdir()
+    cp1 = CollectionCheckpoint(d1, {"job_id": d1.name, **WINDOW})
+    inv1 = OpenSourceSocialInventory(
+        "instagram", IG, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+        item_limit=5, request_budget=2, time_budget_seconds=25, runner=crosscheck_success,
+    )
+    rep1 = cp1.run_source(
+        "instagram", IG, inv1, lambda *_: pytest.fail("transfer_budget=0 must never download"),
+        page_budget=1, transfer_budget=0, byte_limit=1,
+    )
+    assert [c[0] for c in calls_ok] == ["gallery-dl", "instaloader"]
+    assert inv1.tools_executed[0]["outcome"] == "user_lookup_not_found"
+    assert "gallery_dl_user_lookup_unverified" in rep1["issues"]
+    assert rep1["coverage"] == "incomplete" and rep1["coverage_percentage"] is None
+    assert len(rep1["assets"]) == 1 and rep1["assets"][0]["date_eligibility"] == "in_window"
+
+    # 2. Instaloader cross-check reports profile does not exist -> distinct profile_not_found -> access_blocked.
+    calls_missing: list[str] = []
+
+    def crosscheck_nonexistent(cmd: list[str], _stage: Path) -> tuple[int, str]:
+        calls_missing.append(cmd[0])
+        if cmd[0] == "gallery-dl":
+            return 0, gdl_not_found
+        return 1, "Profile lilysclubuk does not exist."
+
+    d2 = tmp_path / ("e" * 32)
+    d2.mkdir()
+    cp2 = CollectionCheckpoint(d2, {"job_id": d2.name, **WINDOW})
+    inv2 = OpenSourceSocialInventory(
+        "instagram", IG, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+        item_limit=5, request_budget=2, time_budget_seconds=25, runner=crosscheck_nonexistent,
+    )
+    rep2 = cp2.run_source("instagram", IG, inv2, lambda *_: None, page_budget=1, transfer_budget=0, byte_limit=1)
+    assert calls_missing == ["gallery-dl", "instaloader"]
+    assert [t["outcome"] for t in inv2.tools_executed] == ["user_lookup_not_found", "profile_not_found"]
+    assert rep2["stop_reason"] == "access_blocked"
+    assert rep2["coverage"] == "incomplete" and rep2["coverage_percentage"] is None
+
+    # 3. Instaloader cross-check encounters explicit 401/429 restriction -> stops cleanly as restricted / rate_limited.
+    for il_msg, expected in (
+        ("HTTP Error 401 Unauthorized: Login required", "restricted"),
+        ("429 Too Many Requests - Please wait a few minutes", "rate_limited"),
+    ):
+        d3 = tmp_path / ("f" * 31 + ("1" if expected == "restricted" else "2"))
+        d3.mkdir()
+        cp3 = CollectionCheckpoint(d3, {"job_id": d3.name, **WINDOW})
+        inv3 = OpenSourceSocialInventory(
+            "instagram", IG, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+            item_limit=5, request_budget=2, time_budget_seconds=25,
+            runner=lambda cmd, _s, msg=il_msg: (0, gdl_not_found) if cmd[0] == "gallery-dl" else (1, msg),
+        )
+        rep3 = cp3.run_source("instagram", IG, inv3, lambda *_: None, page_budget=1, transfer_budget=0, byte_limit=1)
+        assert rep3["stop_reason"] == expected and rep3["coverage_percentage"] is None
+
+    # 4. gallery-dl NotFoundError WITH explicit 403/login/429 signal stops IMMEDIATELY with ZERO fallback.
+    calls_gated: list[str] = []
+
+    def gated_not_found(cmd: list[str], _stage: Path) -> tuple[int, str]:
+        calls_gated.append(cmd[0])
+        return 0, json.dumps([[-1, {"error": "NotFoundError", "message": "Requested user could not be found; 403 Forbidden login required"}]])
+
+    d4 = tmp_path / ("1" * 31 + "a")
+    d4.mkdir()
+    cp4 = CollectionCheckpoint(d4, {"job_id": d4.name, **WINDOW})
+    inv4 = OpenSourceSocialInventory(
+        "instagram", IG, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+        item_limit=5, request_budget=3, time_budget_seconds=25, runner=gated_not_found,
+    )
+    rep4 = cp4.run_source("instagram", IG, inv4, lambda *_: None, page_budget=1, transfer_budget=0, byte_limit=1)
+    assert calls_gated == ["gallery-dl"]
+    assert rep4["stop_reason"] == "restricted"
+
+    # 5. allow_fallbacks=False stops as source_stopped (does NOT claim handle is nonexistent).
+    d5 = tmp_path / ("1" * 31 + "b")
+    d5.mkdir()
+    cp5 = CollectionCheckpoint(d5, {"job_id": d5.name, **WINDOW})
+    inv5 = OpenSourceSocialInventory(
+        "instagram", IG, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+        item_limit=5, request_budget=2, time_budget_seconds=25, allow_fallbacks=False,
+        runner=lambda _c, _s: (0, gdl_not_found),
+    )
+    rep5 = cp5.run_source("instagram", IG, inv5, lambda *_: None, page_budget=1, transfer_budget=0, byte_limit=1)
+    assert [t["outcome"] for t in inv5.tools_executed] == ["user_lookup_not_found"]
+    assert rep5["stop_reason"] == "source_stopped" and rep5["coverage_percentage"] is None

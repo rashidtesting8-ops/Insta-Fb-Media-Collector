@@ -356,12 +356,16 @@ def run_media_preprocessing(
             continue
 
         ext = disk.suffix.lower()
+        item_kind = str(item.get("type") or item.get("kind") or "").lower()
+        item_mime = str(item.get("mime") or "").lower()
+        is_video = ext in _VIDEO_EXTS or (ext == ".media" and (item_kind == "video" or item_mime.startswith("video/")))
+        is_image = ext in _IMAGE_EXTS or (ext == ".media" and (item_kind == "image" or item_mime.startswith("image/")))
 
         # Date categorization applies to every downloaded asset with a file
         # (verified timestamps only; never inferred from capture time).
         item["date_category"] = item.get("date_eligibility") or _date_category(item, cutoff_date)
 
-        if ext in _VIDEO_EXTS:
+        if is_video:
             _process_video(
                 item, disk, job_dir, result,
                 max_frames=max_video_frames,
@@ -370,7 +374,7 @@ def run_media_preprocessing(
             )
             continue
 
-        if ext not in _IMAGE_EXTS:
+        if not is_image:
             # e.g. SVG from website crawls: expected, honest, not an error.
             item["preprocessing"] = {"outcome": "unsupported_format", "note": f"{ext} not analyzable by Pillow"}
             item.setdefault("quality", None)
@@ -380,7 +384,12 @@ def run_media_preprocessing(
         # --- image path ---------------------------------------------------
         sha = item.get("sha256") or hashlib.sha256(disk.read_bytes()).hexdigest()
         try:
-            item["quality"] = analyze_image(disk)
+            quality = analyze_image(disk)
+            item["quality"] = quality
+            if item.get("width") is None and quality.get("width"):
+                item["width"] = quality["width"]
+            if item.get("height") is None and quality.get("height"):
+                item["height"] = quality["height"]
             item["phash"] = phashes[item["asset_id"]] = phash_file(disk)
             item["preprocessing"] = {"outcome": "processed"}
             result.images_analyzed += 1
@@ -518,6 +527,10 @@ def _process_video(
         return
     result.videos_probed += 1
     item["video_probe"] = probe
+    if item.get("width") is None and probe.get("width"):
+        item["width"] = probe["width"]
+    if item.get("height") is None and probe.get("height"):
+        item["height"] = probe["height"]
 
     if probe["duration_s"] is None or probe["duration_s"] > max_duration:
         item["preprocessing"] = {
