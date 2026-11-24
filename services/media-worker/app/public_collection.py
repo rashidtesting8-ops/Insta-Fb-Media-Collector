@@ -245,7 +245,15 @@ class PublicSocialSnapshot:
         return posts.values()
 
 
-def collect_public_job(job_dir: Path, job: dict, configuration: dict, *, session_factory=build_collector_session):
+def collect_public_job(
+    job_dir: Path,
+    job: dict,
+    configuration: dict,
+    *,
+    session_factory=build_collector_session,
+    social_runner=None,
+    clock=time.monotonic,
+):
     """Run the checkpoint path for an explicitly scoped job. Curation is held."""
     if configuration.get("offline_only") or configuration.get("fixture_only"):
         raise ValueError("Offline recordings cannot use the public HTTP path")
@@ -255,6 +263,7 @@ def collect_public_job(job_dir: Path, job: dict, configuration: dict, *, session
             raise ValueError("Public collection configuration does not match the submitted source URLs")
     state = CollectionCheckpoint(job_dir, job)
     reports = {}
+    tools_by_source = {}
     held_origins = {}
     for source in SOURCES:
         config = configs[source]
@@ -268,13 +277,30 @@ def collect_public_job(job_dir: Path, job: dict, configuration: dict, *, session
                     permitted=transport.page_permitted, media_permitted=transport.media_permitted,
                     document_limit=document_limit, entry_limit=limit(config, "entry_limit"),
                 )
-            else:
+            elif config.get("snapshot") is not None or config.get("discovery_mode") != "open_source_cli":
                 inventory = PublicSocialSnapshot(source, url, config.get("snapshot"),
                                                  job.get("social_permission_confirmed") is True)
+            else:
+                from app.social_discovery import OpenSourceSocialInventory
+
+                inventory = OpenSourceSocialInventory(
+                    source,
+                    url,
+                    permission_confirmed=job.get("social_permission_confirmed") is True,
+                    window_start_utc=job.get("window_start_utc"),
+                    item_limit=limit(config, "entry_limit"),
+                    request_budget=limit(config, "request_budget"),
+                    time_budget_seconds=limit(config, "time_budget_seconds"),
+                    allow_fallbacks=bool(config.get("allow_fallbacks", True)),
+                    runner=social_runner,
+                    clock=clock,
+                )
             scope = json.dumps({"url": url, "media_origins": sorted(transport.media_origins),
-                                "sitemaps": config.get("sitemaps", [])}, sort_keys=True)
+                                "sitemaps": config.get("sitemaps", []),
+                                **({"discovery_mode": config["discovery_mode"]} if config.get("discovery_mode") else {})},
+                               sort_keys=True)
             try:
-                if isinstance(inventory, PublicSocialSnapshot):
+                if hasattr(inventory, "check_access"):
                     inventory.check_access()
                 report = state.run_source(source, scope, inventory, transport.download,
                                           page_budget=limit(config, "page_budget"),
@@ -282,11 +308,15 @@ def collect_public_job(job_dir: Path, job: dict, configuration: dict, *, session
                                           byte_limit=limit(config, "byte_limit"))
             except SourceStop as exc:
                 report = state.hold_source(source, scope, str(exc))
+            if getattr(inventory, "tools_executed", None):
+                tools_by_source[source] = list(inventory.tools_executed)
         reports[source] = report
-    return publish_checkpoint_manifest(job_dir, job, reports, mode="public_checkpoint")
+    return publish_checkpoint_manifest(
+        job_dir, job, reports, mode="public_checkpoint", tools_by_source=tools_by_source,
+    )
 
 
-def publish_checkpoint_manifest(job_dir, job, reports, *, mode):
+def publish_checkpoint_manifest(job_dir, job, reports, *, mode, tools_by_source=None):
     manifest = {"job_id": job["job_id"], "schema_version": SCHEMA_VERSION,
                 **{field: job[field] for field in WINDOW_FIELDS},
                 "collection_mode": mode, "collection_gate": COLLECTION_HOLD,
@@ -297,6 +327,8 @@ def publish_checkpoint_manifest(job_dir, job, reports, *, mode):
             key: report[key] for key in ("items", "coverage", "coverage_percentage", "cursor",
                                         "stop_reason", "issues", "listing_exhausted")
         }
+        if tools_by_source and source in tools_by_source:
+            manifest["sources"][source]["tools_executed"] = tools_by_source[source]
         if mode == "recorded_extractor":
             manifest["sources"][source].update(discovery_status=report["coverage"], coverage="unknown")
         items = {item["id"]: item for item in report["items"]}
@@ -307,6 +339,10 @@ def publish_checkpoint_manifest(job_dir, job, reports, *, mode):
                 "type": asset.get("kind"), "sha256": asset["digest"], "bytes": asset["size"],
                 "rights_status": "unverified",
             }
+            if items[asset["item"]].get("shortcode") is not None:
+                normalized["source_shortcode"] = items[asset["item"]]["shortcode"]
+            if asset["status"] == "verified" and asset.get("digest"):
+                by_digest.setdefault(asset["digest"], []).append(asset["asset_id"])
             if mode == "recorded_extractor":
                 normalized["source_shortcode"] = items[asset["item"]]["shortcode"]
                 status = asset["status"]
@@ -316,15 +352,14 @@ def publish_checkpoint_manifest(job_dir, job, reports, *, mode):
                     "blocked" if status in ("restricted", "access_blocked", "rate_limited") else
                     "discovered" if status == "pending" else "failed"
                 )
-                if status == "verified":
-                    by_digest.setdefault(asset["digest"], []).append(asset["asset_id"])
             manifest["assets"].append(normalized)
     record_publication_review(manifest, job)
-    if mode == "recorded_extractor":
-        manifest["unknown_date_review"] = [key for report in reports.values() for key in report["unknown_date_review"]]
-        manifest["duplicate_provenance_groups"] = [
-            {"sha256": digest, "asset_ids": ids} for digest, ids in by_digest.items() if len(ids) > 1
-        ]
+    manifest["unknown_date_review"] = list(dict.fromkeys(
+        [*manifest["unknown_date_review"], *(key for report in reports.values() for key in report["unknown_date_review"])]
+    ))
+    duplicate_groups = [{"sha256": digest, "asset_ids": ids} for digest, ids in by_digest.items() if len(ids) > 1]
+    if mode == "recorded_extractor" or duplicate_groups:
+        manifest["duplicate_provenance_groups"] = duplicate_groups
     if validate_against_disk(job_dir, manifest):
         raise ValueError("Public collection manifest failed file-integrity validation")
     write_manifest(job_dir, manifest)
