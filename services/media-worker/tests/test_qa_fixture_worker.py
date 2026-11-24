@@ -85,6 +85,8 @@ def test_m4_qa_worker_approval_start_ai_manifest_integrity_and_rights_filter(wor
     system_db = worker.DATA_DIR / "_system" / "jobs.sqlite"
     system_db.parent.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(worker, "DB", system_db)
+    monkeypatch.setattr(worker.app.state, "offline_approval_qa", False, raising=False)
+    monkeypatch.setattr(worker.app.state, "offline_processing_consent", {}, raising=False)
     QA_WORKER.enable_disposable_m4_qa(worker, worker.DATA_DIR.parent)
     principal_a, _ = QA_WORKER.provision_qa_admins(
         worker.DB,

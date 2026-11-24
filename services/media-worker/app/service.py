@@ -192,17 +192,222 @@ def status() -> object:
     }
 
 
+def m4_approval_enabled() -> bool:
+    """Explicit default-OFF activation gate for M4 approval, rights ledger, and Start AI execution."""
+    return bool(
+        getattr(app.state, "offline_approval_qa", False)
+        or os.environ.get("M4_COLLECTION_APPROVAL_ENABLED") == "1"
+    )
+
+
+def execute_started_curation(
+    body: dict[str, Any],
+    actor: str,
+    *,
+    provider: Any = None,
+    config: Any = None,
+) -> Any:
+    """Execute Start AI curation for an approved immutable revision through the configured provider."""
+    import re
+    from app.ai.pipeline import run_started_curation
+    from app.ai.provider import AIProviderConfig, build_provider, scrub_secrets
+    from app.ai_execution import InferenceHeld
+    from app.collection_approval import review_state
+
+    if not isinstance(body, dict) or set(body) != {"job_id", "if_match", "processing_consent"}:
+        raise HTTPException(400, "Expected job_id, if_match, and processing_consent")
+    job_id = body["job_id"]
+    start_etag = body["if_match"]
+    raw_consent = body["processing_consent"]
+    if (
+        not isinstance(job_id, str)
+        or not re.fullmatch(r"[a-f0-9]{32}", job_id)
+        or not isinstance(start_etag, str)
+        or not start_etag.strip()
+        or not isinstance(raw_consent, dict)
+        or not raw_consent
+    ):
+        raise HTTPException(400, "Invalid collection execution fields")
+    consent_map: dict[str, tuple[str, str]] = {}
+    for aid, entry in raw_consent.items():
+        if (
+            not isinstance(aid, str)
+            or not aid.strip()
+            or not isinstance(entry, dict)
+            or set(entry) != {"source_url", "sha256"}
+            or not isinstance(entry["source_url"], str)
+            or not entry["source_url"].strip()
+            or not isinstance(entry["sha256"], str)
+            or not entry["sha256"].strip()
+        ):
+            raise HTTPException(400, "Each processing_consent entry requires source_url and sha256")
+        consent_map[aid] = (entry["source_url"], entry["sha256"])
+
+    rec = fetch(job_id)
+    if rec is None:
+        raise HTTPException(404, "Unknown job")
+    job_dir = Path(DATA_DIR) / job_id
+    if (job_dir / "curation.json").exists():
+        raise HTTPException(409, "Existing curation preserved")
+
+    # Read-only preflight before mutating job status or building provider;
+    # ai_execution.execution() remains the sole atomic claim gate inside BEGIN IMMEDIATE.
+    with connect() as con:
+        required = ("collection_revisions", "collection_decisions", "collection_ai_starts", "ai_execution_claims")
+        present = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if not set(required) <= present:
+            raise HTTPException(503, "M4 collection ledger is not migrated")
+        state, submitter, current, _seq, decision, start = review_state(con, DATA_DIR, job_id)
+        if not current or state["state"] != "approved" or not state["start_authorized"] or not decision or not start or decision[3] == submitter:
+            raise HTTPException(409, "Independent approval and active Start AI required")
+        if state["etag"] != start_etag:
+            raise HTTPException(412, "Requested Start AI does not match current approved revision")
+        rev = state["revision"]
+        if con.execute("SELECT 1 FROM ai_execution_claims WHERE job=? AND revision=?", (job_id, rev)).fetchone():
+            raise HTTPException(409, "Execution already claimed for this revision")
+
+    cfg = config or AIProviderConfig.from_env()
+    if cfg.provider == "mock" and not getattr(app.state, "offline_approval_qa", False):
+        raise HTTPException(409, "Mock AI provider is not permitted in production mode")
+
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    previous_ai = rec.get("ai_curation")
+    if provider is None:
+        factory = getattr(app.state, "ai_provider_factory", None)
+        if callable(factory):
+            provider = factory(cfg)
+        else:
+            provider, status = build_provider(cfg)
+            if provider is None:
+                store({
+                    **rec,
+                    "ai_curation": {
+                        "status": status,
+                        "provider": cfg.provider,
+                        "model": cfg.model,
+                        "actor": actor,
+                        "start_etag": start_etag,
+                        "updated_at": now,
+                    },
+                    "updated_at": now,
+                })
+                raise HTTPException(503, f"AI provider {status}")
+
+    store({
+        **rec,
+        "ai_curation": {
+            "status": "started",
+            "provider": getattr(provider, "name", cfg.provider),
+            "model": cfg.model or getattr(provider, "model", ""),
+            "actor": actor,
+            "start_etag": start_etag,
+            "started_at": now,
+        },
+        "updated_at": now,
+    })
+
+    try:
+        outcome = run_started_curation(
+            job_dir,
+            job_id,
+            processing_consent=consent_map,
+            start_etag=start_etag,
+            config=cfg,
+            provider=provider,
+            business_context=rec.get("business_context"),
+            max_images=int(rec.get("max_selected_images") or 30),
+            max_videos=int(rec.get("max_selected_videos") or 10),
+            batch_size=cfg.batch_size,
+        )
+    except InferenceHeld as exc:
+        finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        with connect() as con:
+            claimed = bool(
+                con.execute("SELECT 1 FROM ai_execution_claims WHERE job=? AND revision=?", (job_id, rev)).fetchone()
+            )
+        latest = fetch(job_id) or rec
+        if claimed:
+            store({
+                **latest,
+                "ai_curation": {
+                    "status": "failed",
+                    "held": True,
+                    "error": scrub_secrets(str(exc))[:240],
+                    "actor": actor,
+                    "start_etag": start_etag,
+                    "finished_at": finished,
+                },
+                "updated_at": finished,
+            })
+        else:
+            store({**latest, "ai_curation": previous_ai, "updated_at": finished})
+        raise HTTPException(409, str(exc)) from None
+    except Exception as exc:  # noqa: BLE001 — fail honestly without leaking secrets
+        finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        safe_err = scrub_secrets(str(exc))[:240]
+        latest = fetch(job_id) or rec
+        store({
+            **latest,
+            "ai_curation": {
+                "status": "failed",
+                "provider": getattr(provider, "name", cfg.provider),
+                "model": cfg.model or getattr(provider, "model", ""),
+                "actor": actor,
+                "start_etag": start_etag,
+                "errors": [safe_err],
+                "finished_at": finished,
+            },
+            "updated_at": finished,
+        })
+        return JSONResponse({"job_id": job_id, "status": "failed", "errors": [safe_err]}, status_code=502)
+
+    finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    latest = fetch(job_id) or rec
+    store({
+        **latest,
+        "ai_curation": {
+            **outcome.as_dict(),
+            "actor": actor,
+            "start_etag": start_etag,
+            "finished_at": finished,
+        },
+        "updated_at": finished,
+    })
+    payload_out = {"job_id": job_id, **outcome.as_dict()}
+    if outcome.status not in ("completed", "partial"):
+        return JSONResponse(payload_out, status_code=502)
+    return payload_out
+
+
 @app.post("/named/{action}")
 async def named_action(action: str, request: Request):
-    from app.named_auth import dispatch
+    from app.named_auth import dispatch, verify_admin_action
     from starlette.concurrency import run_in_threadpool
 
-    qa = getattr(app.state, "offline_approval_qa", False)
-    if action.startswith("collection-") and not qa:
+    enabled = m4_approval_enabled()
+    if action == "collection-execute":
+        if not enabled:
+            raise HTTPException(404, "Approval adapter unavailable")
+        actor, body = await run_in_threadpool(
+            verify_admin_action,
+            DB,
+            action,
+            await request.body(),
+            request.headers.get("x-named-assertion", ""),
+            request.headers.get("x-named-session", ""),
+        )
+        return await run_in_threadpool(execute_started_curation, body, actor)
+    if action.startswith("collection-") and not enabled:
         raise HTTPException(404, "Approval adapter unavailable")
-    return await run_in_threadpool(dispatch, DB, action, await request.body(),
-                                  request.headers.get("x-named-assertion", ""),
-                                  request.headers.get("x-named-session", ""), approval_root=DATA_DIR if qa else None)
+    return await run_in_threadpool(
+        dispatch,
+        DB,
+        action,
+        await request.body(),
+        request.headers.get("x-named-assertion", ""),
+        request.headers.get("x-named-session", ""),
+        approval_root=DATA_DIR if enabled else None,
+    )
 
 
 @app.post("/jobs", status_code=202)
@@ -319,10 +524,19 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
 
     try:
         collection_base = None
-        if getattr(app.state, "offline_approval_qa", False):
+        if m4_approval_enabled():
             with connect() as con:
-                collection_base = con.execute("SELECT coalesce(max(revision),0) FROM collection_revisions WHERE job=?",
-                                              (job_id,)).fetchone()[0]
+                has_ledger = con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_revisions'"
+                ).fetchone()
+                if not has_ledger:
+                    raise RuntimeError(
+                        "M4 collection ledger is not migrated; run explicit migration before enabling M4_COLLECTION_APPROVAL_ENABLED"
+                    )
+                collection_base = con.execute(
+                    "SELECT coalesce(max(revision),0) FROM collection_revisions WHERE job=?",
+                    (job_id,),
+                ).fetchone()[0]
         sources: dict[str, Any] = dict(payload.get("sources") or {})
         sources["website"] = {"status": "running"}
         for platform in ("instagram", "facebook"):
@@ -353,7 +567,8 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             store({
                 **payload, "status": "partial_success", "sources": manifest["sources"],
                 "collection_gate": COLLECTION_HOLD, "ai_curation": {"status": COLLECTION_HOLD},
-                "preprocessing": {"status": "not_run"}, "manifest_path": str(job_dir / "manifest.json"),
+                "preprocessing": manifest.get("preprocessing") or {"status": "not_run"},
+                "manifest_path": str(job_dir / "manifest.json"),
                 "error": "Public inventory is unverified and held for per-job owner review.",
                 "updated_at": _now(),
             }, collection_base=collection_base)
@@ -673,11 +888,18 @@ def get_delivery_plan(job_id: str, business_name: str = "") -> dict[str, Any]:
     rec = fetch(job_id)
     if rec is None:
         raise HTTPException(404, "Unknown job")
-    if rec.get("collection_mode") in ("public_checkpoint", "recorded_extractor"):
-        return {"status": "blocked_unverified_collection", "job_id": job_id, "assets": []}
     from app.delivery import build_delivery_plan
 
-    return build_delivery_plan(Path(DATA_DIR) / job_id, job_id, business_name)
+    is_checkpoint = rec.get("collection_mode") in ("public_checkpoint", "recorded_extractor")
+    if is_checkpoint and not m4_approval_enabled():
+        return {"status": "blocked_unverified_collection", "job_id": job_id, "assets": []}
+    return build_delivery_plan(
+        Path(DATA_DIR) / job_id,
+        job_id,
+        business_name,
+        db_path=DB if is_checkpoint else None,
+        projects_root=DATA_DIR if is_checkpoint else None,
+    )
 
 
 @app.post("/jobs/{job_id}/delivery-result")
@@ -685,11 +907,21 @@ def post_delivery_result(job_id: str, payload: dict[str, Any]) -> dict[str, Any]
     rec = fetch(job_id)
     if rec is None:
         raise HTTPException(404, "Unknown job")
-    if rec.get("collection_mode") in ("public_checkpoint", "recorded_extractor"):
-        raise HTTPException(409, "blocked_unverified_collection")
+    if payload.get("public_sharing") is True or payload.get("visibility") not in (None, "private"):
+        raise HTTPException(403, "Private delivery destination required; public sharing is prohibited")
     from app.delivery import build_delivery_plan, finalize_delivery
+
+    is_checkpoint = rec.get("collection_mode") in ("public_checkpoint", "recorded_extractor")
+    if is_checkpoint and not m4_approval_enabled():
+        raise HTTPException(409, "blocked_unverified_collection")
     job_dir = Path(DATA_DIR) / job_id
-    plan = build_delivery_plan(job_dir, job_id, str(payload.get("business_name") or ""))
+    plan = build_delivery_plan(
+        job_dir,
+        job_id,
+        str(payload.get("business_name") or ""),
+        db_path=DB if is_checkpoint else None,
+        projects_root=DATA_DIR if is_checkpoint else None,
+    )
     if plan["status"] != "ready":
         raise HTTPException(409, plan["status"])
     if payload.get("authorization_confirmed") is not True:
@@ -701,6 +933,8 @@ def post_delivery_result(job_id: str, payload: dict[str, Any]) -> dict[str, Any]
         authorization_confirmed=True,
         drive_folder_id=payload.get("drive_folder_id"),
         drive_folder_link=payload.get("drive_folder_link"),
+        public_sharing=False,
+        visibility="private",
     )
 
 

@@ -1,22 +1,51 @@
-"""Website discovery adapter for an injected, offline document transport."""
+"""Website discovery adapter for an injected, offline or guarded HTTP document transport."""
 
 import json
 from pathlib import PurePosixPath
+import re
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
 from bs4 import BeautifulSoup
 
 from app.collection_checkpoint import Attachment, InventoryPage, SourceItem, SourceStop
-from app.legacy_collector import candidate_url, grab_media, normalize_page_url
+from app.legacy_collector import MEDIA_EXTENSIONS, candidate_url, grab_media, normalize_page_url
+
+_HISTORICAL_PATH_HINTS = (
+    "archive", "archives", "blog", "news", "post", "posts", "article", "articles",
+    "category", "categories", "gallery", "galleries", "portfolio", "photo", "photos",
+    "video", "videos", "media", "transformation", "transformations", "before-after",
+    "work", "our-work", "grooming", "updates", "diary", "journal", "showcase",
+)
+_EXCLUDED_PATH_HINTS = (
+    "/logout", "/login", "/signin", "/sign-in", "/signup", "/sign-up", "/register",
+    "/account", "/cart", "/checkout", "/basket", "/admin", "/wp-admin", "/wp-login",
+    "/feed", "/privacy", "/terms", "/cookie", "/search", "/wp-json",
+)
+_NON_HTML_EXTS = frozenset(MEDIA_EXTENSIONS | {".pdf", ".zip", ".gz", ".tar", ".xml", ".json", ".css", ".js", ".ico", ".woff", ".woff2"})
+_PAGINATION_PATH_RE = re.compile(r"(?:/page/\d+/?$|(?:^|&)(?:page|paged|p)=\d+(?:&|$))", re.IGNORECASE)
 
 
 class WebsiteInventory:
-    def __init__(self, website_url, *, sitemaps, fetch, permitted, document_limit, entry_limit, media_permitted=None):
+    def __init__(
+        self,
+        website_url,
+        *,
+        sitemaps,
+        fetch,
+        permitted,
+        document_limit,
+        entry_limit,
+        media_permitted=None,
+        historical_mode: bool = False,
+        robots_sitemaps=(),
+    ):
         if min(document_limit, entry_limit) < 1:
             raise ValueError("Fixture discovery limits must be positive")
         self.origin = self._origin(website_url)
-        self.seed = [("html", website_url), *(("xml", url) for url in sitemaps)]
+        self.historical_mode = bool(historical_mode)
+        seed_sitemaps = list(dict.fromkeys([*sitemaps, *(robots_sitemaps if self.historical_mode else ())]))
+        self.seed = [("html", website_url), *(("xml", url) for url in seed_sitemaps)]
         self.fetch = fetch
         self.permitted = permitted
         self.media_permitted = media_permitted or self._allowed
@@ -32,6 +61,39 @@ class WebsiteInventory:
         parts = urlsplit(url)
         return (parts.scheme in ("https", "http") and parts.username is None and parts.password is None
                 and self._origin(url) == self.origin and self.permitted(url))
+
+    def _same_origin_candidate(self, url):
+        if not url:
+            return False
+        parts = urlsplit(url)
+        if parts.scheme not in ("https", "http") or parts.username is not None or parts.password is not None:
+            return False
+        return self._origin(url) == self.origin
+
+    @staticmethod
+    def _is_excluded_page(url: str) -> bool:
+        parts = urlsplit(url)
+        low_path = (parts.path or "/").lower()
+        if any(bad in low_path for bad in _EXCLUDED_PATH_HINTS):
+            return True
+        suffix = PurePosixPath(low_path).suffix
+        return suffix in _NON_HTML_EXTS
+
+    @staticmethod
+    def _is_pagination_url(url: str) -> bool:
+        parts = urlsplit(url)
+        return bool(_PAGINATION_PATH_RE.search(parts.path or "") or _PAGINATION_PATH_RE.search(parts.query or ""))
+
+    @staticmethod
+    def _is_historical_content_url(url: str) -> bool:
+        parts = urlsplit(url)
+        segments = [seg for seg in (parts.path or "/").lower().split("/") if seg]
+        if any(any(hint == seg or hint in seg for hint in _HISTORICAL_PATH_HINTS) for seg in segments):
+            return True
+        # Match WordPress/static date archives such as /2025/11/ or /2026/02/
+        if len(segments) >= 2 and re.fullmatch(r"20\d{2}", segments[0]) and re.fullmatch(r"(?:0[1-9]|1[0-2])", segments[1]):
+            return True
+        return False
 
     def _sitemap(self, body, base):
         # Reject declarations (including UTF-16/NUL forms) before using the XML parser.
@@ -51,10 +113,39 @@ class WebsiteInventory:
     def _html(self, body, base, issues):
         soup = BeautifulSoup(body, "html.parser")
         next_urls = {candidate_url(str(tag["href"]), base) for tag in soup.select('[rel~="next"][href]')}
-        archives = {candidate_url(str(tag["href"]), base) for tag in soup.select("a[href]")
-                    if "/archive" in str(tag["href"]).lower()}
-        links = [("next", target) for target in sorted(next_urls - {None})]
-        links.extend(("html", target) for target in sorted(archives - next_urls - {None}))
+        if not self.historical_mode:
+            archives = {candidate_url(str(tag["href"]), base) for tag in soup.select("a[href]")
+                        if "/archive" in str(tag["href"]).lower()}
+            links = [("next", target) for target in sorted(next_urls - {None})]
+            links.extend(("html", target) for target in sorted(archives - next_urls - {None}))
+        else:
+            pag_selectors = (
+                'nav[aria-label*="pag" i] a[href]',
+                '.pagination a[href]',
+                '.pager a[href]',
+                'a.next[href]',
+                'a.page-numbers[href]',
+            )
+            pag_urls = set(next_urls)
+            for selector in pag_selectors:
+                for tag in soup.select(selector):
+                    pag_urls.add(candidate_url(str(tag["href"]), base))
+            content_urls: set[str] = set()
+            for tag in soup.select("a[href]"):
+                target = candidate_url(str(tag["href"]), base)
+                if not target or not self._same_origin_candidate(target) or self._is_excluded_page(target):
+                    continue
+                if self._is_pagination_url(target):
+                    pag_urls.add(target)
+                elif self._is_historical_content_url(target):
+                    content_urls.add(target)
+            clean_next = sorted(
+                t for t in pag_urls if t and self._same_origin_candidate(t) and not self._is_excluded_page(t)
+            )
+            clean_next_set = set(clean_next)
+            clean_content = sorted(t for t in content_urls if t not in clean_next_set)
+            links = [("next", target) for target in clean_next]
+            links.extend(("html", target) for target in clean_content)
         posters = {candidate_url(str(tag["poster"]), base) for tag in soup.select("video[poster]")}
         videos = {candidate_url(str(tag["src"]), base) for tag in soup.select("video[src], video source[src]")}
         attachments = {}
@@ -86,7 +177,7 @@ class WebsiteInventory:
         try:
             if not self._allowed(url):
                 raise SourceStop("access_blocked")
-            # Fixture transport supplies a final URL and bytes. This adapter opens no connections.
+            # Fixture or guarded HTTP transport supplies final URL and bytes.
             final_url, body = self.fetch(url)
             if not self._allowed(final_url):
                 raise SourceStop("access_blocked")

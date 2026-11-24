@@ -521,26 +521,40 @@ def grab_media(soup: BeautifulSoup, page_url: str) -> list[dict[str, Any]]:
                     {"url": url, "source_page": page_url, "alt": "", "discovery": "inline-css"}
                 )
     dates: dict[str, list[dict]] = {}
+
+    def _walk_jsonld(node: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(node, list):
+            for child in node:
+                _walk_jsonld(child, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+        node_type = node.get("@type")
+        types = node_type if isinstance(node_type, list) else [node_type]
+        if any(t in ("ImageObject", "VideoObject") for t in types):
+            content = node.get("contentUrl")
+            if isinstance(content, str):
+                url = candidate_url(content, page_url)
+                evidence = publication_evidence(
+                    node.get("datePublished"),
+                    source_url=page_url,
+                    field="datePublished",
+                    attribution="JSON-LD exact contentUrl",
+                )
+                if url and evidence:
+                    dates.setdefault(url, []).append(evidence)
+        for key in ("@graph", "image", "video", "associatedMedia", "primaryImageOfPage", "hasPart", "mainEntity"):
+            if key in node:
+                _walk_jsonld(node[key], depth + 1)
+
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.get_text())
         except (ValueError, RecursionError):
             continue
-        pending = data if isinstance(data, list) else [data]
-        for item in list(pending):
-            if isinstance(item, dict) and isinstance(item.get("@graph"), list):
-                pending.extend(item["@graph"])
-        for item in pending:
-            if not isinstance(item, dict) or item.get("@type") not in ("ImageObject", "VideoObject"):
-                continue
-            content = item.get("contentUrl")
-            if not isinstance(content, str):
-                continue
-            url = candidate_url(content, page_url)
-            evidence = publication_evidence(item.get("datePublished"), source_url=page_url,
-                                            field="datePublished", attribution="JSON-LD exact contentUrl")
-            if url and evidence:
-                dates.setdefault(url, []).append(evidence)
+        _walk_jsonld(data)
     for asset in found:
         matches = dates.get(asset["url"], [])
         if len({match["timestamp_utc"] for match in matches}) == 1:

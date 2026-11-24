@@ -1,9 +1,14 @@
 """Frozen collection windows and attributable source publication dates."""
 
 from datetime import UTC, datetime, timedelta
+import re
+from urllib.parse import urlsplit
 
 WINDOW_FIELDS = ("created_at", "window_start_utc", "window_end_utc")
 WINDOW_LENGTH = timedelta(days=365)
+GALLERY_DL_FACEBOOK_UTC_FIELD = "gallery_dl_facebook_utc_date"
+_GDL_FACEBOOK_GMTIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+_FACEBOOK_HOSTS = frozenset({"facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"})
 
 
 def aware_timestamp(value):
@@ -32,13 +37,37 @@ def window_bounds(metadata):
     return start, end
 
 
-def publication_evidence(value, *, source_url, field, attribution, unix_seconds=False):
+def publication_evidence(
+    value,
+    *,
+    source_url,
+    field,
+    attribution,
+    unix_seconds=False,
+    gallery_dl_facebook_gmtime_utc=False,
+):
     timestamp = aware_timestamp(value)
+    gmtime_fb_utc = False
     if unix_seconds and isinstance(value, (int, float, str)) and not isinstance(value, bool):
         try:
             timestamp = datetime.fromtimestamp(float(value), tz=UTC)
         except (ValueError, OverflowError, OSError):
             pass
+    if (
+        timestamp is None
+        and gallery_dl_facebook_gmtime_utc
+        and field == GALLERY_DL_FACEBOOK_UTC_FIELD
+        and isinstance(value, str)
+        and _GDL_FACEBOOK_GMTIME_RE.fullmatch(value)
+        and isinstance(source_url, str)
+        and source_url.startswith("https://")
+        and (urlsplit(source_url).hostname or "").lower() in _FACEBOOK_HOSTS
+    ):
+        try:
+            timestamp = datetime.fromisoformat(value).replace(tzinfo=UTC)
+            gmtime_fb_utc = True
+        except (ValueError, OverflowError):
+            timestamp = None
     if timestamp is None or not isinstance(source_url, str) or not source_url.startswith(("https://", "http://")):
         return None
     try:
@@ -50,7 +79,10 @@ def publication_evidence(value, *, source_url, field, attribution, unix_seconds=
         "field": field,
         "attribution": attribution,
         "original_timestamp": value,
-        "original_timezone": None if unix_seconds else timestamp.strftime("%z"),
+        "original_timezone": (
+            "UTC (gallery-dl time.gmtime)" if gmtime_fb_utc
+            else (None if unix_seconds else timestamp.strftime("%z"))
+        ),
         "timestamp_utc": normalized,
     }
 
@@ -66,6 +98,7 @@ def verified_publication(asset):
         evidence.get("original_timestamp"), source_url=evidence["source_url"],
         field=evidence["field"], attribution=evidence["attribution"],
         unix_seconds=evidence["field"] in ("taken_at_timestamp", "release_timestamp"),
+        gallery_dl_facebook_gmtime_utc=evidence["field"] == GALLERY_DL_FACEBOOK_UTC_FIELD,
     )
     if original is None or evidence["timestamp_utc"] != original["timestamp_utc"]:
         return None

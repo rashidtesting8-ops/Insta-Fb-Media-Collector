@@ -1,13 +1,18 @@
 """Offline handoff of local extractor artifacts. There is no network fallback."""
 
 import json
-from dataclasses import replace
 
-from app.collection_checkpoint import Attachment, CollectionCheckpoint, InventoryPage, SourceItem, SourceStop
+from app.collection_checkpoint import CollectionCheckpoint, InventoryPage, SourceStop
 from app.fixture_collection import _recorded_download, _website_adapter
-from app.legacy_social_collect import check_social_url
 from app.public_collection import SOURCES, limit, publish_checkpoint_manifest
-from app.publication import publication_evidence
+from app.social_normalizers import (
+    PARSERS,
+    build_source_item,
+    gallery_posts as _gallery_posts,
+    instaloader_posts as _instaloader_posts,
+    media_record as _media,
+    ytdlp_posts as _ytdlp_posts,
+)
 
 EXTRACTORS = {
     "instagram": {"gallery-dl", "instaloader"},
@@ -17,77 +22,6 @@ STOP_CODES = {
     "login_required": "restricted", "challenge": "restricted", "access_denied": "access_blocked",
     "rate_limited": "rate_limited", "cap": "listing_cap", "interrupted": "listing_interrupted",
 }
-
-
-def _media(media_id, url, kind, *dates):
-    return {"id": media_id, "url": url, "kind": kind, "dates": dates}
-
-
-def _gallery_posts(records):
-    posts = {}
-    for entry in records:
-        if not isinstance(entry, list) or len(entry) != 3 or entry[0] != 3 or not isinstance(entry[2], dict):
-            continue
-        _, url, meta = entry
-        post_url = meta.get("post_url") or meta.get("original_post_url")
-        post_id = meta.get("post_id") or meta.get("sidecar_media_id")
-        shortcode = meta.get("post_shortcode") or meta.get("sidecar_shortcode")
-        post = posts.setdefault(post_id or shortcode or post_url or url, {
-            "id": post_id or shortcode, "url": post_url, "shortcode": shortcode, "media": [],
-        })
-        ext = str(meta.get("extension", "")).lower().lstrip(".")
-        if meta.get("media_type") == "thumbnail":
-            kind = "thumbnail"
-        elif ext in ("mp4", "webm", "mov"):
-            kind = "video"
-        elif ext in ("jpg", "jpeg", "png", "webp", "gif", "avif"):
-            kind = "image"
-        else:
-            kind = "unsupported"
-        # A generic gallery-dl date can come from "seen"; it is insufficient on its own.
-        post["media"].append(_media(meta.get("media_id") or meta.get("attachment_id"), url, kind,
-                                   ("post_date", meta.get("post_date")),
-                                   ("taken_at_timestamp", meta.get("taken_at_timestamp"))))
-    return posts.values()
-
-
-def _instaloader_posts(records):
-    for raw in records:
-        node = raw.get("node", raw)
-        code = node.get("shortcode")
-        parent_time = node.get("taken_at_timestamp")
-        edges = node.get("edge_sidecar_to_children", {}).get("edges")
-        media = []
-        for child in ([edge["node"] for edge in edges] if edges is not None else [node]):
-            image_url = child.get("display_url")
-            date = ("taken_at_timestamp", child.get("taken_at_timestamp", parent_time))
-            if child.get("is_video"):
-                if child.get("video_url"):
-                    media.append(_media(child.get("id"), child["video_url"], "video", date))
-                if image_url:
-                    media.append(_media(None, image_url, "thumbnail", date))
-            elif image_url:
-                media.append(_media(child.get("id"), image_url, "image", date))
-        yield {"id": node.get("id") or code, "shortcode": code,
-               "url": f"https://www.instagram.com/p/{code}/" if code else None, "media": media}
-
-
-def _ytdlp_posts(records):
-    for document in records:
-        entries = document["entries"] if document.get("_type") == "playlist" else [document]
-        for item in entries:
-            if not item:
-                continue
-            date = ("release_timestamp", item.get("release_timestamp"))
-            media = []
-            if item.get("url"):
-                media.append(_media(item.get("id"), item["url"], "video", date))
-            if item.get("thumbnail"):
-                media.append(_media(None, item["thumbnail"], "thumbnail", date))
-            yield {"id": item.get("id"), "url": item.get("webpage_url"), "media": media}
-
-
-PARSERS = {"gallery-dl": _gallery_posts, "instaloader": _instaloader_posts, "yt-dlp": _ytdlp_posts}
 
 
 class RecordedSocialInventory:
@@ -135,54 +69,15 @@ class RecordedSocialInventory:
                              tuple(dict.fromkeys(issues)), stop)
 
     def _item(self, post, expected, issues):
-        explicit_url = post.get("url")
-        if explicit_url:
-            check_social_url(self.source, explicit_url)
-        native_id = post.get("id")
-        derived = explicit_url or next((item["url"] for item in post["media"]), None)
-        if not (native_id or derived):
-            issues.append("unidentifiable_post")
-            return None
-        identity = str(native_id) if native_id else derived
-        expectation = expected.get(identity, {})
-        if expectation and not (
-            expectation.get("provenance") == "recorded_extractor"
-            and isinstance(expectation.get("reference"), str) and expectation["reference"].strip()
-        ):
-            issues.append("unverified_child_expectation")
-            expectation = {}
-        attachments = {}
-        for child in post["media"]:
-            kind = child["kind"]
-            if kind == "unsupported":
-                issues.append("unsupported_media")
-            evidence = [
-                entry for field, raw in child["dates"]
-                if (entry := publication_evidence(
-                    raw, source_url=explicit_url, field=field,
-                    attribution=f"recorded {self.extractor} publication metadata",
-                    unix_seconds=field in ("taken_at_timestamp", "release_timestamp"),
-                ))
-            ]
-            date = evidence[0] if len({entry["timestamp_utc"] for entry in evidence}) == 1 else None
-            child_id = child["id"] if kind != "thumbnail" else None
-            fallback = ("thumbnail:" if kind == "thumbnail" else "") + child["url"]
-            item = Attachment(str(child_id) if child_id else fallback, child["url"], kind, date,
-                              "source_supplied" if child_id else "derived")
-            previous = attachments.get(item.id)
-            if previous and previous.publication_evidence != item.publication_evidence:
-                item = replace(previous, publication_evidence=None)
-                issues.append("ambiguous_publication_evidence")
-            attachments[item.id] = item
-        count = expectation.get("count")
-        if count is not None and (type(count) is not int or count < 0):
-            raise ValueError("Invalid recorded expected attachment count")
-        if count is not None and len([a for a in attachments.values() if a.kind != "thumbnail"]) < count:
-            issues.append("missing_child_count")
-        return SourceItem(identity, explicit_url or self.url, tuple(attachments.values()),
-                          tuple(map(str, expectation.get("ids", []))),
-                          identity_status="source_supplied" if native_id else "derived",
-                          expected_count=count, shortcode=post.get("shortcode"))
+        return build_source_item(
+            self.source,
+            self.url,
+            self.extractor,
+            post,
+            attribution=f"recorded {self.extractor} publication metadata",
+            expected=expected,
+            issues=issues,
+        )
 
 
 def collect_recorded_job(job_dir, job, configuration):
@@ -225,3 +120,16 @@ def collect_recorded_job(job_dir, job, configuration):
             transfer_budget=limit(config, "transfer_budget", minimum=0), byte_limit=limit(config, "byte_limit"),
         )
     return publish_checkpoint_manifest(job_dir, job, reports, mode="recorded_extractor")
+
+
+__all__ = [
+    "EXTRACTORS",
+    "PARSERS",
+    "RecordedSocialInventory",
+    "STOP_CODES",
+    "_gallery_posts",
+    "_instaloader_posts",
+    "_media",
+    "_ytdlp_posts",
+    "collect_recorded_job",
+]
