@@ -8,7 +8,9 @@ from urllib.parse import urlsplit
 
 from requests import HTTPError
 
-from app.collection_checkpoint import Attachment, CollectionCheckpoint, Download, InventoryPage, SourceItem, SourceStop
+from app.collection_checkpoint import (
+    Attachment, CollectionCheckpoint, Download, GlobalBudget, InventoryPage, SourceItem, SourceStop,
+)
 from app.legacy_collector import MEDIA_TYPES, build_collector_session, response_get, robots_allowed
 from app.legacy_social_collect import check_social_url
 from app.manifest import SCHEMA_VERSION, validate_against_disk, write_manifest
@@ -17,6 +19,7 @@ from app.website_inventory import WebsiteInventory
 
 SOURCES = ("website", "instagram", "facebook")
 COLLECTION_HOLD = "blocked_unverified_collection"
+_ROBOTS_SITEMAP_RE = re.compile(r"^\s*sitemap\s*:\s*(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
 
 
 def origin(url):
@@ -116,6 +119,28 @@ class PublicHTTP:
                 body.extend(chunk)
             return response.url, bytes(body)
 
+    def discover_robots_sitemaps(self, *, max_sitemaps: int = 8) -> list[str]:
+        """Extract same-origin Sitemap: declarations from /robots.txt within request/time budgets."""
+        scheme, host, port = self.origin
+        default_port = 443 if scheme == "https" else 80
+        netloc = host if port == default_port else f"{host}:{port}"
+        robots_url = f"{scheme}://{netloc}/robots.txt"
+        try:
+            _, raw = self.document(robots_url, 262_144)
+        except (SourceStop, HTTPError, OSError, ValueError):
+            return []
+        found: list[str] = []
+        for match in _ROBOTS_SITEMAP_RE.finditer(raw.decode("utf-8", errors="replace")):
+            candidate = match.group(1).strip()
+            try:
+                if origin(candidate) == self.origin and candidate not in found:
+                    found.append(candidate)
+            except ValueError:
+                continue
+            if len(found) >= max_sitemaps:
+                break
+        return found
+
     def download(self, url, offset, revision):
         headers = {"Accept-Encoding": "identity"}
         if offset and revision:
@@ -123,8 +148,11 @@ class PublicHTTP:
         try:
             response = self._get(url, self.media_origins, headers)
         except HTTPError as exc:
-            if offset and exc.response is not None and exc.response.status_code == 416:
+            status_code = exc.response.status_code if exc.response is not None else 0
+            if offset and status_code == 416:
                 return self.download(url, 0, None)
+            if status_code in (404, 410):
+                raise SourceStop("media_url_expired") from None
             raise
         try:
             content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -132,11 +160,14 @@ class PublicHTTP:
                 raise SourceStop("unsupported_media")
             if response.headers.get("Content-Encoding", "identity").lower() != "identity":
                 raise ValueError("Unsupported encoded response")
-            size = int(response.headers["Content-Length"])
+            raw_len = response.headers.get("Content-Length")
+            size = int(raw_len) if raw_len is not None else None
             etag = response.headers.get("ETag", "")
             strong = etag if re.fullmatch(r'"[^"\r\n]+"', etag) else None
             start = 0
             if response.status_code == 206:
+                if size is None:
+                    raise ValueError("Partial response missing Content-Length")
                 match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
                 if not match:
                     raise ValueError("Invalid Content-Range")
@@ -258,6 +289,27 @@ def collect_public_job(
     """Run the checkpoint path for an explicitly scoped job. Curation is held."""
     if configuration.get("offline_only") or configuration.get("fixture_only"):
         raise ValueError("Offline recordings cannot use the public HTTP path")
+    raw_profile = configuration.get("collection_profile")
+    if raw_profile is None:
+        profile = "historical" if configuration.get("historical_mode") is True else "pilot"
+    else:
+        profile = str(raw_profile).strip().lower()
+    if profile not in ("pilot", "historical"):
+        raise ValueError("collection_profile must be 'pilot' or 'historical'")
+    is_historical = profile == "historical"
+
+    global_budget = None
+    gb_cfg = configuration.get("global_budgets")
+    if isinstance(gb_cfg, dict) and gb_cfg:
+        global_budget = GlobalBudget(
+            max_pages=gb_cfg.get("max_pages"),
+            max_items=gb_cfg.get("max_items"),
+            max_transfers=gb_cfg.get("max_transfers"),
+            max_bytes=gb_cfg.get("max_bytes"),
+            max_time_seconds=gb_cfg.get("max_time_seconds"),
+            clock=clock,
+        )
+
     configs = configuration["sources"]
     for source in SOURCES:
         if configs[source]["url"] != job[source + "_url"]:
@@ -273,10 +325,21 @@ def collect_public_job(
             transport = PublicHTTP(url, config, session, held_origins=held_origins)
             if source == "website":
                 document_limit = limit(config, "document_limit")
+                robots_sitemaps = (
+                    transport.discover_robots_sitemaps()
+                    if is_historical and config.get("discover_robots_sitemaps", True)
+                    else []
+                )
                 inventory = WebsiteInventory(
-                    url, sitemaps=config["sitemaps"], fetch=lambda url: transport.document(url, document_limit),
-                    permitted=transport.page_permitted, media_permitted=transport.media_permitted,
-                    document_limit=document_limit, entry_limit=limit(config, "entry_limit"),
+                    url,
+                    sitemaps=config["sitemaps"],
+                    fetch=lambda target: transport.document(target, document_limit),
+                    permitted=transport.page_permitted,
+                    media_permitted=transport.media_permitted,
+                    document_limit=document_limit,
+                    entry_limit=limit(config, "entry_limit"),
+                    historical_mode=is_historical,
+                    robots_sitemaps=robots_sitemaps,
                 )
             elif config.get("snapshot") is not None or config.get("discovery_mode") != "open_source_cli":
                 inventory = PublicSocialSnapshot(source, url, config.get("snapshot"),
@@ -284,37 +347,66 @@ def collect_public_job(
             else:
                 from app.social_discovery import OpenSourceSocialInventory
 
+                cli_budget = limit(config, "cli_request_budget") if "cli_request_budget" in config else limit(config, "request_budget")
                 inventory = OpenSourceSocialInventory(
                     source,
                     url,
                     permission_confirmed=job.get("social_permission_confirmed") is True,
                     window_start_utc=job.get("window_start_utc"),
                     item_limit=limit(config, "entry_limit"),
-                    request_budget=limit(config, "cli_request_budget") if "cli_request_budget" in config else limit(config, "request_budget"),
+                    request_budget=cli_budget,
                     time_budget_seconds=limit(config, "time_budget_seconds"),
                     allow_fallbacks=bool(config.get("allow_fallbacks", True)),
                     runner=social_runner,
                     clock=clock,
+                    historical_mode=is_historical,
+                    batch_size=limit(config, "batch_size") if "batch_size" in config else None,
+                    cutoff_consecutive_older=limit(config, "cutoff_consecutive_older") if "cutoff_consecutive_older" in config else 3,
+                    include_reels=bool(config.get("include_reels", is_historical)),
+                    include_albums=bool(config.get("include_albums", is_historical)),
+                    album_limit=limit(config, "album_limit") if "album_limit" in config else 5,
+                    resume_dir=(job_dir / "collection" / "instaloader-resume") if is_historical else None,
                 )
-            scope = json.dumps({"url": url, "media_origins": sorted(transport.media_origins),
-                                "sitemaps": config.get("sitemaps", []),
-                                **({"discovery_mode": config["discovery_mode"]} if config.get("discovery_mode") else {})},
-                               sort_keys=True)
+            scope_doc = {
+                "url": url,
+                "media_origins": sorted(transport.media_origins),
+                "sitemaps": config.get("sitemaps", []),
+                **({"discovery_mode": config["discovery_mode"]} if config.get("discovery_mode") else {}),
+                **({"collection_profile": profile} if is_historical else {}),
+            }
+            scope = json.dumps(scope_doc, sort_keys=True)
             requested_transfer = limit(config, "transfer_budget", minimum=0)
             download_blocked = (
-                source != "website"
-                and config.get("discovery_mode") == "open_source_cli"
-                and requested_transfer > 0
-                and config.get("download_authorized") is not True
+                requested_transfer > 0
+                and (
+                    (source != "website" and config.get("discovery_mode") == "open_source_cli" and config.get("download_authorized") is not True)
+                    or (config.get("download_authorized") is False)
+                )
             )
             effective_transfer = 0 if download_blocked else requested_transfer
+            source_item_limit = limit(config, "max_discovered_items") if "max_discovered_items" in config else (
+                limit(config, "entry_limit") if is_historical and source != "website" and "entry_limit" in config else None
+            )
+            source_byte_budget = limit(config, "source_byte_budget") if "source_byte_budget" in config else None
+            skip_old = bool(config.get("skip_out_of_window_downloads", is_historical))
+            validate_magic = bool(config.get("validate_content_magic", is_historical))
             try:
                 if hasattr(inventory, "check_access"):
                     inventory.check_access()
-                report = state.run_source(source, scope, inventory, transport.download,
-                                          page_budget=limit(config, "page_budget"),
-                                          transfer_budget=effective_transfer,
-                                          byte_limit=limit(config, "byte_limit"))
+                report = state.run_source(
+                    source,
+                    scope,
+                    inventory,
+                    transport.download,
+                    page_budget=limit(config, "page_budget"),
+                    transfer_budget=effective_transfer,
+                    byte_limit=limit(config, "byte_limit"),
+                    item_limit=source_item_limit,
+                    source_byte_budget=source_byte_budget,
+                    global_budget=global_budget,
+                    skip_out_of_window_downloads=skip_old,
+                    validate_content_magic=validate_magic,
+                )
             except SourceStop as exc:
                 report = state.hold_source(source, scope, str(exc))
             if download_blocked:
@@ -324,7 +416,13 @@ def collect_public_job(
                 tools_by_source[source] = list(inventory.tools_executed)
         reports[source] = report
     manifest = publish_checkpoint_manifest(
-        job_dir, job, reports, mode="public_checkpoint", tools_by_source=tools_by_source,
+        job_dir,
+        job,
+        reports,
+        mode="public_checkpoint",
+        tools_by_source=tools_by_source,
+        collection_profile=profile if is_historical else None,
+        global_budget_usage=global_budget.snapshot() if global_budget is not None else None,
     )
     if (run_preprocessing or configuration.get("run_preprocessing") is True) and any(
         asset.get("extraction_status") == "downloaded" and asset.get("local_path")
@@ -341,16 +439,30 @@ def collect_public_job(
     return manifest
 
 
-def publish_checkpoint_manifest(job_dir, job, reports, *, mode, tools_by_source=None):
+def publish_checkpoint_manifest(
+    job_dir,
+    job,
+    reports,
+    *,
+    mode,
+    tools_by_source=None,
+    collection_profile=None,
+    global_budget_usage=None,
+):
     manifest = {"job_id": job["job_id"], "schema_version": SCHEMA_VERSION,
                 **{field: job[field] for field in WINDOW_FIELDS},
                 "collection_mode": mode, "collection_gate": COLLECTION_HOLD,
                 "sources": {}, "assets": []}
+    if collection_profile:
+        manifest["collection_profile"] = collection_profile
+    if global_budget_usage is not None:
+        manifest["global_budget_usage"] = global_budget_usage
     by_digest = {}
     for source, report in reports.items():
         manifest["sources"][source] = {
             key: report[key] for key in ("items", "coverage", "coverage_percentage", "cursor",
-                                        "stop_reason", "issues", "listing_exhausted")
+                                        "stop_reason", "termination_reason", "issues", "listing_exhausted")
+            if key in report
         }
         if tools_by_source and source in tools_by_source:
             manifest["sources"][source]["tools_executed"] = tools_by_source[source]

@@ -9,10 +9,13 @@ def source_rows(manifest, inventory):
     rows = []
     for name in ("website", "instagram", "facebook"):
         source = {**inventory.get(name, {}), **manifest.get("sources", {}).get(name, {})}
-        assets = [a for a in manifest["assets"] if a.get("platform") == name]
+        assets = [
+            a for a in manifest["assets"]
+            if a.get("platform") == name and a.get("type") != "frame"
+        ]
         dates = [date_eligibility(a, window_bounds(manifest)) for a in assets]
         # Export only status codes. Extractor diagnostics may include private URLs.
-        codes = [source.get(key) for key in ("status", "stop_reason", "reason")]
+        codes = [source.get(key) for key in ("status", "stop_reason", "termination_reason", "reason")]
         for issue in source.get("issues") or []:
             codes.append(issue.get("reason") if isinstance(issue, dict) else issue)
         codes = list(dict.fromkeys(c for c in codes if isinstance(c, str) and re.fullmatch(r"[a-z0-9_]{1,80}", c)))

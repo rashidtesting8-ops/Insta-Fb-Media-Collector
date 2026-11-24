@@ -17,6 +17,17 @@ from typing import Any
 from app.manifest import atomic_write_json
 
 MOCK_MARKERS = ("mock", "fixture", "test-only")
+_MIME_TO_EXT = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/avif": ".avif",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
+}
 
 
 def sanitize_folder_name(business: str, job_id: str) -> str:
@@ -39,6 +50,23 @@ def _safe_disk_path(job_dir: Path, rel: Any) -> Path | None:
     return candidate if candidate.is_relative_to(job_dir.resolve()) and candidate.is_file() else None
 
 
+def _safe_delivery_filename(asset_id: str, disk: Path, mime: Any, sha: str) -> str | None:
+    """Derive a safe Drive filename without exposing raw .media files or unsafe paths."""
+    if disk.suffix.lower() != ".media":
+        name = Path(disk.name).name
+        if not name or "/" in name or "\\" in name or name in (".", ".."):
+            return None
+        return name
+    clean_mime = str(mime or "").split(";", 1)[0].strip().lower()
+    ext = _MIME_TO_EXT.get(clean_mime)
+    if not ext:
+        return None
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", str(asset_id or "")).strip("._-")[:40]
+    if not stem:
+        return None
+    return f"{stem}-{sha[:8]}{ext}"
+
+
 def _fixture_or_mock(envelope: dict[str, Any]) -> bool:
     if envelope.get("ai_envelope", {}).get("mock") is not False:
         return True
@@ -57,6 +85,8 @@ def build_delivery_plan(
     business_name: str = "",
     *,
     allow_fixture: bool = False,
+    db_path: str | Path | None = None,
+    projects_root: str | Path | None = None,
 ) -> dict[str, Any]:
     job_dir = Path(job_dir)
     curation_path = job_dir / "curation.json"
@@ -69,8 +99,24 @@ def build_delivery_plan(
             "reason": "curation is mock/fixture/test-only; never release as a customer deliverable",
         }
     manifest = json_load(job_dir / "manifest.json")
+    use_rights_ledger = False
+    verified_rights: dict[str, dict[str, Any]] = {}
+    eligible_ids: set[str] | None = None
     if manifest.get("collection_mode") in ("public_checkpoint", "recorded_extractor"):
-        return {"status": "blocked_unverified_collection", "job_id": job_id, "assets": []}
+        if _fixture_or_mock(envelope):
+            return {
+                "status": "blocked_non_real_curation", "job_id": job_id, "assets": [],
+                "reason": "checkpoint delivery requires completed non-mock curation",
+            }
+        if db_path is None:
+            return {"status": "blocked_unverified_collection", "job_id": job_id, "assets": []}
+        from app.collection_approval import verify_checkpoint_release
+
+        root = Path(projects_root) if projects_root is not None else job_dir.parent
+        ok, reason, verified_rights, eligible_ids = verify_checkpoint_release(Path(db_path), root, job_id, manifest)
+        if not ok:
+            return {"status": "blocked_unverified_collection", "job_id": job_id, "assets": [], "reason": reason}
+        use_rights_ledger = True
     by_id = {a.get("asset_id"): a for a in manifest.get("assets", [])}
     selected = list(dict.fromkeys(envelope.get("curation", {}).get("selected_asset_ids", [])))
     rights_review = set(envelope.get("curation", {}).get("rights_review_required_ids", []))
@@ -81,6 +127,9 @@ def build_delivery_plan(
         item = by_id.get(aid)
         if item is None:
             errors.append(f"unknown asset_id: {aid}")
+            continue
+        if eligible_ids is not None and aid not in eligible_ids:
+            errors.append(f"asset outside approved subset: {aid}")
             continue
         if not aid or item.get("extraction_status") not in ("downloaded", "extracted_frame"):
             errors.append(f"asset not eligible: {aid}")
@@ -94,20 +143,39 @@ def build_delivery_plan(
         if item.get("sha256") and sha != item["sha256"]:
             errors.append(f"sha256 mismatch: {aid}")
             continue
-        if item.get("rights_status") != "verified" or aid in rights_review:
-            pending_rights.append(aid)
+        rights_meta: dict[str, Any] = {}
+        if use_rights_ledger:
+            ledger_entry = verified_rights.get(aid)
+            if ledger_entry is None or ledger_entry.get("asset_sha") != sha:
+                pending_rights.append(aid)
+                continue
+            rights_status = "verified"
+            rights_meta = {
+                "rights_evidence_ref": ledger_entry.get("evidence_ref"),
+                "rights_verified_by": ledger_entry.get("actor"),
+                "rights_verified_at": ledger_entry.get("utc"),
+            }
+        else:
+            if item.get("rights_status") != "verified" or aid in rights_review:
+                pending_rights.append(aid)
+                continue
+            rights_status = item.get("rights_status", "unverified")
+        safe_name = _safe_delivery_filename(aid, disk, item.get("mime"), sha)
+        if safe_name is None:
+            errors.append(f"unsupported delivery mime: {aid}")
             continue
         assets.append({
             "asset_id": aid,
-            "filename": disk.name,
+            "filename": safe_name,
             "local_path": str(item["local_path"]),
             "n8n_path": "/data/media/" + job_id + "/" + str(item["local_path"]),
             "sha256": sha,
             "bytes": len(data),
             "mime": item.get("mime") or "application/octet-stream",
             "source_url": item.get("source_url"),
-            "rights_status": item.get("rights_status", "unverified"),
+            "rights_status": rights_status,
             "rights_review_required": False,
+            **rights_meta,
             "upload_key": f"{aid}:{sha}",  # deterministic retry/idempotency key
         })
     # Reuse prior delivery state (retry safety): never re-upload an already uploaded key.
@@ -129,6 +197,8 @@ def build_delivery_plan(
     return {
         "status": status, "job_id": job_id,
         "folder_name": sanitize_folder_name(business_name or manifest.get("website_url", ""), job_id),
+        "visibility": "private",
+        "public_sharing": False,
         "assets": assets, "errors": errors[:30],
         "pending_uploads": pending_uploads,
         "uploaded_keys": uploaded_keys,
@@ -147,10 +217,19 @@ def finalize_delivery(
     authorization_confirmed: bool,
     drive_folder_id: str | None = None,
     drive_folder_link: str | None = None,
+    public_sharing: bool = False,
+    visibility: str = "private",
 ) -> dict[str, Any]:
     """Persist delivery.json. Rights gating: without explicit authorization,
     no upload is recorded as an approved commercial release."""
     job_dir = Path(job_dir)
+    if public_sharing is True or visibility != "private":
+        return {
+            "job_id": plan.get("job_id"),
+            "status": "blocked_unsafe_destination",
+            "uploaded": [],
+            "pending_rights_ids": plan.get("pending_rights_ids", []),
+        }
     if not authorization_confirmed or plan.get("status") == "blocked_rights_review":
         return {"job_id": plan.get("job_id"), "status": "blocked_rights_review", "uploaded": [],
                 "pending_rights_ids": plan.get("pending_rights_ids", [])}
@@ -175,6 +254,7 @@ def finalize_delivery(
             continue
         by_upload[key] = {
             "asset_id": asset["asset_id"], "upload_key": key,
+            "filename": asset.get("filename"),
             "drive_file_id": upload.get("drive_file_id"),
             "drive_link": upload.get("drive_link"),
             "status": upload.get("status", "failed"),
@@ -191,6 +271,8 @@ def finalize_delivery(
         "schema_version": "1.0-delivery", "job_id": plan.get("job_id"),
         "status": status,
         "folder_name": plan.get("folder_name"),
+        "visibility": "private",
+        "public_sharing": False,
         "drive_folder_id": plan.get("drive_folder_id") or drive_folder_id,
         "drive_folder_link": plan.get("drive_folder_link") or drive_folder_link,
         "authorization_confirmed": bool(authorization_confirmed),

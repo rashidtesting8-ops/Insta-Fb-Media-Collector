@@ -145,10 +145,32 @@ def gallery_posts(records: list[Any]) -> list[dict[str, Any]]:
 
         key = str(post_id or shortcode or post_url or url)
         caption = _sanitize_caption(meta.get("caption") or meta.get("description"))
+        pinned = bool(
+            meta.get("pinned")
+            or meta.get("timeline_pinned_user_ids")
+            or meta.get("clips_tab_pinned_user_ids")
+        )
+        next_photo_id = _valid_fb_numeric_id(meta.get("next_photo_id")) if category == "facebook" else None
         post = posts.setdefault(
             key,
-            {"id": post_id or shortcode, "url": post_url, "shortcode": shortcode, "caption": caption, "media": []},
+            {
+                "id": post_id or shortcode,
+                "url": post_url,
+                "shortcode": shortcode,
+                "caption": caption,
+                "pinned": pinned,
+                "fb_set_id": fb_set_id,
+                "fb_next_photo_id": next_photo_id,
+                "fb_next_is_video": bool(meta.get("_next_video")) if category == "facebook" else False,
+                "media": [],
+            },
         )
+        if pinned:
+            post["pinned"] = True
+        if fb_set_id and not post.get("fb_set_id"):
+            post["fb_set_id"] = fb_set_id
+        if next_photo_id and not post.get("fb_next_photo_id"):
+            post["fb_next_photo_id"] = next_photo_id
         if caption and not post.get("caption"):
             post["caption"] = caption
         # Preserve strict attributable fields across platforms; only accept gallery-dl Facebook "date"
@@ -179,8 +201,29 @@ def gallery_posts(records: list[Any]) -> list[dict[str, Any]]:
     return list(posts.values())
 
 
+def gallery_album_queues(records: list[Any]) -> list[dict[str, str]]:
+    """Extract validated Facebook album URLs emitted by gallery-dl FacebookAlbumsExtractor (Message.Queue=6)."""
+    albums: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for entry in records:
+        if not isinstance(entry, list) or len(entry) != 3 or entry[0] != 6 or not isinstance(entry[2], dict):
+            continue
+        _, url, meta = entry
+        if not isinstance(url, str) or not url or url in seen_urls:
+            continue
+        try:
+            check_social_url("facebook", url)
+        except Exception:
+            continue
+        set_id = _valid_fb_set_id(meta.get("set_id") or meta.get("id")) or ""
+        title = _sanitize_caption(meta.get("title"), max_len=120) or ""
+        seen_urls.add(url)
+        albums.append({"url": url, "set_id": set_id, "title": title})
+    return albums
+
+
 def instaloader_posts(records: list[Any]) -> list[dict[str, Any]]:
-    """Normalize Instaloader post/sidecar JSON records (including carousels & videos)."""
+    """Normalize Instaloader post/sidecar JSON records (including carousels, Reels & pinned posts)."""
     out: list[dict[str, Any]] = []
     for raw in records:
         if not isinstance(raw, dict):
@@ -192,6 +235,12 @@ def instaloader_posts(records: list[Any]) -> list[dict[str, Any]]:
         code = node.get("shortcode")
         parent_time = node.get("taken_at_timestamp")
         parent_date_utc = node.get("date_utc")
+        pinned = bool(
+            node.get("is_pinned")
+            or node.get("pinned_for_users")
+            or node.get("timeline_pinned_user_ids")
+            or node.get("clips_tab_pinned_user_ids")
+        )
         edges = (node.get("edge_sidecar_to_children") or {}).get("edges")
         children = [edge["node"] for edge in edges if isinstance(edge, dict) and isinstance(edge.get("node"), dict)] if isinstance(edges, list) else [node]
         media: list[dict[str, Any]] = []
@@ -212,8 +261,16 @@ def instaloader_posts(records: list[Any]) -> list[dict[str, Any]]:
         caption = None
         if isinstance(cap_edges, list) and cap_edges and isinstance(cap_edges[0], dict):
             caption = _sanitize_caption((cap_edges[0].get("node") or {}).get("text"))
-        post_url = f"https://www.instagram.com/p/{code}/" if isinstance(code, str) and _SHORTCODE_RE.fullmatch(code) else None
-        out.append({"id": node.get("id") or code, "shortcode": code, "url": post_url, "caption": caption, "media": media})
+        segment = "reel" if str(node.get("product_type") or "").lower() == "clips" else "p"
+        post_url = f"https://www.instagram.com/{segment}/{code}/" if isinstance(code, str) and _SHORTCODE_RE.fullmatch(code) else None
+        out.append({
+            "id": node.get("id") or code,
+            "shortcode": code,
+            "url": post_url,
+            "caption": caption,
+            "pinned": pinned,
+            "media": media,
+        })
     return out
 
 

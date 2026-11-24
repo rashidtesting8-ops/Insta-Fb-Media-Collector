@@ -30,6 +30,7 @@ from app.legacy_social_collect import _execute_subprocess, check_social_url, cla
 from app.publication import aware_timestamp
 from app.social_normalizers import (
     build_source_item,
+    gallery_album_queues,
     gallery_error_codes,
     gallery_posts,
     instaloader_posts,
@@ -75,6 +76,11 @@ _INSTALOADER_NOT_EXISTS_RE = re.compile(r"profilenotexistsexception|profile\s+\S
 _GALLERY_ERROR_TEXT_RE = re.compile(r"\[\s*(-1|4|6)\s*,")
 _ELIGIBLE_FALLBACK_REASONS = frozenset({"gallery_dl_error_6", "extractor_broken", "tool_unavailable", "user_lookup_not_found"})
 _HARD_STOP_REASONS = frozenset({"rate_limited", "restricted", "access_blocked", "request_budget", "time_budget", "profile_not_found"})
+_SAFE_CURSOR_RE = re.compile(r"^[A-Za-z0-9_.:=/+-]{4,512}$")
+_GDL_CURSOR_RE = re.compile(
+    r"(?:Use\s+'-o\s+cursor=([^'\s]+)'|^\s*\[[^\]]+\]\s*Cursor:\s*(\S+)|\bCursor:\s*([A-Za-z0-9_.:=/+-]{4,512}))",
+    re.MULTILINE,
+)
 
 
 @dataclass
@@ -97,8 +103,8 @@ class DiscoveryBudget:
     def remaining_seconds(self) -> float:
         return self.time_budget_seconds - (self.clock() - self.started_at)
 
-    def reserve_tool(self, tool: str) -> int:
-        if tool in self.tried_tools:
+    def reserve_tool(self, tool: str, *, allow_repeat: bool = False) -> int:
+        if not allow_repeat and tool in self.tried_tools:
             raise SourceStop("source_stopped")
         remaining = self.remaining_seconds()
         if remaining <= 0:
@@ -347,6 +353,159 @@ def build_ytdlp_discovery_cmd(
     ]
 
 
+def _cutoff_timestamp(window_start_utc: str | None) -> datetime:
+    frozen = aware_timestamp(window_start_utc)
+    if frozen is not None:
+        return frozen.astimezone(UTC)
+    return datetime.now(UTC) - timedelta(days=365)
+
+
+def extract_gallery_dl_cursor(output: str, records: list[Any]) -> str | None:
+    """Extract a real continuation cursor emitted by gallery-dl; never synthesizes one."""
+    for match in _GDL_CURSOR_RE.finditer(output or ""):
+        token = next((g for g in match.groups() if g), None)
+        if token and _SAFE_CURSOR_RE.fullmatch(token):
+            return token
+    for entry in reversed(records or ()):
+        meta = None
+        if isinstance(entry, list) and len(entry) >= 2 and isinstance(entry[-1], dict):
+            meta = entry[-1]
+        elif isinstance(entry, dict):
+            meta = entry
+        if isinstance(meta, dict):
+            for key in ("_cursor", "next_cursor", "cursor"):
+                val = meta.get(key)
+                if isinstance(val, str) and _SAFE_CURSOR_RE.fullmatch(val):
+                    return val
+    return None
+
+
+def build_gallery_dl_historical_cmd(
+    *,
+    platform: str,
+    url: str,
+    batch_limit: int,
+    http_timeout: int = 20,
+    sleep_request: float = 1.0,
+    cursor: str | None = None,
+    include: str | None = None,
+    resolve: bool = True,
+    disable_loop: bool = False,
+    executable: str = "gallery-dl",
+) -> list[str]:
+    """Bounded historical gallery-dl command WITHOUT --date-after (avoids pinned/unordered abort)."""
+    cmd = [
+        executable,
+        "--config-ignore",
+        "--no-input",
+        "--no-colors",
+        "--no-postprocessors",
+        "--resolve-json" if resolve else "--dump-json",
+        "--range" if resolve else "--child-range",
+        f"1-{batch_limit}",
+        "--http-timeout",
+        str(http_timeout),
+        "--retries",
+        "0",
+        "--sleep-request",
+        str(sleep_request),
+        "--whitelist",
+        platform,
+    ]
+    if disable_loop:
+        cmd.extend(["-o", "loop=false"])
+    if include:
+        cmd.extend(["-o", f"include={include}"])
+    if cursor:
+        if not _SAFE_CURSOR_RE.fullmatch(cursor):
+            raise SourceStop("invalid_continuation")
+        cmd.extend(["-o", f"cursor={cursor}"])
+    cmd.append(url)
+    return cmd
+
+
+def build_instaloader_historical_cmd(
+    *,
+    url_kind: str,
+    target_hint: str,
+    stage: Path,
+    cutoff: date,
+    http_timeout: int = 20,
+    include_reels: bool = False,
+    reels_only: bool = False,
+    use_resume: bool = False,
+    executable: str = "instaloader",
+) -> list[str]:
+    """Bounded metadata-only Instaloader command with optional --reels and native resume prefix."""
+    cmd = [
+        executable,
+        "--quiet",
+        "--resume-prefix" if use_resume else "--no-resume",
+    ]
+    if use_resume:
+        cmd.append("pgm_resume")
+    cmd.extend([
+        "--no-pictures",
+        "--no-videos",
+        "--no-video-thumbnails",
+        "--no-captions",
+        "--no-compress-json",
+        "--no-profile-pic",
+        "--max-connection-attempts",
+        "1",
+        "--request-timeout",
+        str(http_timeout),
+        "--dirname-pattern",
+        str(stage),
+        "--abort-on=429,403,401",
+    ])
+    if url_kind == "single_post":
+        cmd.extend(["--", f"-{target_hint}"])
+    else:
+        if reels_only:
+            cmd.extend(["--no-posts", "--reels"])
+        elif include_reels:
+            cmd.append("--reels")
+        cmd.extend([
+            "--post-filter",
+            f"date_utc>=datetime({cutoff.year},{cutoff.month},{cutoff.day})",
+            "--",
+            target_hint,
+        ])
+    return cmd
+
+
+def _evaluate_batch_cutoff(
+    paired: list[tuple[dict[str, Any], SourceItem]],
+    cutoff_utc: datetime,
+    consecutive_older: int,
+    threshold: int,
+) -> tuple[int, bool]:
+    """Advance consecutive-older count only for non-pinned posts with verified timestamps.
+
+    Any later in-window post resets consecutive_older to 0 and clears cutoff evaluation,
+    so out-of-order listings cannot prematurely stop traversal.
+    """
+    for post, item in paired:
+        if post.get("pinned"):
+            continue
+        verified_ts = [
+            ts
+            for att in item.attachments
+            if att.kind != "thumbnail"
+            and isinstance(att.publication_evidence, dict)
+            and (ts := aware_timestamp(att.publication_evidence.get("timestamp_utc"))) is not None
+        ]
+        if not verified_ts:
+            continue
+        newest = max(verified_ts)
+        if newest >= cutoff_utc:
+            consecutive_older = 0
+        else:
+            consecutive_older += 1
+    return consecutive_older, consecutive_older >= threshold
+
+
 class OpenSourceSocialInventory:
     """Discovery-only Inventory adapter for public Instagram/Facebook URLs."""
 
@@ -365,15 +524,36 @@ class OpenSourceSocialInventory:
         clock: ClockFn = time.monotonic,
         http_timeout: int = 20,
         sleep_request: float = 1.0,
+        historical_mode: bool = False,
+        batch_size: int | None = None,
+        cutoff_consecutive_older: int = 3,
+        include_reels: bool = False,
+        include_albums: bool = False,
+        album_limit: int = 5,
+        resume_dir: Path | None = None,
     ) -> None:
         self.platform = platform
         self.profile_url = profile_url
         self.permission_confirmed = bool(permission_confirmed)
         self.cutoff = _cutoff_date(window_start_utc)
+        self.cutoff_utc = _cutoff_timestamp(window_start_utc)
         self.allow_fallbacks = bool(allow_fallbacks)
         self.runner = runner
         self.http_timeout = http_timeout
         self.sleep_request = sleep_request
+        self.historical_mode = bool(historical_mode)
+        self.batch_size = min(item_limit, batch_size) if batch_size is not None else min(item_limit, 20)
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        if type(cutoff_consecutive_older) is not int or cutoff_consecutive_older < 1:
+            raise ValueError("cutoff_consecutive_older must be a positive integer")
+        if type(album_limit) is not int or album_limit < 1:
+            raise ValueError("album_limit must be a positive integer")
+        self.cutoff_consecutive_older = cutoff_consecutive_older
+        self.include_reels = bool(include_reels)
+        self.include_albums = bool(include_albums)
+        self.album_limit = album_limit
+        self.resume_dir = resume_dir
         self.budget = DiscoveryBudget(
             request_budget=request_budget,
             item_limit=item_limit,
@@ -393,15 +573,25 @@ class OpenSourceSocialInventory:
             self._url_kind, self._target_hint = classify_social_url(self.platform, self.profile_url)
         return self._url_kind, self._target_hint
 
-    def _run_tool(self, tool: str, cmd: list[str], stage: Path) -> tuple[int, str]:
-        timeout = min(self.http_timeout * 2, self.budget.reserve_tool(tool))
+    def _run_tool(self, tool: str, cmd: list[str], stage: Path, *, allow_repeat: bool = False) -> tuple[int, str]:
+        timeout = min(self.http_timeout * 2, self.budget.reserve_tool(tool, allow_repeat=allow_repeat))
         if self.runner is None and shutil.which(cmd[0]) is None:
             return 127, "tool_unavailable"
         return _execute_subprocess(cmd, stage, timeout=timeout, runner=self.runner)
 
-    def _normalize_posts(self, extractor: str, posts: list[dict[str, Any]], issues: list[str]) -> list[SourceItem]:
+    def _normalize_posts(
+        self,
+        extractor: str,
+        posts: list[dict[str, Any]],
+        issues: list[str],
+        *,
+        max_attachments: int | None = None,
+        visited_ids: set[str] | None = None,
+    ) -> tuple[list[SourceItem], list[tuple[dict[str, Any], SourceItem]], int]:
         items: list[SourceItem] = []
+        paired: list[tuple[dict[str, Any], SourceItem]] = []
         total_attachments = 0
+        cap = max_attachments if max_attachments is not None else self.budget.item_limit
         for post in posts:
             item = build_source_item(
                 self.platform,
@@ -413,7 +603,9 @@ class OpenSourceSocialInventory:
             )
             if item is None:
                 continue
-            remaining = self.budget.item_limit - total_attachments
+            if visited_ids is not None and item.id in visited_ids:
+                continue
+            remaining = cap - total_attachments
             if remaining <= 0:
                 issues.append("listing_cap")
                 break
@@ -430,14 +622,21 @@ class OpenSourceSocialInventory:
                 item = SourceItem(
                     item.id, item.url, tuple(kept), item.expected_ids,
                     item.status, item.identity_status, item.expected_count, item.shortcode,
+                    item.caption,
                 )
                 issues.append("listing_cap")
                 total_attachments += kept_dl
                 items.append(item)
+                paired.append((post, item))
+                if visited_ids is not None:
+                    visited_ids.add(item.id)
                 break
             total_attachments += len(downloadable)
             items.append(item)
-        return items
+            paired.append((post, item))
+            if visited_ids is not None:
+                visited_ids.add(item.id)
+        return items, paired, total_attachments
 
     def _discover_gallery_dl(self, stage: Path, issues: list[str]) -> tuple[list[SourceItem], str | None]:
         cmd = build_gallery_dl_discovery_cmd(
@@ -454,7 +653,7 @@ class OpenSourceSocialInventory:
             return [], "tool_unavailable"
         records = parse_gallery_json(output)
         error_codes = gallery_error_codes(records)
-        items = self._normalize_posts("gallery-dl", gallery_posts(records), issues)
+        items, _, _ = self._normalize_posts("gallery-dl", gallery_posts(records), issues)
         diag = _extract_diagnostic_text("gallery-dl", output, records)
         reason = classify_cli_outcome("gallery-dl", code, output, error_codes, diagnostic_text=diag)
         if "6" in error_codes:
@@ -473,20 +672,43 @@ class OpenSourceSocialInventory:
         return items, reason
 
     def _discover_instaloader(
-        self, url_kind: str, target_hint: str, stage: Path, issues: list[str],
-    ) -> tuple[list[SourceItem], str | None]:
-        cmd = build_instaloader_discovery_cmd(
-            url_kind=url_kind,
-            target_hint=target_hint,
-            stage=stage,
-            cutoff=self.cutoff,
-            item_limit=self.budget.item_limit,
-            http_timeout=self.http_timeout,
-        )
-        code, output = self._run_tool("instaloader", cmd, stage)
+        self,
+        url_kind: str,
+        target_hint: str,
+        stage: Path,
+        issues: list[str],
+        *,
+        historical: bool = False,
+        include_reels: bool = False,
+        reels_only: bool = False,
+        use_resume: bool = False,
+        max_attachments: int | None = None,
+        visited_ids: set[str] | None = None,
+    ) -> tuple[list[SourceItem], list[tuple[dict[str, Any], SourceItem]], int, str | None]:
+        if historical:
+            cmd = build_instaloader_historical_cmd(
+                url_kind=url_kind,
+                target_hint=target_hint,
+                stage=stage,
+                cutoff=self.cutoff,
+                http_timeout=self.http_timeout,
+                include_reels=include_reels,
+                reels_only=reels_only,
+                use_resume=use_resume,
+            )
+        else:
+            cmd = build_instaloader_discovery_cmd(
+                url_kind=url_kind,
+                target_hint=target_hint,
+                stage=stage,
+                cutoff=self.cutoff,
+                item_limit=self.budget.item_limit,
+                http_timeout=self.http_timeout,
+            )
+        code, output = self._run_tool("instaloader", cmd, stage, allow_repeat=historical)
         if code == 127 and output == "tool_unavailable":
             self.tools_executed.append({"tool": "instaloader", "outcome": "tool_unavailable"})
-            return [], "tool_unavailable"
+            return [], [], 0, "tool_unavailable"
         sidecars: list[dict[str, Any]] = []
         for path in sorted(stage.glob("*.json")):
             try:
@@ -495,21 +717,35 @@ class OpenSourceSocialInventory:
                     sidecars.append(loaded)
             except (OSError, json.JSONDecodeError):
                 continue
-        items = self._normalize_posts("instaloader", instaloader_posts(sidecars), issues)
+        if use_resume and list(stage.glob("pgm_resume*.json*")):
+            issues.append("instaloader_resume_state_saved")
+        raw_posts = instaloader_posts(sidecars)
+        items, paired, count = self._normalize_posts(
+            "instaloader", raw_posts, issues, max_attachments=max_attachments, visited_ids=visited_ids,
+        )
         reason = classify_cli_outcome("instaloader", code, output)
         self.tools_executed.append({
             "tool": "instaloader",
             "outcome": reason or f"discovered_{len(items)}",
             "items": len(items),
         })
-        return items, reason
+        return items, paired, count, reason
 
-    def _discover_ytdlp(self, stage: Path, issues: list[str]) -> tuple[list[SourceItem], str | None]:
-        cmd = build_ytdlp_discovery_cmd(url=self.profile_url, http_timeout=self.http_timeout)
-        code, output = self._run_tool("yt-dlp", cmd, stage)
+    def _discover_ytdlp(
+        self,
+        stage: Path,
+        issues: list[str],
+        *,
+        target_url: str | None = None,
+        allow_repeat: bool = False,
+        max_attachments: int | None = None,
+        visited_ids: set[str] | None = None,
+    ) -> tuple[list[SourceItem], list[tuple[dict[str, Any], SourceItem]], int, str | None]:
+        cmd = build_ytdlp_discovery_cmd(url=target_url or self.profile_url, http_timeout=self.http_timeout)
+        code, output = self._run_tool("yt-dlp", cmd, stage, allow_repeat=allow_repeat)
         if code == 127 and output == "tool_unavailable":
             self.tools_executed.append({"tool": "yt-dlp", "outcome": "tool_unavailable"})
-            return [], "tool_unavailable"
+            return [], [], 0, "tool_unavailable"
         docs: list[dict[str, Any]] = []
         for line in (output or "").splitlines():
             raw = line.strip()
@@ -528,7 +764,9 @@ class OpenSourceSocialInventory:
                     docs.append(loaded)
             except json.JSONDecodeError:
                 pass
-        items = self._normalize_posts("yt-dlp", ytdlp_posts(docs), issues)
+        items, paired, count = self._normalize_posts(
+            "yt-dlp", ytdlp_posts(docs), issues, max_attachments=max_attachments, visited_ids=visited_ids,
+        )
         diag = _extract_diagnostic_text("yt-dlp", output)
         reason = classify_cli_outcome("yt-dlp", code, output, diagnostic_text=diag)
         self.tools_executed.append({
@@ -536,7 +774,7 @@ class OpenSourceSocialInventory:
             "outcome": reason or f"discovered_{len(items)}",
             "items": len(items),
         })
-        return items, reason
+        return items, paired, count, reason
 
     def _map_stop(self, reason: str | None) -> str | None:
         if reason is None:
@@ -547,16 +785,406 @@ class OpenSourceSocialInventory:
             return "access_blocked"
         if reason == "user_lookup_not_found":
             return "source_stopped"
-        if reason in ("rate_limited", "restricted", "access_blocked", "request_budget", "time_budget", "listing_cap"):
+        if reason == "extractor_broken" and self.historical_mode:
+            return "extractor_failure"
+        if reason in (
+            "rate_limited", "restricted", "access_blocked", "request_budget", "time_budget",
+            "listing_cap", "cutoff_reached", "unsupported_pagination", "extractor_failure",
+        ):
             return reason
         return "source_stopped"
 
+    def _load_historical_state(self, cursor: str | None, url_kind: str, target_hint: str | None) -> dict[str, Any]:
+        if cursor is not None:
+            try:
+                loaded = json.loads(cursor)
+            except json.JSONDecodeError as exc:
+                raise SourceStop("invalid_continuation") from exc
+            if not isinstance(loaded, dict) or loaded.get("v") != 1 or loaded.get("platform") != self.platform:
+                raise SourceStop("invalid_continuation")
+            return loaded
+        if self.platform == "facebook":
+            can_albums = self.include_albums and url_kind in ("people_profile", "profile_id", "page") and bool(target_hint)
+            return {
+                "v": 1,
+                "platform": "facebook",
+                "phase": "photos",
+                "next_url": self.profile_url,
+                "visited_ids": [],
+                "visited_sets": [],
+                "pending_albums": [],
+                "albums_checked": not can_albums,
+                "consecutive_older": 0,
+                "total_discovered": 0,
+                "timeline_cutoff": False,
+                "unsupported_continuation": False,
+            }
+        if url_kind == "profile" and target_hint:
+            base = f"https://www.instagram.com/{target_hint}"
+            queue = [{"section": "posts", "url": f"{base}/posts/", "cursor": None}]
+            if self.include_reels:
+                queue.append({"section": "reels", "url": f"{base}/reels/", "cursor": None})
+        else:
+            queue = [{"section": "single", "url": self.profile_url, "cursor": None}]
+        return {
+            "v": 1,
+            "platform": "instagram",
+            "queue": queue,
+            "visited_ids": [],
+            "seen_cursors": [],
+            "consecutive_older": 0,
+            "total_discovered": 0,
+            "cutoff_sections": [],
+            "unsupported_sections": [],
+        }
+
+    def _run_gallery_historical(
+        self,
+        *,
+        url: str,
+        batch_limit: int,
+        stage: Path,
+        issues: list[str],
+        cursor: str | None = None,
+        resolve: bool = True,
+        disable_loop: bool = False,
+        visited_ids: set[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[SourceItem], list[tuple[dict[str, Any], SourceItem]], int, list[Any], str | None, str | None]:
+        cmd = build_gallery_dl_historical_cmd(
+            platform=self.platform,
+            url=url,
+            batch_limit=batch_limit,
+            http_timeout=self.http_timeout,
+            sleep_request=self.sleep_request,
+            cursor=cursor,
+            resolve=resolve,
+            disable_loop=disable_loop,
+        )
+        code, output = self._run_tool("gallery-dl", cmd, stage, allow_repeat=True)
+        if code == 127 and output == "tool_unavailable":
+            self.tools_executed.append({"tool": "gallery-dl", "outcome": "tool_unavailable", "url": url})
+            return [], [], [], 0, [], None, "tool_unavailable"
+        records = parse_gallery_json(output)
+        error_codes = gallery_error_codes(records)
+        raw_posts = gallery_posts(records) if resolve else []
+        items, paired, dl_count = (
+            self._normalize_posts("gallery-dl", raw_posts, issues, max_attachments=batch_limit, visited_ids=visited_ids)
+            if resolve
+            else ([], [], 0)
+        )
+        real_cursor = extract_gallery_dl_cursor(output, records)
+        diag = _extract_diagnostic_text("gallery-dl", output, records)
+        reason = classify_cli_outcome("gallery-dl", code, output, error_codes, diagnostic_text=diag)
+        if "6" in error_codes and resolve:
+            issues.append("gallery_dl_error_6")
+        if "4" in error_codes:
+            issues.append("gallery_dl_error_4")
+        if "-1" in error_codes:
+            issues.append("gallery_dl_error_envelope")
+        if reason == "user_lookup_not_found":
+            issues.append("gallery_dl_user_lookup_unverified")
+        self.tools_executed.append({
+            "tool": "gallery-dl",
+            "outcome": reason or f"discovered_{len(items)}",
+            "items": len(items),
+            "url": url,
+        })
+        return raw_posts, items, paired, dl_count, records, real_cursor, reason
+
+    def _page_facebook_historical(self, cursor: str | None, url_kind: str, target_hint: str | None) -> InventoryPage:
+        state = self._load_historical_state(cursor, url_kind, target_hint)
+        issues: list[str] = ["bounded_historical_discovery", "independent_inventory_unavailable"]
+        visited_ids: set[str] = set(state.get("visited_ids") or ())
+        visited_sets: set[str] = set(state.get("visited_sets") or ())
+        phase = state["phase"]
+
+        with tempfile.TemporaryDirectory(prefix="pgm-fb-hist-") as tmp:
+            stage = Path(tmp)
+            if phase == "albums":
+                albums_url = f"https://www.facebook.com/{target_hint}/photos_albums"
+                _, _, _, _, records, _, reason = self._run_gallery_historical(
+                    url=albums_url,
+                    batch_limit=self.album_limit,
+                    stage=stage,
+                    issues=issues,
+                    resolve=False,
+                    disable_loop=True,
+                )
+                if reason in _HARD_STOP_REASONS:
+                    raise SourceStop(self._map_stop(reason) or "access_blocked")
+                albums = [
+                    a for a in gallery_album_queues(records)
+                    if not a["set_id"] or a["set_id"] not in visited_sets
+                ][: self.album_limit]
+                state["albums_checked"] = True
+                if albums:
+                    first_album = albums.pop(0)
+                    state["phase"] = "album_set"
+                    state["next_url"] = first_album["url"]
+                    state["pending_albums"] = albums
+                    state["consecutive_older"] = 0
+                    return InventoryPage((), json.dumps(state, sort_keys=True), tuple(dict.fromkeys(issues)))
+                if state.get("timeline_cutoff"):
+                    return InventoryPage((), None, tuple(dict.fromkeys(issues)), "cutoff_reached")
+                if state.get("unsupported_continuation"):
+                    return InventoryPage((), None, tuple(dict.fromkeys([*issues, "unsupported_pagination"])), "unsupported_pagination")
+                if state["total_discovered"] == 0:
+                    raise SourceStop(self._map_stop(reason) or "public_inventory_unavailable")
+                return InventoryPage((), None, tuple(dict.fromkeys(issues)))
+
+            rem_total = self.budget.item_limit - int(state["total_discovered"])
+            if rem_total <= 0:
+                return InventoryPage((), None, tuple(dict.fromkeys([*issues, "listing_cap"])), "listing_cap")
+            batch_limit = min(self.batch_size, rem_total)
+            raw_posts, items, paired, dl_count, _, _, primary_reason = self._run_gallery_historical(
+                url=state["next_url"],
+                batch_limit=batch_limit,
+                stage=stage,
+                issues=issues,
+                resolve=True,
+                disable_loop=True,
+                visited_ids=visited_ids,
+            )
+
+            # Single public Facebook video URL yt-dlp fallback on eligible primary failure.
+            if (
+                not items
+                and url_kind == "single_post"
+                and self.allow_fallbacks
+                and primary_reason in _ELIGIBLE_FALLBACK_REASONS
+            ):
+                yt_stage = stage / "yt-dlp"
+                yt_stage.mkdir(parents=True, exist_ok=True)
+                try:
+                    items, paired, dl_count, primary_reason = self._discover_ytdlp(
+                        yt_stage,
+                        issues,
+                        target_url=state["next_url"],
+                        allow_repeat=True,
+                        max_attachments=batch_limit,
+                        visited_ids=visited_ids,
+                    )
+                except SourceStop as exc:
+                    primary_reason = str(exc)
+
+            if not items and primary_reason in _HARD_STOP_REASONS:
+                raise SourceStop(self._map_stop(primary_reason) or "access_blocked")
+            if not items and primary_reason == "gallery_dl_error_6" and url_kind != "single_post":
+                raise SourceStop("restricted")
+
+            consecutive_older, set_cutoff = _evaluate_batch_cutoff(
+                paired, self.cutoff_utc, int(state["consecutive_older"]), self.cutoff_consecutive_older,
+            )
+            state["total_discovered"] = int(state["total_discovered"]) + dl_count
+            for post in raw_posts:
+                if post.get("fb_set_id"):
+                    visited_sets.add(str(post["fb_set_id"]))
+            state["visited_ids"] = sorted(visited_ids)
+            state["visited_sets"] = sorted(visited_sets)
+
+            # Real Facebook continuation only via gallery-dl next_photo_id + set_id (&setextract).
+            next_set_url = None
+            if raw_posts:
+                last_post = raw_posts[-1]
+                next_pid = last_post.get("fb_next_photo_id")
+                set_id = last_post.get("fb_set_id")
+                if next_pid and set_id and next_pid not in visited_ids:
+                    next_set_url = f"https://www.facebook.com/photo/?fbid={next_pid}&set={set_id}&setextract"
+
+            if primary_reason in _HARD_STOP_REASONS and items:
+                return InventoryPage(tuple(items), None, tuple(dict.fromkeys(issues)), self._map_stop(primary_reason))
+
+            if state["total_discovered"] >= self.budget.item_limit:
+                issues.append("listing_cap")
+                if next_set_url and not set_cutoff:
+                    state["next_url"] = next_set_url
+                    state["consecutive_older"] = consecutive_older
+                    return InventoryPage(tuple(items), json.dumps(state, sort_keys=True), tuple(dict.fromkeys(issues)), "listing_cap")
+                pending_albums_cap = list(state.get("pending_albums") or ())
+                if pending_albums_cap:
+                    next_album = pending_albums_cap.pop(0)
+                    state["phase"] = "album_set"
+                    state["next_url"] = next_album["url"]
+                    state["pending_albums"] = pending_albums_cap
+                    state["consecutive_older"] = 0
+                    return InventoryPage(tuple(items), json.dumps(state, sort_keys=True), tuple(dict.fromkeys(issues)), "listing_cap")
+                if not state.get("albums_checked"):
+                    state["phase"] = "albums"
+                    state["consecutive_older"] = 0
+                    return InventoryPage(tuple(items), json.dumps(state, sort_keys=True), tuple(dict.fromkeys(issues)), "listing_cap")
+                return InventoryPage(tuple(items), None, tuple(dict.fromkeys(issues)), "listing_cap")
+
+            if not set_cutoff and next_set_url:
+                state["next_url"] = next_set_url
+                state["consecutive_older"] = consecutive_older
+                return InventoryPage(tuple(items), json.dumps(state, sort_keys=True), tuple(dict.fromkeys(issues)))
+
+            if phase == "photos" and set_cutoff:
+                state["timeline_cutoff"] = True
+            if not set_cutoff and not next_set_url and dl_count >= batch_limit:
+                state["unsupported_continuation"] = True
+
+            # Move to pending albums or album discovery if configured.
+            pending_albums = list(state.get("pending_albums") or ())
+            if pending_albums:
+                next_album = pending_albums.pop(0)
+                state["phase"] = "album_set"
+                state["next_url"] = next_album["url"]
+                state["pending_albums"] = pending_albums
+                state["consecutive_older"] = 0
+                return InventoryPage(tuple(items), json.dumps(state, sort_keys=True), tuple(dict.fromkeys(issues)))
+            if not state.get("albums_checked"):
+                state["phase"] = "albums"
+                state["consecutive_older"] = 0
+                return InventoryPage(tuple(items), json.dumps(state, sort_keys=True), tuple(dict.fromkeys(issues)))
+
+            if state.get("unsupported_continuation"):
+                return InventoryPage(
+                    tuple(items), None, tuple(dict.fromkeys([*issues, "unsupported_pagination"])), "unsupported_pagination",
+                )
+            if state.get("timeline_cutoff") or (phase == "photos" and set_cutoff):
+                return InventoryPage(tuple(items), None, tuple(dict.fromkeys(issues)), "cutoff_reached")
+            if not items and primary_reason:
+                raise SourceStop(self._map_stop(primary_reason) or "source_stopped")
+            if state["total_discovered"] == 0:
+                raise SourceStop("public_inventory_unavailable")
+            return InventoryPage(tuple(items), None, tuple(dict.fromkeys(issues)), self._map_stop(primary_reason))
+
+    def _page_instagram_historical(self, cursor: str | None, url_kind: str, target_hint: str | None) -> InventoryPage:
+        state = self._load_historical_state(cursor, url_kind, target_hint)
+        issues: list[str] = ["bounded_historical_discovery", "independent_inventory_unavailable"]
+        visited_ids: set[str] = set(state.get("visited_ids") or ())
+        seen_cursors: set[str] = set(state.get("seen_cursors") or ())
+        queue = list(state.get("queue") or ())
+        if not queue:
+            return InventoryPage((), None, tuple(dict.fromkeys(issues)))
+
+        rem_total = self.budget.item_limit - int(state["total_discovered"])
+        if rem_total <= 0:
+            return InventoryPage((), None, tuple(dict.fromkeys([*issues, "listing_cap"])), "listing_cap")
+        batch_limit = min(self.batch_size, rem_total)
+        task = dict(queue[0])
+
+        with tempfile.TemporaryDirectory(prefix="pgm-ig-hist-") as tmp:
+            stage = Path(tmp)
+            _, items, paired, dl_count, _, real_cursor, primary_reason = self._run_gallery_historical(
+                url=task["url"],
+                batch_limit=batch_limit,
+                stage=stage,
+                issues=issues,
+                cursor=task.get("cursor"),
+                resolve=True,
+                disable_loop=False,
+                visited_ids=visited_ids,
+            )
+
+            final_reason = primary_reason
+            if not items and primary_reason in _HARD_STOP_REASONS:
+                raise SourceStop(self._map_stop(primary_reason) or "access_blocked")
+
+            if not items and self.allow_fallbacks and primary_reason in _ELIGIBLE_FALLBACK_REASONS:
+                if target_hint:
+                    il_stage = (self.resume_dir / task["section"]) if self.resume_dir is not None else (stage / "instaloader")
+                    il_stage.mkdir(parents=True, exist_ok=True)
+                    try:
+                        items, paired, dl_count, final_reason = self._discover_instaloader(
+                            url_kind,
+                            target_hint,
+                            il_stage,
+                            issues,
+                            historical=True,
+                            include_reels=False,
+                            reels_only=task["section"] == "reels",
+                            use_resume=self.resume_dir is not None,
+                            max_attachments=batch_limit,
+                            visited_ids=visited_ids,
+                        )
+                    except SourceStop as exc:
+                        final_reason = str(exc)
+                if not items and url_kind == "single_post" and final_reason in _ELIGIBLE_FALLBACK_REASONS:
+                    yt_stage = stage / "yt-dlp"
+                    yt_stage.mkdir(parents=True, exist_ok=True)
+                    try:
+                        items, paired, dl_count, final_reason = self._discover_ytdlp(
+                            yt_stage,
+                            issues,
+                            target_url=task["url"],
+                            allow_repeat=True,
+                            max_attachments=batch_limit,
+                            visited_ids=visited_ids,
+                        )
+                    except SourceStop as exc:
+                        final_reason = str(exc)
+
+            if not items and final_reason in _HARD_STOP_REASONS:
+                raise SourceStop(self._map_stop(final_reason) or "access_blocked")
+
+            consecutive_older, section_cutoff = _evaluate_batch_cutoff(
+                paired, self.cutoff_utc, int(state["consecutive_older"]), self.cutoff_consecutive_older,
+            )
+            state["total_discovered"] = int(state["total_discovered"]) + dl_count
+            state["visited_ids"] = sorted(visited_ids)
+
+            if final_reason in _HARD_STOP_REASONS and items:
+                return InventoryPage(tuple(items), None, tuple(dict.fromkeys(issues)), self._map_stop(final_reason))
+
+            valid_next_cursor = real_cursor if real_cursor and real_cursor not in seen_cursors else None
+            if state["total_discovered"] >= self.budget.item_limit:
+                issues.append("listing_cap")
+                if valid_next_cursor and not section_cutoff:
+                    task["cursor"] = valid_next_cursor
+                    queue[0] = task
+                    seen_cursors.add(valid_next_cursor)
+                    state["queue"] = queue
+                    state["seen_cursors"] = sorted(seen_cursors)
+                    state["consecutive_older"] = consecutive_older
+                    return InventoryPage(tuple(items), json.dumps(state, sort_keys=True), tuple(dict.fromkeys(issues)), "listing_cap")
+                return InventoryPage(tuple(items), None, tuple(dict.fromkeys(issues)), "listing_cap")
+
+            if not section_cutoff and valid_next_cursor:
+                task["cursor"] = valid_next_cursor
+                queue[0] = task
+                seen_cursors.add(valid_next_cursor)
+                state["queue"] = queue
+                state["seen_cursors"] = sorted(seen_cursors)
+                state["consecutive_older"] = consecutive_older
+                return InventoryPage(tuple(items), json.dumps(state, sort_keys=True), tuple(dict.fromkeys(issues)))
+
+            # Section complete (cutoff reached, exhausted, or capped without real cursor).
+            queue.pop(0)
+            state["queue"] = queue
+            state["consecutive_older"] = 0
+            if section_cutoff:
+                state["cutoff_sections"] = list(dict.fromkeys([*state.get("cutoff_sections", []), task["section"]]))
+            elif dl_count >= batch_limit and not valid_next_cursor:
+                state["unsupported_sections"] = list(dict.fromkeys([*state.get("unsupported_sections", []), task["section"]]))
+
+            if queue:
+                return InventoryPage(tuple(items), json.dumps(state, sort_keys=True), tuple(dict.fromkeys(issues)))
+
+            if state.get("cutoff_sections") and not state.get("unsupported_sections"):
+                return InventoryPage(tuple(items), None, tuple(dict.fromkeys(issues)), "cutoff_reached")
+            if state.get("unsupported_sections"):
+                return InventoryPage(
+                    tuple(items), None, tuple(dict.fromkeys([*issues, "unsupported_pagination"])), "unsupported_pagination",
+                )
+            if not items and final_reason:
+                raise SourceStop(self._map_stop(final_reason) or "source_stopped")
+            if state["total_discovered"] == 0:
+                raise SourceStop("public_inventory_unavailable")
+            return InventoryPage(tuple(items), None, tuple(dict.fromkeys(issues)), self._map_stop(final_reason))
+
     def page(self, cursor: str | None) -> InventoryPage:
+        url_kind, target_hint = self.check_access()
+        if self.historical_mode:
+            if self.platform == "facebook":
+                return self._page_facebook_historical(cursor, url_kind, target_hint)
+            return self._page_instagram_historical(cursor, url_kind, target_hint)
+
         if cursor is not None:
             raise ValueError("Bounded open-source discovery emits a single page without synthetic cursors")
         if self._ran:
             raise SourceStop(self._last_stop or "source_stopped")
-        url_kind, target_hint = self.check_access()
         self._ran = True
         issues: list[str] = ["bounded_public_discovery", "independent_inventory_unavailable"]
 
@@ -581,7 +1209,7 @@ class OpenSourceSocialInventory:
                     fb_stage = stage / "instaloader"
                     fb_stage.mkdir(parents=True, exist_ok=True)
                     try:
-                        items, final_reason = self._discover_instaloader(url_kind, target_hint, fb_stage, issues)
+                        items, _, _, final_reason = self._discover_instaloader(url_kind, target_hint, fb_stage, issues)
                     except SourceStop as exc:
                         final_reason = str(exc)
                 if (
@@ -593,7 +1221,7 @@ class OpenSourceSocialInventory:
                     yt_stage = stage / "yt-dlp"
                     yt_stage.mkdir(parents=True, exist_ok=True)
                     try:
-                        items, final_reason = self._discover_ytdlp(yt_stage, issues)
+                        items, _, _, final_reason = self._discover_ytdlp(yt_stage, issues)
                     except SourceStop as exc:
                         final_reason = str(exc)
 

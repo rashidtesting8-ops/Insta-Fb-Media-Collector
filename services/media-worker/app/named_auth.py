@@ -155,6 +155,32 @@ def verify_ticket(con, data):
     return session_actor(con, row[0])[0]
 
 
+def verify_admin_action(db, action, raw, header, session):
+    """Verify HMAC assertion, single-use replay nonce, and active named Admin session, then release DB lock."""
+    claims = verify_assertion(header, action, raw, session)
+    body = json.loads(raw)
+    if not isinstance(body, dict):
+        raise denied()
+    session_hash = digest(session)
+    now = int(time.time())
+    with closing(sqlite3.connect(db)) as con, con:
+        con.executescript(SCHEMA)
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("DELETE FROM named_nonces WHERE expires<=?", (now,))
+        try:
+            con.execute("INSERT INTO named_nonces VALUES (?,?)", (claims["jti"], claims["exp"]))
+        except sqlite3.IntegrityError:
+            raise denied() from None
+        con.commit()
+        con.execute("BEGIN IMMEDIATE")
+        if claims["exp"] <= int(time.time()):
+            raise denied()
+        actor, role = session_actor(con, session_hash)
+        if role != "admin":
+            raise denied()
+    return actor, body
+
+
 def dispatch(db, action, raw, header, session, *, approval_root=None):
     claims = verify_assertion(header, action, raw, session)
     body = json.loads(raw)
