@@ -48,6 +48,7 @@ from app.legacy_social_collect import (
     collect_social,
 )
 from app.manifest import build_social_item, validate_against_disk
+from app.publication import aware_timestamp, publication_evidence
 
 RunnerFn = Callable[[list[str], Path], tuple[int, str]]
 
@@ -178,23 +179,6 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _parse_instaloader_timestamp(value: Any) -> str | None:
-    """Instaloader sidecars expose 'date_utc' (ISO) or 'taken_at_timestamp'."""
-    if isinstance(value, str):
-        text = value.strip().replace("Z", "+00:00")
-        try:
-            dt = datetime.fromisoformat(text)
-            return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).astimezone(UTC).isoformat()
-        except ValueError:
-            return None
-    if isinstance(value, int | float) and value > 0:
-        try:
-            return datetime.fromtimestamp(float(value), tz=UTC).isoformat()
-        except (OSError, OverflowError, ValueError):
-            return None
-    return None
-
-
 def _instaloader_fallback(
     profile_url: str,
     stage: Path,
@@ -235,15 +219,17 @@ def _instaloader_fallback(
             continue
         if media.stat().st_size > MAX_SOCIAL_ITEM_BYTES:
             continue
-        node: dict[str, Any] = {}
-        for prefix, candidate in sidecars.items():
-            if media.stem.startswith(prefix):
-                node = candidate
-                break
-        post_date = _parse_instaloader_timestamp(
-            node.get("date_utc") or node.get("taken_at_timestamp") or node.get("timestamp")
-        )
+        node = sidecars.get(media.stem) or sidecars.get(re.sub(r"_\d+$", "", media.stem)) or {}
         shortcode = node.get("shortcode")
+        post_url = f"https://www.instagram.com/p/{shortcode}/" if isinstance(shortcode, str) and re.fullmatch(r"[\w-]+", shortcode) else None
+        evidence = publication_evidence(node.get("date_utc"), source_url=post_url,
+                                        field="date_utc", attribution="Instaloader post sidecar")
+        epoch = publication_evidence(node.get("taken_at_timestamp"), source_url=post_url,
+                                     field="taken_at_timestamp", attribution="Instaloader post sidecar", unix_seconds=True)
+        if evidence and epoch and evidence["timestamp_utc"] != epoch["timestamp_utc"]:
+            evidence = None
+        else:
+            evidence = evidence or epoch
         sha = _sha256_file(media)
         width, height = _dims_for(media)
         rows.append(
@@ -251,11 +237,8 @@ def _instaloader_fallback(
                 "file": media.name,
                 "sha256": sha,
                 "bytes": media.stat().st_size,
-                "post_date": post_date,
-                "post_date_verified": post_date is not None,
-                "source_post_url": (
-                    f"https://www.instagram.com/p/{shortcode}/" if isinstance(shortcode, str) else None
-                ),
+                "publication_evidence": evidence,
+                "source_post_url": post_url,
                 "author": profile,
                 "dimensions": [width, height] if width else None,
                 "source": "instaloader_fallback",
@@ -297,24 +280,21 @@ def _ytdlp_fallback(
         try:
             data = json.loads(info.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                infos[info.stem[: info.stem.rfind("_")]] = data
+                infos[info.name.removesuffix(".info.json")] = data
         except (OSError, json.JSONDecodeError):
             continue
     for media in sorted(stage.iterdir()):
         if media.suffix.lower() not in MEDIA_EXTENSIONS or not media.is_file():
             continue
-        info: dict[str, Any] = {}
-        for key, candidate in infos.items():
-            if media.stem.startswith(key):
-                info = candidate
-                break
-        upload_date = info.get("upload_date")
-        post_date = None
-        if isinstance(upload_date, str) and re.fullmatch(r"\d{8}", upload_date):
-            try:
-                post_date = datetime.strptime(upload_date, "%Y%m%d").replace(tzinfo=UTC).isoformat()
-            except ValueError:
-                post_date = None
+        info = infos.get(media.stem, {})
+        post_url = info.get("webpage_url")
+        try:
+            check_social_url("facebook", post_url or "")
+        except (TypeError, ValueError):
+            post_url = None
+        evidence = publication_evidence(info.get("release_timestamp"), source_url=post_url,
+                                        field="release_timestamp", attribution="yt-dlp video sidecar",
+                                        unix_seconds=True)
         sha = _sha256_file(media)
         width, height = _dims_for(media)
         rows.append(
@@ -322,9 +302,8 @@ def _ytdlp_fallback(
                 "file": media.name,
                 "sha256": sha,
                 "bytes": media.stat().st_size,
-                "post_date": post_date,
-                "post_date_verified": post_date is not None,
-                "source_post_url": info.get("webpage_url") or url,
+                "publication_evidence": evidence,
+                "source_post_url": post_url or url,
                 "author": info.get("uploader") or info.get("channel"),
                 "dimensions": [width, height] if width else None,
                 "source": "ytdlp_fallback",
@@ -362,8 +341,10 @@ def _move_rows_into_job(
             continue
         sha = row.get("sha256") or _sha256_file(src)
         if sha in seen:
-            src.unlink(missing_ok=True)
             dupes += 1
+            original = next(item for item in normalized if item["sha256"] == sha)
+            src.unlink()
+            normalized.append({**row, "file": original["file"], "sha256": sha, "bytes": original["bytes"]})
             continue
         seen.add(sha)
         size = src.stat().st_size
@@ -409,6 +390,7 @@ def run_social_extraction(
     instaloader_runner: RunnerFn | None = None,
     ytdlp_runner: RunnerFn | None = None,
     enable_fallbacks: bool = True,
+    window_start_utc: str | None = None,
 ) -> SocialExtractionResult:
     """Collect one social platform for one job. Never raises for collection
     failures; everything is reported honestly in the result.
@@ -454,6 +436,7 @@ def run_social_extraction(
         timeout=timeout,
         i_have_permission=True,
         runner=runner,
+        window_start_utc=window_start_utc,
     )
 
     try:
@@ -495,12 +478,14 @@ def run_social_extraction(
             "gallery-dl produced no data for this source (unsupported/gated "
             "extractor for this URL type)."
         )
+    frozen_start = aware_timestamp(window_start_utc)
+    cutoff = (frozen_start.astimezone(UTC).date() if frozen_start else
+              (datetime.now(UTC) - timedelta(days=lookback_days)).date())
     if (
         enable_fallbacks
         and not normalized
         and legacy_reason in _FALLBACK_IG_REASONS
     ):
-        cutoff = (datetime.now(UTC) - timedelta(days=lookback_days)).date()
         if platform == "instagram":
             result.fallback_attempted = "instaloader"
             with tempfile.TemporaryDirectory(prefix="ig-fallback-") as td:
@@ -524,6 +509,9 @@ def run_social_extraction(
                     sha = row["sha256"]
                     if sha in seen:
                         dupes += 1
+                        if row.get("source_post_url"):
+                            original = next(item for item in normalized if item["sha256"] == sha)
+                            normalized.append({**row, "file": original["file"]})
                         continue
                     seen.add(sha)
                     dest = job_dir / platform / src.name
@@ -553,6 +541,9 @@ def run_social_extraction(
                     sha = row["sha256"]
                     if sha in seen:
                         dupes += 1
+                        if row.get("source_post_url"):
+                            original = next(item for item in normalized if item["sha256"] == sha)
+                            normalized.append({**row, "file": original["file"]})
                         continue
                     seen.add(sha)
                     dest = job_dir / platform / src.name
@@ -592,10 +583,10 @@ def run_social_extraction(
     # SAMPLE — never presented as complete 365-day coverage.
     result.coverage = {
         "lookback_days": lookback_days,
-        "cutoff_date": (datetime.now(UTC) - timedelta(days=lookback_days)).date().isoformat(),
+        "cutoff_date": cutoff.isoformat(),
         "discovery_limit_files": max_files,
         "discovery_selection": "bounded_sample_not_full_coverage",
-        "date_filter": "only_verified_dates_outside_lookback_are_filtered",
+        "date_filter": "discovery_hint_only",
         "full_coverage_claimed": False,
     }
 

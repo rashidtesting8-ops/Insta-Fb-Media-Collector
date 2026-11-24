@@ -157,8 +157,9 @@ Invoke-WebRequest http://localhost:8788/health
 Invoke-WebRequest http://localhost:8788/ready
 ```
 
-`POST /jobs` accepts: `website_url` (required), `instagram_url`,
-`facebook_url` (optional), `lookback_days` (1–366), `max_pages` (1–25),
+`POST /jobs` requires `website_url`, `instagram_url` and `facebook_url` for every new job.
+New jobs freeze a 365-day UTC window at creation. The legacy `lookback_days` input is accepted for compatibility and does not change that window.
+The endpoint also accepts `max_pages` (1–25),
 `max_media` (1–80), `max_social_files` (1–60), and
 **`social_permission_confirmed`** — an operator acknowledgement that intended
 collection/use is permitted. It is *not* platform authorization, *not* a

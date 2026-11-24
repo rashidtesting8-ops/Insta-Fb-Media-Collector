@@ -52,6 +52,7 @@ class WorkerSecurity:
         dashboard_scope = (
             method == "GET" and JOB_READ.fullmatch(path)
             or (method, path) == ("POST", "/intake/validate")
+            or (method == "POST" and path.startswith("/named/"))
         )
         dashboard = matches(token, os.getenv("MEDIA_WORKER_DASHBOARD_TOKEN", ""))
         if not admin and not (dashboard and dashboard_scope):

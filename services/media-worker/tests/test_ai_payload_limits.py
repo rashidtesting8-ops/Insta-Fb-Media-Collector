@@ -9,6 +9,8 @@ import json
 import random
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("isolated_provider_unit")
 import requests
 from PIL import Image
 

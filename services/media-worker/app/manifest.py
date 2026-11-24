@@ -7,8 +7,8 @@ filename, dimensions (where available), date status, file size, sha256 and
 extraction status.
 
 Honesty rules baked into the builder:
-- Website assets have no verifiable publication date: `post_date` stays null
-  and `date_status` is "unknown" (PROJECT_SPEC §01 — never invent dates).
+- Website assets without media-specific publication evidence keep `post_date`
+  null and `date_status` set to "unknown_date".
 - Public visibility is not permission: `rights_status` starts "unverified"
   (PROJECT_SPEC §14).
 - Failures (robots-blocked, too-large, invalid, network errors, skips) are
@@ -23,6 +23,7 @@ import mimetypes
 import os
 import tempfile
 from datetime import UTC, datetime, timedelta
+from app.publication import record_publication_review
 from pathlib import Path
 from typing import Any
 
@@ -90,7 +91,7 @@ def build_item(index: int, row: dict[str, Any], *, job_id: str, media_dir: str =
     """Convert one legacy collector row into a normalized manifest item."""
     status = str(row.get("status") or "unknown")
     sha = row.get("sha256")
-    rel_file = str(row.get("file") or "")
+    rel_file = str(row.get("file") or row.get("same_as") or "")
     filename = Path(rel_file).name if rel_file else None
     dims = row.get("dimensions")
     width = height = None
@@ -116,15 +117,16 @@ def build_item(index: int, row: dict[str, Any], *, job_id: str, media_dir: str =
         "source_url": row.get("url"),
         "source_page": row.get("source_page"),
         "filename": filename,
-        "local_path": f"{media_dir}/{filename}" if status == DOWNLOADED and filename else None,
+        "local_path": f"{media_dir}/{filename}" if status in (DOWNLOADED, DUPLICATE) and filename else None,
         "mime": row.get("mime"),
         "bytes": row.get("bytes"),
         "width": width,
         "height": height,
         "sha256": sha,
         "captured_at": row.get("captured_at"),
-        "post_date": None,
-        "date_status": "unknown",
+        "post_date": (row.get("publication_evidence") or {}).get("timestamp_utc"),
+        "date_status": "verified" if row.get("publication_evidence") else "unknown_date",
+        "publication_evidence": row.get("publication_evidence"),
         "rights_status": "unverified",
         "extraction_status": status,
         "detail": detail,
@@ -192,7 +194,7 @@ def build_manifest(
             "issues": [issue for issue in (issues or [])][:50],
         },
         "notes": [
-            "Website asset publication dates are generally not verifiable; date_status is 'unknown'.",
+            "Website media without attributable publication evidence has date_status 'unknown_date'.",
             "Public visibility is not permission; rights_status starts 'unverified'.",
             "Files live under the job folder; local_path is relative to /data/projects/<job_id>.",
         ],
@@ -262,7 +264,7 @@ def build_social_item(
     rel_file = str(row.get("file") or "")
     filename = Path(rel_file).name if rel_file else None
     mime = row.get("mime") or (filename and _infer_mime(filename)) or None
-    date_verified = bool(row.get("post_date_verified"))
+    evidence = row.get("publication_evidence")
     detail: dict[str, Any] = {"origin": row.get("source") or "gallery_dl"}
     if row.get("author"):
         detail["author"] = row["author"]
@@ -283,9 +285,9 @@ def build_social_item(
         "height": height,
         "sha256": sha,
         "captured_at": row.get("captured_at") or utc_now_iso(),
-        "post_date": row.get("post_date"),
-        # Only platform-provided timestamps are trusted; never invented (spec §01).
-        "date_status": "verified" if date_verified else "unknown",
+        "post_date": evidence.get("timestamp_utc") if evidence else None,
+        "date_status": "verified" if evidence else "unknown_date",
+        "publication_evidence": evidence,
         "rights_status": "unverified",
         "extraction_status": "downloaded",
         "detail": detail,
@@ -306,6 +308,7 @@ def merge_social_into_manifest(
     job_id: str,
     lookback_days: int | None,
     permission_confirmed: bool | None,
+    collection_job: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Produce the unified multi-source manifest document.
 
@@ -318,7 +321,10 @@ def merge_social_into_manifest(
     merged["generated_at"] = utc_now_iso()
     merged["lookback_days"] = lookback_days
     merged["social_permission_confirmed"] = permission_confirmed
-    if lookback_days is not None:
+    if collection_job and collection_job.get("window_start_utc"):
+        merged["cutoff_date"] = collection_job["window_start_utc"][:10]
+        merged["lookback_days"] = 365
+    elif collection_job is None and lookback_days is not None:
         merged["cutoff_date"] = (datetime.now(UTC) - timedelta(days=lookback_days)).date().isoformat()
 
     sources: dict[str, Any] = {}
@@ -333,6 +339,8 @@ def merge_social_into_manifest(
         assets.extend(section.get("items", []))
     merged["sources"] = sources
     merged["assets"] = assets
+    if collection_job is not None:
+        record_publication_review(merged, collection_job)
 
     attempted = [
         s.get("status")

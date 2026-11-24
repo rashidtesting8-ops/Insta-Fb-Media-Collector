@@ -133,10 +133,13 @@ class AIProviderConfig:
     mode_a_max_output_tokens: int = 4000
     mode_b_max_output_tokens: int = 4000
     bounded_acceptance: bool = False
+    mode_b_only: bool = False
 
     def __post_init__(self) -> None:
         if min(self.mode_a_max_output_tokens, self.mode_b_max_output_tokens) < 1:
             raise ValueError("Output-token caps must be positive")
+        if self.mode_b_only and not self.bounded_acceptance:
+            raise ValueError("MODE B-only recovery requires bounded acceptance")
         if not self.bounded_acceptance:
             return
         if (self.provider, self.model, self.endpoint) != (
@@ -155,7 +158,9 @@ class AIProviderConfig:
         self.max_image_bytes = min(self.max_image_bytes, 100_000)
         self.batch_size = 1
         self.mode_a_max_output_tokens = min(self.mode_a_max_output_tokens, 1200)
-        self.mode_b_max_output_tokens = min(self.mode_b_max_output_tokens, 1800)
+        self.mode_b_max_output_tokens = min(self.mode_b_max_output_tokens, 900 if self.mode_b_only else 1800)
+        if self.mode_b_only:
+            self.max_requests_per_job = min(self.max_requests_per_job, 1)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "AIProviderConfig":
@@ -416,6 +421,8 @@ class MockVisionProvider(VisionProvider):
             for a in ranked[3:9]
         ]
         selected = [h["asset_id"] for h in hero] + [g["asset_id"] for g in gallery]
+        mode_b_usage = {"input_tokens": 200, "output_tokens": 150}
+        tracker.record(mode_b_usage, retries=0)
         return CompletionResult(
             text=json.dumps(
                 {
@@ -475,9 +482,8 @@ class MockVisionProvider(VisionProvider):
                     },
                 }
             ),
-            usage={"input_tokens": 200, "output_tokens": 150},
+            usage=mode_b_usage,
         )
-        tracker.record({"input_tokens": 200, "output_tokens": 150}, retries=0)
 
     @staticmethod
     def _extract_block(prompt: str, marker: str) -> str | None:
@@ -548,7 +554,7 @@ class OpenAICompatibleProvider(VisionProvider):
             tracker.pre_flight()
             if tracker.config != self.config:
                 raise ValueError("Bounded acceptance requires a matching usage tracker")
-            if len(images) != (1 if tracker.usage.requests == 0 else 0):
+            if len(images) != (0 if self.config.mode_b_only else int(tracker.usage.requests == 0)):
                 raise ValueError("Bounded acceptance requires one MODE A image and text-only MODE B")
             if images:
                 image = images[0]
@@ -603,22 +609,23 @@ class OpenAICompatibleProvider(VisionProvider):
             )
 
         last_error = ""
-        for attempt in range(self.config.max_retries + 1):
+        from app import ai_execution
+        retries = ai_execution.retry_limit(self.config.max_retries)
+        for attempt in range(retries + 1):
             # Gentle pacing between calls (free-tier RPM/TPM friendliness).
             due = self.config.min_request_spacing_s - (time.monotonic() - self._last_request)
             if due > 0:
                 self._sleep(due)
             self._last_request = time.monotonic()
-            reservation = tracker.reserve_request(max_output_tokens, retry=attempt > 0)
             try:
-                response = self._transport(
-                    {
+                with ai_execution.attempt("A" if images else "B", [image.asset_id for image in images],
+                                          lambda: tracker.reserve_request(max_output_tokens, retry=attempt > 0)) as reservation:
+                    response = self._transport({
                         "url": self.config.endpoint,
                         "headers": headers,
                         "body": body,
                         "timeout_s": self.config.timeout_s,
-                    }
-                )
+                    })
                 usage_raw = response.get("usage") or {}
                 if self.config.bounded_acceptance and not all(
                     type(usage_raw.get(key)) is int and 0 <= usage_raw[key] <= cap
@@ -638,6 +645,8 @@ class OpenAICompatibleProvider(VisionProvider):
                 if not text.strip():
                     raise ValueError("empty content in provider response")
                 return CompletionResult(text=text, usage=usage)
+            except ai_execution.InferenceHeld:
+                raise
             except requests.HTTPError as exc:
                 # Retry ONLY rate limits (bounded, honoring retry-after) and
                 # transient 5xx. 401/403/413 are authoritative: no retry.
@@ -658,19 +667,19 @@ class OpenAICompatibleProvider(VisionProvider):
                     except (TypeError, ValueError):
                         retry_after = 0.0
                     last_error = f"HTTP 429: {detail}"
-                    if attempt < self.config.max_retries:
+                    if attempt < retries:
                         self._sleep(max(retry_after, 2.0 * (2**attempt)))
                         continue
                     raise RateLimitedError(f"provider rate limit: {detail}") from None
                 if 500 <= code < 600:
                     last_error = f"HTTP {code}: {detail}"
-                    if attempt < self.config.max_retries:
+                    if attempt < retries:
                         self._sleep(2.0 * (2**attempt))
                         continue
                 raise RuntimeError(f"provider HTTP error: HTTP {code} {detail}") from None
             except (requests.Timeout, requests.RequestException, ValueError) as exc:
                 last_error = _safe_provider_message(str(exc), self.config.api_key)
-                if attempt < self.config.max_retries:
+                if attempt < retries:
                     self._sleep(2.0 * (2**attempt))
                     continue
                 raise RuntimeError(f"provider error: {last_error}") from None
@@ -683,6 +692,10 @@ class OpenAICompatibleProvider(VisionProvider):
         TLS verification stays ON; credentials remain in headers only and are
         never logged or persisted. Bounded timeout comes from configuration.
         """
+        from app.ai_execution import require_transport
+        require_transport()
+        if request["url"] != GROQ_ACCEPTANCE_ENDPOINT:
+            raise ProviderUnavailableError("External processing consent for this destination is unavailable")
         response = requests.post(
             request["url"],
             headers=request["headers"],

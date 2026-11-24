@@ -69,10 +69,13 @@ def build_delivery_plan(
             "reason": "curation is mock/fixture/test-only; never release as a customer deliverable",
         }
     manifest = json_load(job_dir / "manifest.json")
+    if manifest.get("collection_mode") in ("public_checkpoint", "recorded_extractor"):
+        return {"status": "blocked_unverified_collection", "job_id": job_id, "assets": []}
     by_id = {a.get("asset_id"): a for a in manifest.get("assets", [])}
     selected = list(dict.fromkeys(envelope.get("curation", {}).get("selected_asset_ids", [])))
     rights_review = set(envelope.get("curation", {}).get("rights_review_required_ids", []))
     assets: list[dict[str, Any]] = []
+    pending_rights = []
     errors: list[str] = []
     for aid in selected:
         item = by_id.get(aid)
@@ -91,6 +94,9 @@ def build_delivery_plan(
         if item.get("sha256") and sha != item["sha256"]:
             errors.append(f"sha256 mismatch: {aid}")
             continue
+        if item.get("rights_status") != "verified" or aid in rights_review:
+            pending_rights.append(aid)
+            continue
         assets.append({
             "asset_id": aid,
             "filename": disk.name,
@@ -101,7 +107,7 @@ def build_delivery_plan(
             "mime": item.get("mime") or "application/octet-stream",
             "source_url": item.get("source_url"),
             "rights_status": item.get("rights_status", "unverified"),
-            "rights_review_required": item.get("rights_status", "unverified") != "verified" or aid in rights_review,
+            "rights_review_required": False,
             "upload_key": f"{aid}:{sha}",  # deterministic retry/idempotency key
         })
     # Reuse prior delivery state (retry safety): never re-upload an already uploaded key.
@@ -118,6 +124,8 @@ def build_delivery_plan(
     ]
     pending_uploads = [a for a in assets if a["upload_key"] not in uploaded_keys]
     status = "ready" if assets and not errors else ("partial" if assets else "failed")
+    if not assets and pending_rights:
+        status = "blocked_rights_review"
     return {
         "status": status, "job_id": job_id,
         "folder_name": sanitize_folder_name(business_name or manifest.get("website_url", ""), job_id),
@@ -126,7 +134,7 @@ def build_delivery_plan(
         "uploaded_keys": uploaded_keys,
         "drive_folder_id": existing_delivery.get("drive_folder_id"),
         "drive_folder_link": existing_delivery.get("drive_folder_link"),
-        "pending_rights_ids": [a["asset_id"] for a in assets if a["rights_review_required"]],
+        "pending_rights_ids": pending_rights,
         "note": "n8n owns Google Drive credentials/uploads; files are never made public automatically.",
     }
 
@@ -143,7 +151,11 @@ def finalize_delivery(
     """Persist delivery.json. Rights gating: without explicit authorization,
     no upload is recorded as an approved commercial release."""
     job_dir = Path(job_dir)
-    by_key = {a["upload_key"]: a for a in plan.get("assets", [])}
+    if not authorization_confirmed or plan.get("status") == "blocked_rights_review":
+        return {"job_id": plan.get("job_id"), "status": "blocked_rights_review", "uploaded": [],
+                "pending_rights_ids": plan.get("pending_rights_ids", [])}
+    by_key = {a["upload_key"]: a for a in plan.get("assets", [])
+              if a.get("rights_status") == "verified" and a.get("rights_review_required") is False}
     # Merge with any prior ledger so retries do not lose successful uploads.
     existing_ledger = []
     existing_path = job_dir / "delivery.json"
@@ -152,8 +164,8 @@ def finalize_delivery(
             existing_ledger = list((json.loads(existing_path.read_text(encoding="utf-8")) or {}).get("uploaded") or [])
         except (OSError, json.JSONDecodeError):
             existing_ledger = []
-    by_upload = {}
-    for upload in [*existing_ledger, *uploads]:
+    by_upload = {row["upload_key"]: row for row in existing_ledger if row.get("upload_key")}
+    for upload in uploads:
         key = str(upload.get("upload_key") or "")
         asset = by_key.get(key)
         if asset is None:
@@ -170,9 +182,9 @@ def finalize_delivery(
             "sha256": asset["sha256"], "rights_status": asset["rights_status"],
         }
     ledger = list(by_upload.values())
-    ok = [u for u in ledger if u["status"] == "uploaded" and u["drive_file_id"]]
-    status = "blocked_rights_review" if not authorization_confirmed else (
-        "completed" if len(ok) == len(plan.get("assets", [])) and ok else
+    ok = [u for u in ledger if u["upload_key"] in by_key and u["status"] == "uploaded" and u["drive_file_id"]]
+    status = (
+        "completed" if len(ok) == len(plan.get("assets", [])) and ok and not plan.get("pending_rights_ids") else
         "partial_success" if ok else "failed"
     )
     result = {

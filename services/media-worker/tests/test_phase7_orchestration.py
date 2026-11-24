@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -81,8 +82,15 @@ def test_derive_stage_terminal_flags():
     assert derive_stage(_job("failed"))["terminal"] is True
 
 
-def test_validate_intake_valid_website_only():
-    out = validate_intake({"website_url": "https://example.com/", "max_pages": 5})
+SOURCE_URLS = {
+    "website_url": "https://example.com/",
+    "instagram_url": "https://www.instagram.com/example/",
+    "facebook_url": "https://www.facebook.com/example/",
+}
+
+
+def test_validate_intake_valid_three_sources():
+    out = validate_intake({**SOURCE_URLS, "max_pages": 5})
     assert out["valid"] is True
     assert out["errors"] == []
     assert out["resume"] is False
@@ -129,31 +137,33 @@ def test_validate_intake_invalid_job_id():
 
 
 def test_validate_intake_preferences_clamped_and_invalid():
-    out = validate_intake({"website_url": "https://x.test/", "max_pages": 0, "max_pages2": 1})
+    out = validate_intake({**SOURCE_URLS, "max_pages": 0, "max_pages2": 1})
     # max_pages clamped to 1
     assert out["valid"] is True
     assert out["create"]["max_pages"] == 1
-    out = validate_intake({"website_url": "https://x.test/", "max_pages": "abc"})
+    out = validate_intake({**SOURCE_URLS, "max_pages": "abc"})
     assert out["valid"] is False
 
 
 def test_validate_intake_idempotency_derived():
-    a = validate_intake({"website_url": "https://x.test/"})
-    b = validate_intake({"website_url": "https://x.test/"})
+    a = validate_intake(SOURCE_URLS)
+    b = validate_intake(SOURCE_URLS)
     assert a["idempotency_key"] == b["idempotency_key"]
-    c = validate_intake({"website_url": "https://x.test/", "idempotency_key": "my-key"})
+    c = validate_intake({**SOURCE_URLS, "idempotency_key": "my-key"})
     assert c["idempotency_key"] == "my-key"
 
 
 def test_find_idempotent_job_reuse_and_expiry():
-    now = "2026-01-02T00:00:00+00:00"
+    now = datetime.now(timezone.utc)
+    fresh = (now - timedelta(hours=47)).isoformat()
+    expired = (now - timedelta(hours=49)).isoformat()
     records = [
-        {"job_id": "j1", "idempotency_key": "k", "created_at": "2026-11-21T00:00:00+00:00"},
-        {"job_id": "j2", "idempotency_key": "other", "created_at": "2026-11-21T00:00:00+00:00"},
+        {"job_id": "j1", "idempotency_key": "k", "created_at": fresh},
+        {"job_id": "j2", "idempotency_key": "other", "created_at": fresh},
     ]
     assert find_idempotent_job(records, "k") == "j1"
     assert find_idempotent_job(records, "missing") is None
-    old = [{"job_id": "j3", "idempotency_key": "k", "created_at": "2020-01-01T00:00:00+00:00"}]
+    old = [{"job_id": "j3", "idempotency_key": "k", "created_at": expired}]
     assert find_idempotent_job(old, "k") is None
 
 

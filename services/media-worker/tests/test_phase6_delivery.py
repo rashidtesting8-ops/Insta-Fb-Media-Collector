@@ -37,7 +37,7 @@ def _job(tmp_path: Path, *, assets=2, rights="unverified") -> tuple[Path, list[d
         "ai_envelope": {"mock": False, "prompt_version": FIXTURE_TAG},
         "curation": {
             "selected_asset_ids": [r["asset_id"] for r in rows],
-            "rights_review_required_ids": [r["asset_id"] for r in rows],
+            "rights_review_required_ids": [r["asset_id"] for r in rows if r["rights_status"] != "verified"],
             "analysis_coverage": {"mock": False},
         },
     }
@@ -77,12 +77,11 @@ def test_mock_boolean_and_unknown_provenance_are_blocked(tmp_path, field):
 def test_plan_maps_validated_files_and_rights(tmp_path):
     job, rows = _job(tmp_path)
     plan = build_delivery_plan(job, "job_p6", "Pup Palace", allow_fixture=True)
-    assert plan["status"] == "ready"
-    assert len(plan["assets"]) == 2
+    assert plan["status"] == "blocked_rights_review"
+    assert plan["assets"] == plan["pending_uploads"] == []
+    assert plan["pending_rights_ids"] == [r["asset_id"] for r in rows]
+    assert finalize_delivery(job, plan, [], authorization_confirmed=True)["status"] == "blocked_rights_review"
     assert plan["folder_name"].startswith("pup-palace-job-p6")
-    assert all(a["rights_review_required"] for a in plan["assets"])
-    assert all(a["n8n_path"].startswith("/data/media/job_p6/") for a in plan["assets"])
-    assert all(a["sha256"] == r["sha256"] for a, r in zip(plan["assets"], rows))
 
 
 def test_plan_rejects_path_traversal_and_missing_files(tmp_path):
@@ -94,6 +93,20 @@ def test_plan_rejects_path_traversal_and_missing_files(tmp_path):
     assert any("unsafe path" in e for e in plan["errors"])
 
 
+def test_mixed_selection_releases_only_independently_verified_assets(tmp_path):
+    job, rows = _job(tmp_path, rights="verified")
+    rows[1]["rights_status"] = "unverified"
+    (job / "manifest.json").write_text(json.dumps({"assets": rows}))
+    plan = build_delivery_plan(job, "job_p6", allow_fixture=True)
+    assert [a["asset_id"] for a in plan["assets"]] == [rows[0]["asset_id"]]
+    assert plan["assets"] == plan["pending_uploads"]
+    assert plan["pending_rights_ids"] == [rows[1]["asset_id"]]
+    key = rows[1]["asset_id"] + ":" + rows[1]["sha256"]
+    result = finalize_delivery(job, plan, [{"upload_key": key, "drive_file_id": "fake", "status": "uploaded"}],
+                               authorization_confirmed=True)
+    assert result["uploaded"] == []
+
+
 def test_plan_detects_sha_mismatch(tmp_path):
     job, rows = _job(tmp_path)
     rows[0]["sha256"] = "0" * 64
@@ -103,7 +116,7 @@ def test_plan_detects_sha_mismatch(tmp_path):
 
 
 def test_finalize_rights_gate_and_upload_ledger(tmp_path):
-    job, _ = _job(tmp_path)
+    job, _ = _job(tmp_path, rights="verified")
     plan = build_delivery_plan(job, "job_p6", "Pup Palace", allow_fixture=True)
     uploads = [
         {"upload_key": a["upload_key"], "drive_file_id": f"drive-{i}",
@@ -119,7 +132,7 @@ def test_finalize_rights_gate_and_upload_ledger(tmp_path):
 
 
 def test_idempotency_dedupes_retries(tmp_path):
-    job, _ = _job(tmp_path)
+    job, _ = _job(tmp_path, rights="verified")
     plan = build_delivery_plan(job, "job_p6", "Pup Palace", allow_fixture=True)
     a = plan["assets"][0]
     retries = [
@@ -134,7 +147,7 @@ def test_idempotency_dedupes_retries(tmp_path):
 
 
 def test_partial_upload_failure(tmp_path):
-    job, _ = _job(tmp_path)
+    job, _ = _job(tmp_path, rights="verified")
     plan = build_delivery_plan(job, "job_p6", "Pup Palace", allow_fixture=True)
     uploads = [
         {"upload_key": plan["assets"][0]["upload_key"], "drive_file_id": "d1", "status": "uploaded"},

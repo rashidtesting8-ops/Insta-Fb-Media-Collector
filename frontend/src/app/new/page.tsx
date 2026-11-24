@@ -2,6 +2,7 @@
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
+import { sourceUrlErrors } from "@/lib/intake";
 
 export default function NewCollection() {
   const router = useRouter();
@@ -22,11 +23,7 @@ export default function NewCollection() {
   const previousSubmission = useRef<{ payload: string; key: string } | null>(null);
 
   function validate() {
-    const e: Record<string, string> = {};
-    if (!form.website_url.trim()) e.website_url = "Website URL is required";
-    else if (!/^https?:\/\//i.test(form.website_url.trim())) e.website_url = "Must start with http:// or https://";
-    if (form.instagram_url && !/^https?:\/\//i.test(form.instagram_url.trim())) e.instagram_url = "Must start with http:// or https://";
-    if (form.facebook_url && !/^https?:\/\//i.test(form.facebook_url.trim())) e.facebook_url = "Must start with http:// or https://";
+    const e = sourceUrlErrors(form);
     const mi = Number(form.max_selected_images);
     const mv = Number(form.max_selected_videos);
     if (!Number.isInteger(mi) || mi < 1 || mi > 200) e.max_selected_images = "Between 1 and 200";
@@ -44,8 +41,8 @@ export default function NewCollection() {
     try {
       const payload = {
           website_url: form.website_url.trim(),
-          instagram_url: form.instagram_url.trim() || null,
-          facebook_url: form.facebook_url.trim() || null,
+          instagram_url: form.instagram_url.trim(),
+          facebook_url: form.facebook_url.trim(),
           business_name: form.business_name.trim() || undefined,
           max_selected_images: Number(form.max_selected_images),
           max_selected_videos: Number(form.max_selected_videos),
@@ -87,9 +84,9 @@ export default function NewCollection() {
       <h1 className="text-2xl font-semibold">New Media Collection</h1>
       <form onSubmit={onSubmit} className="space-y-4 rounded-lg border border-slate-200 bg-white p-6">
         {field("business_name", "Business name")}
-        {field("website_url", "Business website URL *", { placeholder: "https://example.com" })}
-        {field("instagram_url", "Instagram URL (optional)", { placeholder: "https://www.instagram.com/..." })}
-        {field("facebook_url", "Facebook URL (optional)", { placeholder: "https://www.facebook.com/..." })}
+        {field("website_url", "Business website URL *", { required: true, placeholder: "https://example.com" })}
+        {field("instagram_url", "Instagram URL *", { required: true, placeholder: "https://www.instagram.com/..." })}
+        {field("facebook_url", "Facebook URL *", { required: true, placeholder: "https://www.facebook.com/..." })}
         <div className="grid grid-cols-2 gap-4">
           {field("max_selected_images", "Max images")}
           {field("max_selected_videos", "Max videos")}

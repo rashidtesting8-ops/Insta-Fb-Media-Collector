@@ -8,6 +8,8 @@ backoff, TLS verification, and secret scrubbing.
 from __future__ import annotations
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("isolated_provider_unit")
 import requests
 
 from app.ai.provider import (
@@ -75,7 +77,7 @@ def test_http_post_uses_requests_with_tls_verify_and_no_ua_override(monkeypatch)
 
     monkeypatch.setattr("app.ai.provider.requests.post", fake_post)
     result = OpenAICompatibleProvider._http_post(
-        {"url": "https://api.test", "headers": {"Authorization": "Bearer fake"},
+        {"url": "https://api.groq.com/openai/v1/chat/completions", "headers": {"Authorization": "Bearer fake"},
          "body": {"model": "m"}, "timeout_s": 30}
     )
     assert result == {"ok": True}

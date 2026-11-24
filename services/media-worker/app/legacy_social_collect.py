@@ -19,6 +19,7 @@ import tempfile
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
+from app.publication import aware_timestamp, publication_evidence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -85,7 +86,7 @@ _EXTRACTOR_BROKEN_PATTERNS = (
 
 
 def cutoff_year(today: date | None = None) -> date:
-    day = today or date.today()
+    day = today or datetime.now(UTC).date()
     try:
         return day.replace(year=day.year - 1)
     except ValueError:  # Feb 29
@@ -147,66 +148,24 @@ def classify_social_failure(exit_code: int, output: str) -> str:
     return "unknown"
 
 
-def _parse_real_timestamp(raw_val: Any) -> str | None:
-    """Parse a real post timestamp from gallery-dl metadata into UTC ISO-8601 format."""
-    if raw_val is None or isinstance(raw_val, bool):
-        return None
-    if isinstance(raw_val, int | float):
-        if raw_val <= 0:
-            return None
-        try:
-            return datetime.fromtimestamp(float(raw_val), tz=UTC).isoformat()
-        except (OSError, OverflowError, ValueError):
-            return None
-    if isinstance(raw_val, str):
-        text = raw_val.strip()
-        if not text:
-            return None
-        if text.isdigit():
-            val = int(text)
-            if val > 0:
-                try:
-                    return datetime.fromtimestamp(float(val), tz=UTC).isoformat()
-                except (OSError, OverflowError, ValueError):
-                    return None
-        normalized = text.replace("Z", "+00:00")
-        try:
-            dt = datetime.fromisoformat(normalized)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=UTC)
-            else:
-                dt = dt.astimezone(UTC)
-            return dt.isoformat()
-        except ValueError:
-            pass
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-            try:
-                dt = datetime.strptime(text, fmt).replace(tzinfo=UTC)
-                return dt.isoformat()
-            except ValueError:
-                continue
-    return None
-
-
 def derive_post_metadata(meta: dict[str, Any], *, fallback_url: str) -> dict[str, Any]:
     """Derive post_date, post_date_verified, original_post_url, and author from metadata."""
-    post_date: str | None = None
-    for key in ("date", "post_date", "timestamp", "created_at", "taken_at"):
-        if key in meta:
-            parsed = _parse_real_timestamp(meta.get(key))
-            if parsed is not None:
-                post_date = parsed
-                break
-
+    host = urlparse(fallback_url).hostname
+    platform = "instagram" if host in SOCIAL_HOSTS["instagram"] else "facebook"
     original_post_url: str | None = None
     for url_key in ("post_url", "original_post_url", "webpage_url"):
         candidate = meta.get(url_key)
-        if isinstance(candidate, str) and candidate.startswith("https://"):
-            original_post_url = candidate
-            break
+        if not isinstance(candidate, str):
+            continue
+        try:
+            if candidate.rstrip("/") != fallback_url.rstrip("/"):
+                original_post_url = check_social_url(platform, candidate)
+                break
+        except ValueError:
+            continue
     if original_post_url is None and isinstance(meta.get("post_shortcode"), str):
         shortcode = meta["post_shortcode"].strip("/")
-        if shortcode and "instagram.com" in fallback_url:
+        if platform == "instagram" and re.fullmatch(r"[\w-]+", shortcode):
             original_post_url = f"https://www.instagram.com/p/{shortcode}/"
 
     author: str | None = None
@@ -221,9 +180,16 @@ def derive_post_metadata(meta: dict[str, Any], *, fallback_url: str) -> dict[str
                 author = nested.strip()
                 break
 
+    evidence = [
+        item for key in ("post_date", "date")
+        if (item := publication_evidence(meta.get(key), source_url=original_post_url,
+                                         field=key, attribution="gallery-dl matched post"))
+    ]
+    verified = evidence[0] if len({item["timestamp_utc"] for item in evidence}) == 1 else None
     return {
-        "post_date": post_date,
-        "post_date_verified": post_date is not None,
+        "post_date": verified["timestamp_utc"] if verified else None,
+        "post_date_verified": verified is not None,
+        "publication_evidence": verified,
         "original_post_url": original_post_url or fallback_url,
         "source_post_url": original_post_url,
         "author": author,
@@ -251,7 +217,11 @@ def parse_dump_json_metadata(raw_output: str) -> list[dict[str, Any]]:
                     code = entry[0]
                     dicts = [item for item in entry[1:] if isinstance(item, dict)]
                     if code == 2 and dicts:
-                        shared_context.update(dicts[-1])
+                        shared_context.clear()
+                        shared_context.update({
+                            key: dicts[-1][key] for key in ("author", "username", "owner", "fullname", "user")
+                            if key in dicts[-1]
+                        })
                     elif dicts:
                         merged = {**shared_context, **dicts[-1]}
                         records.append(merged)
@@ -408,7 +378,6 @@ def _execute_subprocess(
 
 def _match_metadata_for_file(
     src: Path,
-    index: int,
     metadata_records: list[dict[str, Any]],
 ) -> dict[str, Any]:
     sidecar = src.with_suffix(src.suffix + ".json")
@@ -422,18 +391,15 @@ def _match_metadata_for_file(
 
     stem = src.stem.lower()
     name = src.name.lower()
+    matches = []
     for record in metadata_records:
         rec_filename = str(record.get("filename") or "").lower()
         rec_ext = str(record.get("extension") or "").lower().lstrip(".")
         rec_full = f"{rec_filename}.{rec_ext}" if rec_filename and rec_ext else rec_filename
-        if rec_filename and (rec_filename == stem or rec_full == name):
-            return record
-
-    if index < len(metadata_records):
-        return metadata_records[index]
-    if len(metadata_records) == 1:
-        return metadata_records[0]
-    return {}
+        if rec_full == name or (not rec_ext and rec_filename in (name, stem)):
+            if record not in matches:
+                matches.append(record)
+    return matches[0] if len(matches) == 1 else {}
 
 
 def collect_social(
@@ -450,6 +416,7 @@ def collect_social(
     executable: str = "gallery-dl",
     runner: Callable[[list[str], Path], tuple[int, str]] | None = None,
     i_have_permission: bool | None = None,
+    window_start_utc: str | None = None,
 ) -> dict[str, Any]:
     try:
         if i_have_permission is False or (i_have_permission is None and runner is None):
@@ -481,7 +448,9 @@ def collect_social(
                 "files_added": 0,
             }
 
-        cutoff = datetime.now(UTC).date().toordinal() - days_limit
+        frozen_start = aware_timestamp(window_start_utc)
+        cutoff = (frozen_start.astimezone(UTC).date().toordinal() - 1 if frozen_start else
+                  datetime.now(UTC).date().toordinal() - days_limit)
         cutoff_date = date.fromordinal(cutoff).isoformat()
         dest = project_path / "assets" / platform
         optimized_dest = project_path / "assets" / "optimized"
@@ -564,7 +533,7 @@ def collect_social(
             combined_msg = (dry_out + "\n" + stderr).strip()
             candidate_files = [p for p in sorted(stage.rglob("*")) if file_safe(p)]
 
-            for idx, src in enumerate(candidate_files):
+            for src in candidate_files:
                 if len(rows) >= max_files or folder_size(project_path) >= MAX_PROJECT_BYTES:
                     break
                 blob = src.read_bytes()
@@ -578,19 +547,17 @@ def collect_social(
                         continue
 
                 sha = hashlib.sha256(blob).hexdigest()
-                if sha in known_hashes:
-                    continue
-
-                raw_meta = _match_metadata_for_file(src, idx, metadata_records)
+                raw_meta = _match_metadata_for_file(src, metadata_records)
                 derived = derive_post_metadata(raw_meta, fallback_url=url)
-
-                # If metadata has a verified post_date older than cutoff_date, skip
-                if derived["post_date_verified"] and isinstance(derived["post_date"], str):
-                    post_day = datetime.fromisoformat(derived["post_date"]).date()
-                    if post_day < date.fromisoformat(cutoff_date):
-                        continue
-
                 name = f"{platform}-{sha[:16]}{src.suffix.lower()}"
+                if sha in known_hashes:
+                    identity = (platform, url, derived["source_post_url"], derived["post_date"])
+                    if any(row.get("sha256") == sha and
+                           tuple(row.get(key) for key in ("platform", "source_profile_url", "source_post_url", "post_date")) == identity
+                           for row in (*existing, *rows)):
+                        continue
+                    suffix = hashlib.sha256(repr(identity).encode()).hexdigest()[:12]
+                    name = f"{platform}-{sha[:16]}-{suffix}{src.suffix.lower()}"
                 target = dest / name
                 _atomic_write_bytes(target, blob)
 
@@ -621,6 +588,7 @@ def collect_social(
                         "author": derived["author"],
                         "post_date": derived["post_date"],
                         "post_date_verified": derived["post_date_verified"],
+                        "publication_evidence": derived["publication_evidence"],
                         "date_filter_requested_after": cutoff_date,
                         "sha256": sha,
                         "bytes": len(blob),

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
+import { createHash, createHmac } from "node:crypto";
 import test from "node:test";
 import { setTimeout } from "node:timers/promises";
 
@@ -19,6 +20,19 @@ test("built dashboard enforces sessions and routes authorized intake to n8n", { 
     for await (const chunk of req) chunks.push(chunk);
     const body = Buffer.concat(chunks).toString();
     requests.push({ url: req.url, headers: req.headers, body });
+    if (req.url.startsWith("/named/")) {
+      const [encoded, mac] = req.headers["x-named-assertion"].split(".");
+      const claims = JSON.parse(Buffer.from(encoded, "base64url"));
+      assert.equal(mac, createHmac("sha256", "disposable-assertion-key-".repeat(2)).update(encoded).digest("hex"));
+      assert.equal(claims.aud, "pgm-worker");
+      assert.equal(claims.action, req.url.slice(7));
+      assert.equal(claims.body, createHash("sha256").update(body).digest("hex"));
+      assert.equal(claims.sub, createHash("sha256").update(req.headers["x-named-session"]).digest("hex"));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(req.url === "/named/login" ? { session: "x".repeat(43) } :
+        req.url === "/named/intake" ? { idempotency_key: "named-" + "a".repeat(64) } : { ok: true }));
+      return;
+    }
     const intake = req.url === "/webhook/pipeline-intake";
     res.writeHead(intake ? 202 : 200, { "content-type": "application/json" });
     res.end(JSON.stringify(intake ? { job_id: id } : { ok: true, jobs: [] }));
@@ -42,6 +56,7 @@ test("built dashboard enforces sessions and routes authorized intake to n8n", { 
       DASHBOARD_PASSWORD: password, DASHBOARD_SESSION_SECRET: "fixture-independent-signing-secret",
       MEDIA_WORKER_DASHBOARD_TOKEN: "fixture-read-only", N8N_PIPELINE_TOKEN: "fixture-pipeline",
       WORKER_URL: `http://127.0.0.1:${upstreamPort}`, N8N_URL: `http://127.0.0.1:${upstreamPort}`,
+      NAMED_ASSERTION_SECRET: "disposable-assertion-key-".repeat(2),
     },
   });
   let output = "";
@@ -82,11 +97,28 @@ test("built dashboard enforces sessions and routes authorized intake to n8n", { 
   assert.equal(jobs.headers.get("access-control-allow-origin"), null);
   assert.equal(requests.find((request) => request.url === "/jobs").headers["x-api-key"], "fixture-read-only");
   assert.equal((await post("/api/jobs", {}, { cookie, origin: "https://foreign.example" })).status, 403);
-  const intake = await post("/api/jobs", { website_url: "https://business.test", authorization_confirmed: true }, { cookie });
+  const sourceUrls = {
+    website_url: "https://business.test",
+    instagram_url: "https://www.instagram.com/example/",
+    facebook_url: "https://www.facebook.com/example/",
+  };
+  assert.equal((await post("/api/jobs", { website_url: sourceUrls.website_url }, { cookie })).status, 400);
+  const intake = await post("/api/jobs", { ...sourceUrls, authorization_confirmed: true }, { cookie });
   assert.deepEqual(await intake.json(), { job_id: id });
   assert.equal(intake.status, 202);
   const forwarded = requests.find((request) => request.url === "/webhook/pipeline-intake");
   assert.equal(forwarded.headers["x-pipeline-key"], "fixture-pipeline");
-  assert.deepEqual(JSON.parse(forwarded.body), { website_url: "https://business.test" });
+  assert.deepEqual(JSON.parse(forwarded.body), sourceUrls);
   assert.match((await post("/api/auth/logout", {}, { cookie })).headers.get("set-cookie"), /Max-Age=0/);
+  assert.equal((await post("/api/auth/named/create", { role: "admin" }, { cookie })).status, 401);
+  const namedLogin = await post("/api/auth/named/login", { name: "synthetic", password });
+  assert.deepEqual(await namedLogin.json(), { ok: true });
+  const namedHeader = namedLogin.headers.get("set-cookie");
+  assert.match(namedHeader, /^__Host-pgm_named=/);
+  for (const protection of [/Secure/, /HttpOnly/, /SameSite=strict/i]) assert.match(namedHeader, protection);
+  const named = namedHeader.split(";")[0];
+  assert.equal((await post("/api/auth/named/create", {}, { cookie: named, origin: "https://foreign.example" })).status, 403);
+  assert.equal((await post("/api/jobs", { ...sourceUrls, actor: "spoof" }, { cookie: named })).status, 202);
+  const namedIntake = requests.filter(r => r.url === "/webhook/pipeline-intake").at(-1);
+  assert.deepEqual(JSON.parse(namedIntake.body), { ...sourceUrls, idempotency_key: "named-" + "a".repeat(64) });
 });

@@ -1,4 +1,5 @@
 import { cookies } from "next/headers";
+import { namedCall, namedCookie } from "./named";
 import { cookieName, dashboardOrigin, validSession } from "./security";
 
 export function workerUrl(path: string): string {
@@ -22,7 +23,10 @@ export async function dashboardDenied(req?: Request): Promise<Response | undefin
       (!dashboardOrigin() || req.headers.get("origin") !== dashboardOrigin())) {
     return Response.json({ error: "Origin denied" }, { status: 403 });
   }
-  if (!validSession((await cookies()).get(cookieName())?.value)) {
+  const jar = await cookies();
+  if (!validSession(jar.get(cookieName())?.value)) {
+    const session = jar.get(namedCookie)?.value;
+    if (session && await namedCall("session", {}, session).then(r => r.ok, () => false)) return;
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 }

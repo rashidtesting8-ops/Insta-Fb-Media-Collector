@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.test_phase7_orchestration import SOURCE_URLS
 
 
 @pytest.fixture
@@ -92,13 +93,34 @@ def test_job_retry_reuses_existing_id_while_slots_are_full(worker, monkeypatch):
     submitted = []
     monkeypatch.setattr(worker, "slots", BoundedSemaphore(1))
     monkeypatch.setattr(worker.executor, "submit", lambda *args: submitted.append(args))
-    request_body = (b'{"website_url":"https://business.test","idempotency_key":"test-retry"}',)
+    request_body = (json.dumps({**SOURCE_URLS, "idempotency_key": "test-retry"}).encode(),)
     first = request(worker.app, "/jobs", "POST", "test-admin", request_body)
     second = request(worker.app, "/jobs", "POST", "test-admin", request_body)
     assert first[0] == second[0] == 202
     assert json.loads(first[2])["job_id"] == json.loads(second[2])["job_id"]
     assert json.loads(second[2])["idempotent_reuse"] is True
     assert len(submitted) == 1
+
+
+@pytest.mark.parametrize("field, wrong_platform", [
+    ("website_url", "https://www.facebook.com/example/"),
+    ("instagram_url", "https://www.facebook.com/example/"),
+    ("facebook_url", "https://www.instagram.com/example/"),
+])
+def test_new_jobs_require_all_source_urls(worker, field, wrong_platform):
+    for value in (None, "", "not a URL", "https://example.test:bad/", wrong_platform):
+        payload = {**SOURCE_URLS, field: value}
+        if value is None:
+            del payload[field]
+        body = (json.dumps(payload).encode(),)
+        status, _, result = request(worker.app, "/intake/validate", "POST", "test-admin", body)
+        assert status == 200
+        validation = json.loads(result)
+        assert validation["valid"] is False
+        assert any(error.startswith(field + ":") for error in validation["errors"])
+        assert request(worker.app, "/jobs", "POST", "test-admin", body)[0] == 422
+    with worker.connect() as db:
+        assert db.execute("SELECT id FROM jobs").fetchall() == [("a" * 32,)]
 
 
 def test_workflow_auth_and_acknowledgement():
@@ -120,6 +142,9 @@ def test_workflow_auth_and_acknowledgement():
             condition = nodes["Plan Ready Gate"]["parameters"]["conditions"]["conditions"][0]
             assert "authorization_confirmed === true" in condition["leftValue"]
         if name.startswith("07"):
+            assert nodes["Validate Intake"]["parameters"]["url"].endswith("/intake/validate")
+            assert workflow["connections"]["Validate Intake"]["main"][0][0]["node"] == "Intake Valid?"
+            assert workflow["connections"]["Intake Valid?"]["main"][1][0]["node"] == "Respond Invalid Input"
             assert nodes["Respond Accepted"]["parameters"]["options"]["responseCode"] == 202
             assert workflow["connections"]["Session"]["main"][0][0]["node"] == "Respond Accepted"
             assert workflow["connections"]["Respond Accepted"]["main"][0][0]["node"] == "Poll Job Status"

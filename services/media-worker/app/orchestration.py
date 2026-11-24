@@ -64,20 +64,25 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-def _check_url(value: Any, field: str, errors: list[str]) -> str | None:
-    if value is None:
+def _check_url(value: Any, field: str, errors: list[str], *, required: bool = False) -> str | None:
+    from app.legacy_social_collect import SOCIAL_HOSTS, check_social_url
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if required:
+            errors.append(f"{field}: required")
         return None
     if not isinstance(value, str):
         errors.append(f"{field}: must be a string URL")
         return None
     v = value.strip()
-    if not v:
-        return None
     if len(v) > 2048:
         errors.append(f"{field}: URL too long")
         return None
     try:
         parsed = urllib.parse.urlsplit(v)
+        _ = parsed.port
+        if re.search(r"[\x00-\x20\x7f\\]", v) or "%" in (parsed.hostname or ""):
+            raise ValueError("Invalid URL characters")
     except ValueError:
         errors.append(f"{field}: malformed URL")
         return None
@@ -91,9 +96,21 @@ def _check_url(value: Any, field: str, errors: list[str]) -> str | None:
         errors.append(f"{field}: URLs must not embed credentials")
         return None
     # Normalize: drop fragments, keep path/query.
-    return urllib.parse.urlunsplit(
+    normalized = urllib.parse.urlunsplit(
         (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", parsed.query, "")
     )
+    if field == "website_url":
+        host = parsed.hostname.lower().rstrip(".")
+        if any(host in hosts for hosts in SOCIAL_HOSTS.values()):
+            errors.append(f"{field}: must be a business website URL")
+            return None
+    elif field in ("instagram_url", "facebook_url"):
+        try:
+            check_social_url(field.removesuffix("_url"), normalized)
+        except ValueError as exc:
+            errors.append(f"{field}: {exc}")
+            return None
+    return normalized
 
 
 def validate_intake(payload: Any) -> dict[str, Any]:
@@ -116,12 +133,9 @@ def validate_intake(payload: Any) -> dict[str, Any]:
             job_id = jid
             resume = True
 
-    website_url = _check_url(payload.get("website_url"), "website_url", errors)
-    instagram_url = _check_url(payload.get("instagram_url"), "instagram_url", errors)
-    facebook_url = _check_url(payload.get("facebook_url"), "facebook_url", errors)
-
-    if not resume and not website_url:
-        errors.append("website_url: required (or provide job_id to resume)")
+    website_url = _check_url(payload.get("website_url"), "website_url", errors, required=not resume)
+    instagram_url = _check_url(payload.get("instagram_url"), "instagram_url", errors, required=not resume)
+    facebook_url = _check_url(payload.get("facebook_url"), "facebook_url", errors, required=not resume)
 
     lookback_days = _as_int(payload.get("lookback_days", 365), 365, 1, 366)
     if lookback_days == "invalid":
@@ -278,7 +292,9 @@ def derive_stage(job: Mapping[str, Any], delivery: Mapping[str, Any] | None = No
         stage, detail = "partial_success", str(job.get("error") or "Partial extraction success.")
     elif job_status == "extraction_complete":
         if run_ai:
-            if ai_status == "completed" and ai_record.get("mock") is True:
+            if ai_status == "awaiting_collection_approval":
+                stage, detail = "blocked", "Collection review and a separate named Start AI are required."
+            elif ai_status == "completed" and ai_record.get("mock") is True:
                 stage, detail = "blocked", "Mock curation is available for QA only."
             elif ai_status == "completed":
                 stage, detail = "awaiting_rights_approval", "AI curation completed; awaiting rights approval."
