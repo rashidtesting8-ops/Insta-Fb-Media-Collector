@@ -2,6 +2,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+
 type Action = "approve" | "deny" | "revoke" | "start";
 type Review = {
   job_id: string; revision: number; etag: string; state: string; start_authorized: boolean;
@@ -23,8 +24,8 @@ export default function CollectionReview({ id }: { id: string }) {
   const requestKey = useRef({ signature: "", key: "" });
   const latest = useRef(0);
   const load = useCallback(async () => {
-    const version = ++latest.current;
     setBusy(true);
+    const version = ++latest.current;
     try {
       const res = await fetch(url, { cache: "no-store" });
       const data = await res.json();
@@ -36,7 +37,12 @@ export default function CollectionReview({ id }: { id: string }) {
       if (latest.current === version) { setReview(null); setMessage("Review unavailable."); }
     } finally { if (latest.current === version) setBusy(false); }
   }, [url]);
-  useEffect(() => { void load(); return () => { latest.current++; }; }, [load]);
+  useEffect(() => {
+    let active = true;
+    const fetchPanel = async () => { if (active) await load(); };
+    void fetchPanel();
+    return () => { active = false; latest.current += 1; };
+  }, [load]);
 
   async function decide(action: Action) {
     if (!review || busy) return;
