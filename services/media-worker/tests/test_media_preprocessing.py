@@ -134,7 +134,7 @@ def test_exact_duplicates_grouped_with_explainable_representative(tmp_path):
     group = groups[0]
     assert group["method"] == "exact_sha256"
     assert set(group["member_asset_ids"]) == {"web_0001_aaa", "web_0002_bbb"}
-    assert group["representative_reason"].startswith("representative has the largest pixel area")
+    assert group["representative_reason"].startswith("representative ranked by verified date eligibility")
     reps = [a for a in _by_id(enriched).values() if a.get("representative")]
     assert len(reps) == 1  # deterministic single representative
     both = _by_id(enriched)

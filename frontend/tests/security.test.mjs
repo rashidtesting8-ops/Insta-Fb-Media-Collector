@@ -46,22 +46,45 @@ test("object reader rejects invalid content and streamed overflow", async () => 
   await assert.rejects(readObject(request('{"long":true}'), 4), { status: 413 });
 });
 
+const sourceUrls = {
+  website_url: "https://business.test",
+  instagram_url: "https://www.instagram.com/example/",
+  facebook_url: "https://www.facebook.com/example/",
+};
+
 test("intake goes only to n8n and excludes rights and resume fields", async () => {
   const jobId = "ab".repeat(16);
   const result = await submitIntake(
-    { website_url: "https://business.test", authorization_confirmed: true, job_id: jobId },
+    { ...sourceUrls, authorization_confirmed: true, job_id: jobId },
     "http://n8n:5678", "test-only",
     async (url, init) => {
       assert.equal(url.href, "http://n8n:5678/webhook/pipeline-intake");
       assert.equal(init.headers["X-Pipeline-Key"], "test-only");
       assert.equal(init.redirect, "error");
-      assert.deepEqual(JSON.parse(init.body), { website_url: "https://business.test" });
+      assert.deepEqual(JSON.parse(init.body), sourceUrls);
       return Response.json({ job_id: jobId }, { status: 202 });
     },
   );
   assert.deepEqual(result, { status: 202, body: { job_id: jobId } });
-  const bad = await submitIntake({}, "http://n8n:5678", "test-only", async () => Response.json({ ok: true }));
+  const bad = await submitIntake(sourceUrls, "http://n8n:5678", "test-only", async () => Response.json({ ok: true }));
   assert.equal(bad.status, 502);
+});
+
+test("invalid or missing source URLs never reach n8n", async () => {
+  for (const [field, wrongPlatform] of [
+    ["website_url", sourceUrls.facebook_url],
+    ["instagram_url", sourceUrls.facebook_url],
+    ["facebook_url", sourceUrls.instagram_url],
+  ]) {
+    for (const value of [undefined, null, " ", "invalid", "https://example.test:bad/", wrongPlatform]) {
+      const result = await submitIntake(
+        { ...sourceUrls, [field]: value }, "http://n8n:5678", "test-only",
+        () => assert.fail("Invalid job must not reach n8n"),
+      );
+      assert.equal(result.status, 400);
+      assert.ok(result.body.error.startsWith(field + ":"));
+    }
+  }
 });
 
 test("staging workflow retains intake and status without Drive credentials", () => {
@@ -72,4 +95,16 @@ test("staging workflow retains intake and status without Drive credentials", () 
   for (const branches of Object.values(staging.connections)) {
     for (const branch of branches.main) for (const edge of branch) assert.ok(names.has(edge.node));
   }
+});
+
+test("the optional fixture intake path is loopback-only and fails closed", async () => {
+  const path = "/webhook-test/phase10-exec-pipeline-intake";
+  const neverSend = () => assert.fail("Invalid fixture routing must never send");
+  assert.equal((await submitIntake({}, "http://n8n:5678", "test-only", neverSend, path)).status, 503);
+  assert.equal((await submitIntake({}, "http://127.0.0.1:5679", "test-only", neverSend, "/webhook-test/wrong")).status, 503);
+  const response = await submitIntake(sourceUrls, "http://127.0.0.1:5679", "test-only", async (url) => {
+    assert.equal(url.href, "http://127.0.0.1:5679" + path);
+    return Response.json({ job_id: "fe".repeat(16) }, { status: 202 });
+  }, path);
+  assert.equal(response.status, 202);
 });

@@ -27,6 +27,7 @@ from typing import Any
 from PIL import Image, UnidentifiedImageError
 
 from app.ai.provider import ImagePayload
+from app.publication import date_eligibility, window_bounds
 
 SENDABLE_IMAGE_MIMES = {"image/jpeg", "image/png"}
 DEFAULT_MAX_IMAGE_DIM = 1024
@@ -73,12 +74,17 @@ def select_ai_candidates(
         path = job_dir / candidate
         return path if path.is_file() else None
 
+    bounds = window_bounds(manifest)
     # Pre-partition by honest exclusion reasons
     for item in manifest.get("assets", []):
-        if item.get("extraction_status") not in ("downloaded", "extracted_frame"):
+        if item.get("extraction_status") not in ("downloaded", "duplicate", "extracted_frame"):
             continue
         if item.get("type") == "frame":
             continue  # frames are supplied via their parent video
+        date_state = date_eligibility(item, bounds)
+        if date_state != "in_window":
+            report.excluded.append({"asset_id": item["asset_id"], "reason": date_state})
+            continue
         outcome = _outcome(item)
         if outcome in ("corrupted", "missing_file", "video_probe_failed"):
             report.excluded.append({"asset_id": item["asset_id"], "reason": outcome})

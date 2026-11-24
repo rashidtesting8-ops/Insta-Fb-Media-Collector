@@ -2,6 +2,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import CollectionReview from "./CollectionReview";
 import { api } from "@/lib/api";
 import type { JobRecord, PipelineStatus, Manifest, Curation, Delivery } from "@/lib/types";
 import { curationSelection, isMockCuration } from "@/lib/types";
@@ -78,6 +79,7 @@ export default function JobDetailClient({ id }: { id: string }) {
         <div className="mt-2 text-xs text-slate-500">Progress indicator is stage-based, not a fabricated percentage of work.</div>
       </div>
 
+      <CollectionReview key={id} id={id} />
       <section className="rounded-lg border border-slate-200 bg-white p-4">
         <h2 className="mb-3 font-medium">Source outcomes</h2>
         <pre className="overflow-auto rounded bg-slate-50 p-3 text-xs">{JSON.stringify(job.sources, null, 2)}</pre>

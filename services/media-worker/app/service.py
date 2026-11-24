@@ -25,10 +25,11 @@ from pathlib import Path
 from threading import BoundedSemaphore, Lock
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
+from app.publication import frozen_window, window_bounds
 from app.security import WorkerSecurity
 
 app = FastAPI(title="Pet Grooming Media Worker", version="0.9.0", docs_url=None, redoc_url=None, openapi_url=None)
@@ -64,8 +65,12 @@ def connect() -> sqlite3.Connection:
     return con
 
 
-def store(record: dict[str, Any]) -> None:
+def store(record: dict[str, Any], *, collection_base: int | None = None) -> None:
     with lock, connect() as con:
+        if collection_base is not None:
+            from app.collection_approval import accept
+            con.execute("BEGIN IMMEDIATE")
+            accept(con, DATA_DIR, record, collection_base)
         con.execute(
             "INSERT OR REPLACE INTO jobs (id, payload) VALUES (?,?)",
             (record["job_id"], json.dumps(record)),
@@ -107,8 +112,8 @@ with connect() as _db:
 
 class CreateJobRequest(BaseModel):
     website_url: str = Field(min_length=1, max_length=2048, description="Required pet grooming business website URL")
-    instagram_url: str | None = Field(default=None, description="Optional public Instagram URL")
-    facebook_url: str | None = Field(default=None, description="Optional public Facebook Page URL")
+    instagram_url: str = Field(min_length=1, max_length=2048, description="Required public Instagram URL")
+    facebook_url: str = Field(min_length=1, max_length=2048, description="Required public Facebook URL")
     lookback_days: int = Field(default=365, ge=1, le=366)
     max_selected_images: int = Field(default=30, ge=1, le=200)
     max_selected_videos: int = Field(default=10, ge=1, le=100)
@@ -148,15 +153,13 @@ class CreateJobRequest(BaseModel):
 
     @field_validator("website_url", "instagram_url", "facebook_url")
     @classmethod
-    def validate_url(cls, value: str | None) -> str | None:
+    def validate_url(cls, value: str, info) -> str:
         from app.orchestration import _check_url
 
-        if not value:
-            return value
         errors: list[str] = []
-        normalized = _check_url(value, "source", errors)
-        if errors or normalized is None:
-            raise ValueError("Expected an HTTP(S) URL without credentials")
+        normalized = _check_url(value, info.field_name, errors, required=True)
+        if normalized is None:
+            raise ValueError(errors[0])
         return normalized
 
 
@@ -189,6 +192,19 @@ def status() -> object:
     }
 
 
+@app.post("/named/{action}")
+async def named_action(action: str, request: Request):
+    from app.named_auth import dispatch
+    from starlette.concurrency import run_in_threadpool
+
+    qa = getattr(app.state, "offline_approval_qa", False)
+    if action.startswith("collection-") and not qa:
+        raise HTTPException(404, "Approval adapter unavailable")
+    return await run_in_threadpool(dispatch, DB, action, await request.body(),
+                                  request.headers.get("x-named-assertion", ""),
+                                  request.headers.get("x-named-session", ""), approval_root=DATA_DIR if qa else None)
+
+
 @app.post("/jobs", status_code=202)
 def create_job(req: CreateJobRequest) -> dict[str, Any]:
     with submission_lock:
@@ -196,12 +212,37 @@ def create_job(req: CreateJobRequest) -> dict[str, Any]:
 
 
 def register_job(req: CreateJobRequest) -> dict[str, Any]:
+    named = (req.idempotency_key or "").startswith("named-")
+    if named:
+        from app.named_auth import verify_ticket
+        with connect() as con:
+            if not con.execute("SELECT 1 FROM sqlite_master WHERE name='named_intakes'").fetchone():
+                raise HTTPException(403, "Named authorization denied")
+            submitter = verify_ticket(con, req.model_dump())
     if req.idempotency_key:
         from app.orchestration import find_idempotent_job
 
         existing_id = find_idempotent_job(_all_job_records(), req.idempotency_key)
         if existing_id:
             rec = fetch(existing_id)
+            if named and (rec or {}).get("submitter_principal_id") != submitter:
+                raise HTTPException(403, "Submitter mismatch")
+            if (rec and rec.get("collection_mode") == "recorded_extractor" and rec.get("status") == "interrupted"
+                    and os.environ.get("RECORDED_EXTRACTOR_HANDOFF") == "1"):
+                keys = ("website_url", "instagram_url", "facebook_url")
+                if any(rec.get(key) != getattr(req, key) for key in keys):
+                    raise HTTPException(409, "Recorded retry must preserve the original source URLs")
+                if not slots.acquire(blocking=False):
+                    raise HTTPException(429, "Worker busy; retry later")
+                queued = {**rec, "status": "queued"}
+                try:
+                    store(queued)
+                    executor.submit(_process_job, existing_id, queued)
+                except Exception:
+                    slots.release()
+                    store(rec)
+                    raise
+                return {"job_id": existing_id, "status": "queued", "idempotent_reuse": True}
             return {
                 "job_id": existing_id,
                 "status": (rec or {}).get("status", "queued"),
@@ -210,14 +251,15 @@ def register_job(req: CreateJobRequest) -> dict[str, Any]:
     if not slots.acquire(blocking=False):
         raise HTTPException(429, "Worker busy; retry later")
     job_id = uuid.uuid4().hex
-    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    window = frozen_window(_dt.datetime.now(_dt.timezone.utc))
+    now_iso = window["created_at"]
     payload: dict[str, Any] = {
         "job_id": job_id,
         "status": "queued",
         "website_url": req.website_url,
         "instagram_url": req.instagram_url,
         "facebook_url": req.facebook_url,
-        "lookback_days": req.lookback_days,
+        "lookback_days": 365,
         "max_selected_images": req.max_selected_images,
         "max_selected_videos": req.max_selected_videos,
         "user_selection_notes": req.user_selection_notes,
@@ -228,7 +270,7 @@ def register_job(req: CreateJobRequest) -> dict[str, Any]:
         "run_ai_curation": req.run_ai_curation,
         "business_context": req.business_context,
         "idempotency_key": req.idempotency_key,
-        "created_at": now_iso,
+        **window,
         "updated_at": now_iso,
         "sources": {
             "website": {"status": "queued"},
@@ -236,8 +278,18 @@ def register_job(req: CreateJobRequest) -> dict[str, Any]:
             "facebook": {"status": "queued" if req.facebook_url else "not_requested"},
         },
     }
+    if os.environ.get("RECORDED_EXTRACTOR_HANDOFF") == "1":
+        payload["collection_mode"] = "recorded_extractor"
+    elif os.environ.get("PUBLIC_COLLECTION_CHECKPOINTS") == "1":
+        payload["collection_mode"] = "public_checkpoint"
     try:
-        store(payload)
+        if named:
+            with lock, connect() as con:
+                con.execute("BEGIN IMMEDIATE")
+                payload["submitter_principal_id"] = verify_ticket(con, req.model_dump())
+                con.execute("INSERT INTO jobs VALUES (?,?)", (job_id, json.dumps(payload)))
+        else:
+            store(payload)
         executor.submit(_process_job, job_id, payload)
     except Exception:
         slots.release()
@@ -266,6 +318,11 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
         return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
     try:
+        collection_base = None
+        if getattr(app.state, "offline_approval_qa", False):
+            with connect() as con:
+                collection_base = con.execute("SELECT coalesce(max(revision),0) FROM collection_revisions WHERE job=?",
+                                              (job_id,)).fetchone()[0]
         sources: dict[str, Any] = dict(payload.get("sources") or {})
         sources["website"] = {"status": "running"}
         for platform in ("instagram", "facebook"):
@@ -276,6 +333,31 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
 
         job_dir = Path(DATA_DIR) / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
+
+        mode = payload.get("collection_mode")
+        if mode in ("public_checkpoint", "recorded_extractor"):
+            from app.public_collection import COLLECTION_HOLD, collect_public_job
+
+            if mode == "recorded_extractor":
+                from app.recorded_collection import collect_recorded_job
+
+                flag, config_key, collect = "RECORDED_EXTRACTOR_HANDOFF", "RECORDED_EXTRACTOR_CONFIG", collect_recorded_job
+            else:
+                flag, config_key, collect = "PUBLIC_COLLECTION_CHECKPOINTS", "PUBLIC_COLLECTION_CONFIG", collect_public_job
+            if os.environ.get(flag) != "1":
+                raise ValueError("Checkpoint collection mode is disabled")
+            config_path = os.environ.get(config_key)
+            if not config_path:
+                raise ValueError("Checkpoint collection requires an explicit source configuration")
+            manifest = collect(job_dir, payload, json.loads(Path(config_path).read_text(encoding="utf-8")))
+            store({
+                **payload, "status": "partial_success", "sources": manifest["sources"],
+                "collection_gate": COLLECTION_HOLD, "ai_curation": {"status": COLLECTION_HOLD},
+                "preprocessing": {"status": "not_run"}, "manifest_path": str(job_dir / "manifest.json"),
+                "error": "Public inventory is unverified and held for per-job owner review.",
+                "updated_at": _now(),
+            }, collection_base=collection_base)
+            return
 
         # --- Website source -------------------------------------------------
         website_status: dict[str, Any] = {}
@@ -319,6 +401,7 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
                     max_files=int(payload.get("max_social_files") or 20),
                     lookback_days=int(payload.get("lookback_days") or 365),
                     permission_confirmed=bool(payload.get("social_permission_confirmed")),
+                    window_start_utc=payload.get("window_start_utc"),
                 )
             except Exception as exc:  # noqa: BLE001 — isolate social failures
                 social_result = SocialExtractionResult(
@@ -349,7 +432,7 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
                 website_doc = json.loads(manifest_file.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 website_doc = None
-        if social_sections or website_doc is None:
+        if social_sections or website_doc is None or window_bounds(payload):
             try:
                 merged = merge_social_into_manifest(
                     website_doc,
@@ -357,6 +440,7 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
                     job_id=job_id,
                     lookback_days=int(payload.get("lookback_days") or 365),
                     permission_confirmed=bool(payload.get("social_permission_confirmed")),
+                    collection_job=payload,
                 )
                 # Final guarantee: every manifest asset that claims a file must
                 # exist on disk with a matching hash (Phase 3 acceptance #5).
@@ -383,11 +467,7 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             try:
                 from app.preprocessing import run_media_preprocessing
 
-                cutoff = (
-                    _dt.datetime.now(_dt.timezone.utc)
-                    - _dt.timedelta(days=int(payload.get("lookback_days") or 365))
-                ).date().isoformat()
-                pre = run_media_preprocessing(job_dir, job_id, cutoff_date=cutoff)
+                pre = run_media_preprocessing(job_dir, job_id)
                 preprocessing_record = {
                     "status": pre.status,
                     "images": {
@@ -409,30 +489,8 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             except Exception as exc:  # noqa: BLE001 — preprocessing failure is recorded
                 preprocessing_record = {"status": "failed", "error": str(exc)[:240]}
 
-        if payload.get("run_ai_curation") and manifest_file.is_file():
-            store({**payload, "status": "running", "sources": {**sources, "website": website_status}, "pipeline_stage": "ai_processing", "updated_at": _now()})
-        # --- Phase 5 AI curation (optional; isolated; honest failure) ------
-        ai_record: dict[str, Any] = {"status": "not_requested"}
-        if payload.get("run_ai_curation") and manifest_file.is_file():
-            try:
-                from app.ai.pipeline import run_ai_curation as run_ai
-                from app.ai.provider import AIProviderConfig
-
-                ai_config = AIProviderConfig.from_env()
-                ai = run_ai(
-                    job_dir,
-                    job_id,
-                    business_context=payload.get("business_context") or {},
-                    max_images=int(payload.get("max_selected_images") or 30),
-                    max_videos=int(payload.get("max_selected_videos") or 10),
-                    batch_size=max(1, ai_config.batch_size),
-                )
-                ai_record = ai.as_dict()
-                ai_record["curation_path"] = str(job_dir / "curation.json")
-            except Exception as exc:  # noqa: BLE001 — AI failure is recorded, extraction preserved
-                ai_record = {"status": "failed", "error": str(exc)[:240]}
-        elif payload.get("run_ai_curation"):
-            ai_record = {"status": "failed", "error": "no manifest available for AI curation"}
+        # Intake can request review. Only post-collection dispatch consumes a named Start AI.
+        ai_record = {"status": "awaiting_collection_approval" if payload.get("run_ai_curation") else "not_requested"}
 
         # --- Honest overall status -------------------------------------------
         # NOTE: compute from the SAME merged dict the record stores, otherwise a
@@ -489,8 +547,10 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
             # the job is honestly NOT marked fully complete.
             record["status"] = job_status = "partial_success"
             record["error"] = "AI curation failed or provider unavailable; extraction preserved."
-        store(record)
+        store(record, collection_base=collection_base if manifest_file.is_file() else None)
     except Exception as exc:  # noqa: BLE001 — record failure and keep worker up
+        if isinstance(exc, HTTPException) and exc.status_code == 412:
+            return  # A newer collection publication already won the transaction.
         store(
             {
                 **payload,
@@ -613,6 +673,8 @@ def get_delivery_plan(job_id: str, business_name: str = "") -> dict[str, Any]:
     rec = fetch(job_id)
     if rec is None:
         raise HTTPException(404, "Unknown job")
+    if rec.get("collection_mode") in ("public_checkpoint", "recorded_extractor"):
+        return {"status": "blocked_unverified_collection", "job_id": job_id, "assets": []}
     from app.delivery import build_delivery_plan
 
     return build_delivery_plan(Path(DATA_DIR) / job_id, job_id, business_name)
@@ -623,6 +685,8 @@ def post_delivery_result(job_id: str, payload: dict[str, Any]) -> dict[str, Any]
     rec = fetch(job_id)
     if rec is None:
         raise HTTPException(404, "Unknown job")
+    if rec.get("collection_mode") in ("public_checkpoint", "recorded_extractor"):
+        raise HTTPException(409, "blocked_unverified_collection")
     from app.delivery import build_delivery_plan, finalize_delivery
     job_dir = Path(DATA_DIR) / job_id
     plan = build_delivery_plan(job_dir, job_id, str(payload.get("business_name") or ""))
@@ -692,3 +756,36 @@ def get_manifest(job_id: str) -> dict[str, Any]:
         "assets": [],
         "note": "No manifest generated for this job yet (pre-Phase-2 job, or extraction not finished).",
     }
+
+
+@app.get("/qa/collection/{job_id}/poll")
+def qa_collection_poll(job_id: str):
+    from app.collection_approval import review_state
+    if not getattr(app.state, "offline_approval_qa", False):
+        raise HTTPException(404, "QA adapter unavailable")
+    with connect() as con:
+        con.execute("BEGIN")
+        state = review_state(con, DATA_DIR, job_id)[0]
+        claimed = con.execute("SELECT 1 FROM ai_execution_claims WHERE job=? AND revision=?",
+                              (job_id, state["revision"])).fetchone()
+    return {"job_id": job_id, "state": state["state"], "etag": state["etag"],
+            "start_authorized": state["start_authorized"], "claimed": bool(claimed)}
+
+
+@app.post("/qa/collection/{job_id}/resume")
+def qa_collection_resume(job_id: str, body: dict):
+    from app.ai.pipeline import run_started_curation
+    from app.ai.provider import AIProviderConfig, MockVisionProvider
+    from app.ai_execution import InferenceHeld
+    if not getattr(app.state, "offline_approval_qa", False):
+        raise HTTPException(404, "QA adapter unavailable")
+    if set(body) != {"etag"} or not isinstance(body["etag"], str):
+        raise HTTPException(400, "Expected the observed Start AI etag")
+    consent = getattr(app.state, "offline_processing_consent", {}).get(job_id, {})
+    try:
+        outcome = run_started_curation(DATA_DIR / job_id, job_id, processing_consent=consent,
+                                      start_etag=body["etag"], provider=MockVisionProvider(),
+                                      config=AIProviderConfig(provider="mock"))
+    except InferenceHeld:
+        raise HTTPException(409, "Execution held by worker") from None
+    return {"job_id": job_id, "status": outcome.status, "mock": True}

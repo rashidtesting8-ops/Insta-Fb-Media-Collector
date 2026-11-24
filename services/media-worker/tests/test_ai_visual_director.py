@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("isolated_provider_unit")
 from PIL import Image, ImageFilter
 
 from app.ai.pipeline import run_ai_curation, extract_json_text
@@ -108,10 +110,20 @@ def _video_item(asset_id: str, local_path: str, *, blob: bytes, frames: list[dic
 
 
 def _manifest(items: list[dict]) -> dict:
+    from datetime import datetime
+    from app.publication import frozen_window, publication_evidence
+
+    published = "2026-06-01T12:00:00+00:00"
     return {
         "schema_version": "3.0-unified", "job_id": "job_ai",
         "source_status": "completed", "sources": {}, "counts": {},
-        "coverage": {"issues": []}, "assets": items, "notes": [],
+        "coverage": {"issues": []}, "assets": [
+            {**item, "post_date": published, "date_status": "verified",
+             "publication_evidence": publication_evidence(
+                 published, source_url=item["source_url"], field="datePublished", attribution="test source fixture"
+             )} for item in items
+        ], "notes": [],
+        **frozen_window(datetime.fromisoformat("2026-11-20T12:00:00+00:00")),
     }
 
 

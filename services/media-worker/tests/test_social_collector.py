@@ -271,8 +271,8 @@ def test_facebook_ytdlp_fallback_for_single_video(tmp_path):
     item = result.items[0]
     assert item["type"] == "video"
     assert item["platform"] == "facebook"
-    assert item["date_status"] == "verified"
-    assert item["post_date"].startswith("2026-06-01")
+    assert item["date_status"] == "unknown_date"
+    assert item["post_date"] is None  # upload_date is not a publication instant
     assert item["detail"]["origin"] == "ytdlp_fallback"
     disk = tmp_path / "job_fb_vid" / item["local_path"]
     assert disk.is_file()
@@ -401,7 +401,7 @@ def test_unverified_dates_stay_unknown_in_social_items(tmp_path):
     assert result.status == "completed"
     item = result.items[0]
     assert item["post_date"] is None
-    assert item["date_status"] == "unknown"
+    assert item["date_status"] == "unknown_date"
 
 
 def test_ytdlp_fallback_needs_single_item_url_pattern():
@@ -545,10 +545,7 @@ def test_partial_social_success_files_plus_gate(tmp_path):
     assert (tmp_path / "job_partial_fb" / item["local_path"]).is_file()
 
 
-def test_date_boundary_old_verified_post_filtered(tmp_path):
-    """Only VERIFIED dates gate the lookback: an in-range dated post is kept,
-    an out-of-range dated post is dropped; undated posts are never filtered
-    by invented dates."""
+def test_old_verified_post_is_preserved_for_audit(tmp_path):
 
     def dated(cmd, stage):
         if "--dump-json" in cmd:
@@ -587,21 +584,12 @@ def test_date_boundary_old_verified_post_filtered(tmp_path):
         runner=_mk_runner(dated, []),
         enable_fallbacks=False,
     )
-    assert result.files_added == 1
-    item = result.items[0]
-    assert item["post_date"] is not None and item["date_status"] == "verified"
-    # the out-of-range verified post never reaches the manifest
-    old_sha = hashlib.sha256(_png_bytes_alt()).hexdigest()
-    assert all(i["sha256"] != old_sha for i in result.items)
-    # and it was never relocated into the job folder
-    job_ig_dir = tmp_path / "job_boundary" / "instagram"
-    listed = [p.name for p in job_ig_dir.iterdir()] if job_ig_dir.is_dir() else []
-    assert len(listed) == 1  # only the in-range asset was relocated
+    assert result.files_added == 2
+    assert {item["post_date"][:4] for item in result.items} == {"2024", "2026"}
+    assert all(item["date_status"] == "verified" for item in result.items)
 
 
-def test_duplicate_fallback_posts_deduped(tmp_path):
-    """Identical media delivered twice by a fallback is stored once and the
-    duplicate is counted, not silently duplicated."""
+def test_duplicate_fallback_posts_keep_publication_provenance(tmp_path):
 
     def dup_instaloader(cmd, stage):
         for day, short in ((1, "aaa111"), (2, "bbb222")):
@@ -626,10 +614,12 @@ def test_duplicate_fallback_posts_deduped(tmp_path):
         enable_fallbacks=True,
     )
     assert result.status == "partial_success"
-    assert result.files_added == 1
+    assert result.files_added == 2
     assert result.duplicates == 1
     shas = [i["sha256"] for i in result.items]
-    assert len(set(shas)) == len(shas)
+    assert len(set(shas)) == 1
+    assert len({item["post_date"] for item in result.items}) == 2
+    assert len({item["source_url"] for item in result.items}) == 2
 
 
 def test_coverage_metadata_records_bounded_sample(tmp_path):

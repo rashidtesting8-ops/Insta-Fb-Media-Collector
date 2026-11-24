@@ -23,6 +23,8 @@ reported as partial.
 from __future__ import annotations
 
 import json
+import os
+from contextlib import nullcontext
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -42,6 +44,7 @@ from app.ai.provider import (
     BudgetExceededError,
     ImagePayload,
     MockVisionProvider,
+    OpenAICompatibleProvider,
     UsageTracker,
     VisionProvider,
     build_provider,
@@ -55,6 +58,8 @@ from app.ai.schemas import (
     breakdown_matches_score,
 )
 from app.manifest import atomic_write_json
+from app.publication import date_eligibility, window_bounds
+from app import ai_execution
 
 HERO_MAX = 3
 _JSON_FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$")
@@ -226,6 +231,16 @@ def _truncate_to_limits(
     return response, warnings
 
 
+def run_started_curation(job_dir, job_id, *, processing_consent, start_etag, **options):
+    """Internal post-collection dispatch. No intake body supplies consent or ledger location."""
+    with ai_execution.execution(job_dir, job_id, processing_consent, start_etag) as staging:
+        result = run_ai_curation(staging, job_id, **options)
+        with ai_execution.publication():
+            if result.mode_b is not None and (staging / "curation.json").is_file():
+                os.link(staging / "curation.json", Path(job_dir) / "curation.json")
+            return result
+
+
 def run_ai_curation(
     job_dir: str | Path,
     job_id: str,
@@ -240,11 +255,20 @@ def run_ai_curation(
     tracker: UsageTracker | None = None,
     max_image_dim: int | None = None,
     max_image_bytes: int | None = None,
+    validated_mode_a: ModeAResponse | None = None,
 ) -> AICurationResult:
     job_dir = Path(job_dir)
     manifest_path = job_dir / "manifest.json"
     result = AICurationResult(job_id=job_id, status="failed")
+    try:
+        ai_execution.require_pipeline(job_dir, job_id)
+    except ai_execution.InferenceHeld as exc:
+        result.errors.append(str(exc))
+        return result
     business_context = business_context or {}
+    raw_manifest = manifest_path.read_bytes() if manifest_path.is_file() else b""
+    ai_execution.check_inputs(raw_manifest)
+    manifest = json.loads(raw_manifest) if raw_manifest else None
 
     cfg = config or AIProviderConfig.from_env()
     max_image_dim = max_image_dim if max_image_dim is not None else cfg.max_image_dim
@@ -269,14 +293,19 @@ def run_ai_curation(
     result.mock = isinstance(provider, MockVisionProvider)
     tracker = tracker or UsageTracker(cfg)
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest is None:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    bounds = window_bounds(manifest)
     manifest_ids = {
         a["asset_id"]: a
         for a in manifest.get("assets", [])
-        if a.get("extraction_status") in ("downloaded", "extracted_frame")
+        if a.get("extraction_status") in ("downloaded", "duplicate") and date_eligibility(a, bounds) == "in_window"
     }
 
     selection = select_ai_candidates(manifest, job_dir, max_assets=max_assets)
+    allowed = {c.asset["asset_id"] for c in selection.candidates} | set(selection.inherited)
+    ai_execution.check_inputs(raw_manifest, allowed)
+    manifest_ids = {aid: asset for aid, asset in manifest_ids.items() if aid in allowed}
     for exc in selection.excluded:
         result.warnings.append(f"excluded {exc['asset_id']}: {exc['reason']}")
     for member, rep in selection.inherited.items():
@@ -286,7 +315,7 @@ def run_ai_curation(
 
     candidates: list[Candidate] = selection.candidates
     if cfg.bounded_acceptance and (
-        len(manifest_ids) != 1 or len(candidates) != 1 or candidates[0].kind != "image"
+        len(manifest.get("assets", [])) != 1 or len(candidates) != 1 or candidates[0].kind != "image"
     ):
         result.errors.append("Bounded acceptance requires exactly one eligible image in the manifest")
         return result
@@ -295,12 +324,21 @@ def run_ai_curation(
         result.errors.append("no AI-ready assets (all excluded, corrupted, or unavailable)")
         return result
 
+    if cfg.mode_b_only != (validated_mode_a is not None):
+        result.errors.append("MODE B-only recovery requires a validated MODE A checkpoint")
+        return result
+    if validated_mode_a is not None and [
+        (item.asset_id, item.visual_analysis_status) for item in validated_mode_a.items
+    ] != [(candidates[0].asset["asset_id"], "analyzed")]:
+        result.errors.append("Checkpoint analysis does not match the authorized manifest asset")
+        return result
+
     # --- MODE A batches ---------------------------------------------------
-    mode_a_items: list[dict[str, Any]] = []
+    mode_a_items = [item.model_dump() for item in validated_mode_a.items] if validated_mode_a else []
     injection_hits: list[str] = []
     batch_failures = 0
     total_batches = (len(candidates) + batch_size - 1) // max(1, batch_size)
-    for start in range(0, len(candidates), max(1, batch_size)):
+    for start in range(0, 0 if cfg.mode_b_only else len(candidates), max(1, batch_size)):
         batch = candidates[start : start + max(1, batch_size)]
         batch_dicts = [{"asset": c.asset, "kind": c.kind, "frame_timestamps": c.frame_timestamps} for c in batch]
         prompt, hits = build_mode_a_prompt(job_id, batch_dicts)
@@ -334,9 +372,14 @@ def run_ai_curation(
         if cfg.bounded_acceptance and len(payloads) != 1:
             result.errors.append("Could not prepare the one bounded acceptance image")
             return result
-        for attempt in range(cfg.max_retries + 1):
+        for attempt in range(ai_execution.retry_limit(cfg.max_retries) + 1):
             try:
-                completion = provider.complete(prompt, payloads, tracker)
+                with (nullcontext() if isinstance(provider, OpenAICompatibleProvider)
+                      else ai_execution.attempt("A", supplied_ids)):
+                    completion = provider.complete(prompt, payloads, tracker)
+            except ai_execution.InferenceHeld as exc:
+                result.errors.append(str(exc))
+                return result
             except BudgetExceededError as exc:
                 result.errors.append(str(exc))
                 _finalize_unavailable(batch, supplied_ids, mode_a_items)
@@ -349,6 +392,8 @@ def run_ai_curation(
             parsed, problems, score_warnings = _parse_mode_a(completion.text, batch_ids)
             result.warnings.extend(score_warnings)
             if parsed is not None:
+                if cfg.bounded_acceptance and not result.mock:
+                    ai_execution.checkpoint_analysis(parsed, batch_ids, result.model, cfg.api_key, completion.usage)
                 break
             attempt_errors.extend(problems)
         if parsed is None:
@@ -415,12 +460,17 @@ def run_ai_curation(
         max_images=max_images,
         max_videos=max_videos,
         asset_metadata=manifest_ids,
+        compact_output=cfg.bounded_acceptance and cfg.mode_b_max_output_tokens <= 900,
     )
     mode_b: ModeBResponse | None = None
     mode_b_errors: list[str] = []
-    for attempt in range(cfg.max_retries + 1):
+    for attempt in range(ai_execution.retry_limit(cfg.max_retries) + 1):
         try:
-            completion = provider.complete(mode_b_prompt, [], tracker)
+            with (nullcontext() if isinstance(provider, OpenAICompatibleProvider) else ai_execution.attempt("B", [])):
+                completion = provider.complete(mode_b_prompt, [], tracker)
+        except ai_execution.InferenceHeld as exc:
+            result.errors.append(str(exc))
+            return result
         except BudgetExceededError as exc:
             result.errors.append(str(exc))
             break
@@ -549,7 +599,8 @@ def run_ai_curation(
             "overflow_cut": selection.overflow_cut,
         },
     }
-    atomic_write_json(job_dir / "curation.json", envelope)
+    with ai_execution.publication():
+        atomic_write_json(job_dir / "curation.json", envelope)
     result.mode_a_items = mode_a_items
     result.mode_b = curation
     result.status = "completed" if batch_failures == 0 else "partial"

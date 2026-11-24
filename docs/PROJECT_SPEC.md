@@ -1,23 +1,40 @@
 # Pet Grooming AI Media Intelligence Platform — Developer Guide v2.0
 
 **Date:** 20 November 2026  
-**Status:** Approved development architecture / NOT proof that the software has been built  
+**Status:** Approved development architecture with Collection V1.1 requirements. Implementation status is tracked separately.
+
 **Audience:** OpenCode agent, developer, n8n engineer, QA reviewer  
 **Source baseline:** User-supplied `pet-gromming-agent-factory-main (1).zip`  
 **Creative baseline:** Premium Pet Grooming Website Visual Director V2.0  
 **Target:** Any publicly accessible pet grooming business website and publicly visible Facebook/Instagram pages, subject to legitimate access and reuse permissions.
 
-> **North star:** A non-technical operator enters the business website (required), Instagram and Facebook URLs (optional), and an optional selection preference. The platform collects *accessible and permitted* media, records source/coverage evidence, intelligently curates the strongest real pet grooming photography and videos, and delivers approved selected originals to a business-named Google Drive folder. The operator sees accurate live progress and the final folder link.
+> **North star:** A non-technical operator enters the business website, Instagram and Facebook URLs. The platform collects accessible and permitted images and videos published in the preceding 365 days, verifies coverage, checks quality and removes duplicates before Groq selection, and delivers only approved selections.
 
 ## 01 — Product scope and hard boundaries
 
-**Inputs:** website URL; Instagram profile URL (optional); Facebook Page URL (optional); lookback=365 days by default; desired maximum images/videos; optional user creative notes; permission/rights review status. The master Creative Director V2.0 prompt is a versioned project asset, **not a text box that end users replace**.
+**Inputs** include the required website, Instagram profile and Facebook Page URLs, desired maximum selected images and videos, optional creative notes, and permission and rights review status. Selection limits apply after collection. The master Creative Director V2.0 prompt remains versioned.
+
+### Collection V1.1 — OWNER CONFIRMED
+
+1. All three source URLs are mandatory.
+2. Collect images and videos published in the 365 days preceding each job run, subject to legitimate access and collection permissions.
+3. Incomplete or unverified collection can proceed to Groq selection only with explicit owner approval for that job.
+4. Quality checks and deduplication precede Groq selection.
+5. Final selection and delivery follow the Complete Project Flow Infographic and existing rights controls. Partial-collection approval leaves per-asset rights status and delivery eligibility unchanged.
+
+**Milestone 1 implementation.** New submissions require all three source URLs at the dashboard and worker. Canonical n8n intake delegates validation to the authenticated worker validator and returns HTTP 400 on invalid input before job creation. Direct worker creation rejects invalid input with HTTP 422. The new requirement applies to new jobs. Trusted resume by existing job ID remains available without resupplying source URLs. The existing social permission gate still governs whether collection can run.
 
 **Outputs:** source-separated original local media, metadata/coverage manifests, image and video analysis, ranked final selection, selected original asset IDs, permission review flags, Google Drive business folder, transfer report, job status/history, machine-readable errors.
 
 **Out of scope for the media-only MVP:** generating a new website; publishing HTML or a GHL site; private profile access; CAPTCHA or account-checkpoint bypass; scraping media unavailable to a normal permitted viewer; guaranteeing every post from the last year; assigning ownership/copyright rights based solely on public visibility.
 
-**Critical distinction:** On social posts, apply the 365-day rule using trustworthy publication timestamps, record unknown timestamps explicitly, and do not trust a `--date-after` early-exit alone because pinned/non-chronological posts may exist. Website asset dates frequently cannot be established: store `date_unknown` and do not invent a publication date.
+**Milestone 2 date policy — OWNER CONFIRMED.** Use UTC backend timestamps. Store original job creation as `created_at` and `window_end_utc`. Set `window_start_utc` exactly 365 × 24 hours earlier. Both endpoints are inclusive. Retries of an existing job, resume and status reads preserve the stored window. The existing idempotency expiration still applies to new submissions. Historical records without a frozen window remain readable.
+
+**Milestone 2 implementation.** The manifest stores attributable publication evidence, original timestamp and offset where supplied, and normalized UTC separately from capture time. Website evidence comes from an unambiguous media-specific JSON-LD `datePublished` matched to `contentUrl`. Social evidence requires an unambiguous matched post record or extractor sidecar. Positional matches, naive dates, upload dates and capture times do not qualify. Unknown dates appear in the manifest’s `unknown_date_review` list. Out-of-window media remains available for audit. Both are excluded from automatic AI, as are jobs without a verified frozen window. The guarded adapter applies the same rule. The unpublished standalone synthetic fixture has no publication evidence and cannot be sent by the acceptance runner under this rule.
+
+**Proposed details for final owner review.** Coverage includes website galleries and videos, Instagram feed posts, carousels, Reels and accessible Stories, and Facebook posts, albums, photos, videos and Reels. Only calculate a coverage percentage against a trustworthy independent inventory. Otherwise display **Unknown** for the percentage.
+
+**USER INPUT REQUIRED.** Confirm the proposed content list (including expired Stories and off-site embeds), acceptable inventory evidence for each source and how manual review of unknown dates is resolved. Supply the three authorized pilot URLs, available CMS/platform inventories or supported access, and permissions for collection, retention and later external processing. Confirm the owner approval mechanism and handling of stale approvals after resume or inventory changes, and agree resource, retention and cost limits.
 
 **Quality bar:** An excellent but unrelated image is not acceptable. Never fabricate a founder portrait, service offered, before/after pair, animal identity, or salon location. Visual selection is separate from legal permission to republish.
 
@@ -209,6 +226,22 @@ Within n8n use `http://collector:8787/health`; verify before adding any scraping
 5. **FFmpeg:** worker produces sample frames from videos, records timestamps and duration. Do not claim full-video review from a thumbnail.
 6. **Fail safely:** record `not_accessible`, `permission_required`, `rate_limited`, `date_unknown`, `partial_success`, `unsupported_url`, or `source_failed` with evidence.
 
+**V1.1 required capabilities.** Follow permitted historical pagination and persist per-source checkpoints, page or cursor progress, stable post and attachment identities, stop reasons, and verified file checksums. Enumerate carousel and album children separately. Preserve original files, source URLs, publication timestamps and collection metadata. A lone old or pinned post cannot establish the cutoff. Reconcile expected items against collected, duplicate, out-of-window, missing, blocked and failed items. Record verified coverage only when the permitted historical boundary is established and every in-scope attachment is accounted for as present and verified. A cap, access gate, unresolved failure or unknown boundary cannot establish complete coverage.
+
+**Remaining implementation gaps.** The website crawler follows bounded HTML links. The social extractors yield bounded samples, lack verified historical pagination checkpoints and an independent attachment inventory, and have observed anonymous access gaps. The AI path enforces date eligibility. Verified coverage and per-job partial approval remain separate, unimplemented gates. See the [Phase 10 acceptance matrix](PHASE_10_LOCALHOST_QA_MATRIX.md) for the V1.1 acceptance baseline.
+
+**Milestone 3A offline implementation.** The opt-in checkpoint engine stores the original frozen window, source identity, cursor, discovered pages or posts, attachment identities and transfer receipts in a job-local `collection/` directory. The engine commits a page and its continuation together. The injected website adapter discovers permitted sitemap indexes, archive links and explicit next-page links. Simulated social listings use the same interface with separate post and attachment IDs. Thumbnail and missing-child records remain distinct from downloadable media. An interrupted transfer resumes only when the adapter confirms the same revision and range, or restarts from byte zero. File publication is an atomic rename after length and checksum checks, with recovery from a saved checksum receipt. Local checksums are recorded even when a fixture supplies no independent source digest.
+
+M3A uses explicit fixture budgets and an injected permission policy. It is outside the normal worker job path. Listing exhaustion alone leaves coverage unknown, and recorded gaps leave it incomplete. Existing collectors still run their bounded paths. M3B requires owner-approved sources, access methods, content scope, inventories and operating budgets before wiring a real transport or validating platform coverage.
+
+**Milestone 3B-A fixture worker entry point.** From the worker directory, run `python -m app.fixture_collection RECORDING.json OUTPUT_ROOT`. Supply a recording marked `fixture_only`, a `fixture-...` job ID with its original frozen M2 timestamps, per-source budgets, recorded website documents and robots policy, recorded social pages with explicit cursors and child IDs, and inline binary fixtures. A repeated command for the same marked job and window reopens its checkpoint. The worker writes `collection/fixture-manifest.json` under that fixture job. It records source URLs, asset IDs, publication evidence, cursor outcomes and unknown-date review entries in the existing manifest shape. It never enters normal job intake, publishes a normal job manifest or invokes AI or delivery. Fixture budgets do not establish live operating limits.
+
+**M3B-B default-off integration.** The worker can opt into the checkpoint path using operator-configured source URLs, approved origins and explicit budgets. It connects guarded website discovery and downloads and accepts local public social snapshots without launching an extractor. Unverified collection is held before AI and delivery. The [Lily’s Club pilot](M3B_B_PUBLIC_PILOT.md) has designated URLs and still requires live collection approval, source inventory evidence and operating limits. The M4 owner-approval requirement remains separate.
+
+**M3B-C offline extractor handoff.** The same authenticated worker job endpoint can enter a recorded-only mode via operator-set `RECORDED_EXTRACTOR_HANDOFF=1` and `RECORDED_EXTRACTOR_CONFIG` pointing to local JSON explicitly marked `offline_only`. All three URLs remain mandatory and the configuration must match each one. Recorded website documents and binary fixtures are local. Instagram accepts gallery-dl URL records and Instaloader post sidecars. Facebook accepts gallery-dl URL records and yt-dlp video info records. The mode takes precedence over the public HTTP flag and cannot use HTTP or launch an extractor. An interrupted recorded job can reuse its idempotency key within the existing retry window, with its original URLs, job ID and frozen UTC window.
+
+Each recording identifies its extractor and profile. Continuations and child expectations retain source attribution. An unattributed token, child count or generic extractor date does not establish pagination, a missing attachment or a verified publication instant. Asset outcomes and source issues are separate from overall coverage, which stays unknown without an independent inventory. Duplicate checksums keep separate provenance and rights flags. Recorded jobs stay held at both curation and delivery. [Pilot and remaining live prerequisites](M3B_B_PUBLIC_PILOT.md)
+
 **Never** construct a shell command from untrusted URL text. Use `subprocess.run([binary, option, ..., validated_url], timeout=...)`, a strict allowlist of domains and executable paths, and resource limits. Validate URLs after redirects and DNS resolution to block localhost/private IP SSRF. Publicly visible does not imply copyright permission.
 
 ## 08 — Job API and manifest contracts
@@ -229,7 +262,7 @@ Within n8n use `http://collector:8787/health`; verify before adding any scraping
 
 **Immediate response:** `{"job_id":"<uuid>","status":"queued"}`. Return promptly; do not hold a browser HTTP request open while downloading hundreds of files. n8n internally calls existing/adapted worker endpoints; inspect real routes before designing incompatible paths.
 
-**State machine:** `queued -> validating -> extracting -> deduplicating -> ai_batch_analysis -> ai_final_selection -> awaiting_rights_review (if necessary) -> uploading -> completed`. Terminal variants `partial_success`, `failed`, `cancelled`. Distinguish source-status from overall job-status.
+**Required state transitions.** Validate all three URLs before starting collection. After collection, record each source as verified complete, incomplete, blocked or coverage unknown. For incomplete, blocked or unverified collection, enter `awaiting_partial_collection_approval` and keep Groq disabled. An explicit owner decision tied to the job, coverage evidence and eligible subset can record `partial_collection_approved` or `partial_collection_declined`. Declined or pending jobs issue no Groq request. Approved partial jobs retain their incomplete coverage status. Eligible jobs proceed through quality checks and deduplication, Groq batch analysis and final selection, independent per-asset rights review, and approved delivery. Keep source coverage distinct from job status and delivery outcome.
 
 **Sample media manifest item:**
 
@@ -274,7 +307,7 @@ Reject illegal paths (absolute outside the mounted root, `..` traversal, symlink
 
 **WF01 Intake & Job Registration**
 `Webhook (POST) -> validate/normalize fields -> create job in durable state -> trigger WF02 -> Respond to Webhook(job_id)`.
-Acceptance: 3 URL inputs (website required) and prompt preferences validated, immediate response, no duplicate jobs on retry without intended behavior.
+Acceptance requires all three correct source URL types and validated prompt preferences. Reject each missing, invalid or wrong-platform URL before queueing. Return promptly for valid intake and preserve intended idempotency.
 
 **WF02 Extract & Prepare Media**
 `Execute Workflow Trigger / HTTP -> Worker start API -> check/poll worker status without busy loops -> read manifest -> dedupe/quality frame prep -> update state -> trigger WF03`.
@@ -315,7 +348,7 @@ For a repeat run, locate the business folder and reuse it; create a new dated re
 
 ## 12 — Frontend specification
 
-**Primary screen (nontechnical):** website input; Instagram/Facebook optional; auto-detected social links shown for confirmation (not silently trusted); 365-day selector; maximum images/videos; optional additional creative instructions; Start button; job progress and source-specific errors; selected image/video previews; Google Drive link; recent jobs/history; Retry button.
+**Primary screen** requires website, Instagram and Facebook URLs and shows the rolling 365-day scope. Show auto-detected links for confirmation, selection limits, optional creative instructions, per-source progress and stop reasons, coverage and partial-approval status, selected previews, the Drive link and job history.
 
 **No raw credentials in browser.** Frontend should use a server-side proxy/API route to the protected n8n webhook. The `/api/jobs` response returns job ID immediately. UI displays `queued`, `collecting website`, `collecting social`, `analyzing`, `uploading`, `completed`, or `partial` truthfully. Don't claim 365-day complete when sources are inaccessible.
 
@@ -329,11 +362,11 @@ For a repeat run, locate the business folder and reuse it; create a new dated re
 | M1 | Docker health and shared mount | Both containers start; n8n HTTP calls worker using service DNS; n8n reads permitted mount |
 | M2 | One website download | At least one real permitted media file, manifest with URL/hash/error proof |
 | M3 | Public social source | Downloader success **or** explicit, classified access limitation; never fake success |
-| M4 | 365-day processing | In-range/old/unknown timestamps categorized; pinned/non-chronological cases don't silently vanish |
+| M4 | Rolling 365-day collection across three mandatory sources | Reject each missing or invalid URL. Traverse historical pages through the verified boundary, reconcile individual images and videos and their provenance, handle in-range, old and unknown dates and pinned/out-of-order posts, and resume the same window. Caps, access blocks or missing evidence cannot produce verified complete status. |
 | M5 | Image batch AI | Pixels reach model; score schema valid; no hallucinated IDs |
 | M6 | Video AI | Frames with timestamps analyzed; `thumbnail_only` never marked `full_video_reviewed` |
 | M7 | Drive | Folder created/reused, file IDs verified, retries do not duplicate files |
-| M8 | Full E2E + UI | Job ID, progress, accurate partial failure, curated selection, final Drive link |
+| M8 | Full E2E + UI | Dashboard and worker agree on per-source coverage and job ID. Pending and declined partial jobs make zero Groq calls. Approved partial jobs preserve coverage gaps and run quality checks and deduplication before Groq. Rights-unverified assets cannot be delivered. Verify final selection and delivery against the supplied infographic and rights evidence. |
 
 **Negative tests:** wrong URLs, private/restricted profiles, blocked pages, non-image files, oversized media, disk exhaustion, worker restart, duplicate downloads, invalid AI JSON, hallucinatory asset IDs, expired Google OAuth, duplicate Drive uploads, simultaneous jobs, unsafe redirects, malicious captions. Test each milestone against a controlled or explicitly authorized sample before broader usage.
 

@@ -174,12 +174,12 @@ def test_website_extraction_end_to_end(tmp_path: Path) -> None:
     assert hashlib.sha256(disk.read_bytes()).hexdigest() == downloaded["sha256"]
     assert downloaded["width"] == 320 and downloaded["height"] == 240
     assert downloaded["type"] == "image"
-    assert downloaded["post_date"] is None and downloaded["date_status"] == "unknown"
+    assert downloaded["post_date"] is None and downloaded["date_status"] == "unknown_date"
     assert downloaded["rights_status"] == "unverified"
     assert downloaded["source_page"] and downloaded["source_page"].startswith("http")
 
     duplicate = next(i for i in items if i["extraction_status"] == "duplicate")
-    assert duplicate["local_path"] is None
+    assert duplicate["local_path"] == downloaded["local_path"]
     assert duplicate["detail"] and "same_as" in duplicate["detail"]
 
     # Deterministic disk validation of the whole manifest.
@@ -265,5 +265,5 @@ def test_manifest_holds_unknown_dates_only(tmp_path: Path) -> None:
     manifest = json.loads((job_dir / "manifest.json").read_text(encoding="utf-8"))
     for item in manifest["assets"]:
         assert item["post_date"] is None
-        assert item["date_status"] == "unknown"
+        assert item["date_status"] == "unknown_date"
         assert item["rights_status"] == "unverified"

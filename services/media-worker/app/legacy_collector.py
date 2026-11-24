@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urldefrag, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
+from app.publication import publication_evidence
 
 import requests
 from bs4 import BeautifulSoup, Comment, Tag
@@ -359,6 +360,8 @@ def response_get(
     stream: bool = False,
     resolver: ResolverFn | None = None,
     connector: ConnectorFn | None = None,
+    url_policy=None,
+    headers=None,
 ) -> requests.Response:
     """Fetch URL with manual redirect following and full SSRF/rebinding checks on every hop."""
     _ensure_safe_session(
@@ -370,12 +373,15 @@ def response_get(
     current_url = url
     for _ in range(MAX_REDIRECT_HOPS):
         safe_url(current_url, allow_private=allow_private)
+        if url_policy is not None:
+            url_policy(current_url)
         response = session.get(
             current_url,
             timeout=(7, 18),
             stream=stream,
             allow_redirects=False,
             proxies={},
+            **({"headers": headers} if headers is not None else {}),
         )
         if response.status_code in (301, 302, 303, 307, 308):
             nxt = response.headers.get("Location")
@@ -404,6 +410,8 @@ def robots_allowed(
     cache: dict[str, RobotFileParser | bool | None],
     *,
     allow_private: bool = False,
+    url_policy=None,
+    response_policy=None,
 ) -> bool:
     p = urlparse(url)
     origin = f"{p.scheme}://{p.netloc}"
@@ -412,9 +420,11 @@ def robots_allowed(
         rp.set_url(origin + "/robots.txt")
         try:
             r = response_get(
-                session, origin + "/robots.txt", allow_private=allow_private, stream=True
+                session, origin + "/robots.txt", allow_private=allow_private, stream=True, url_policy=url_policy
             )
             try:
+                if response_policy is not None:
+                    response_policy(r)
                 if r.status_code in (401, 403) or r.status_code >= 500:
                     cache[origin] = False  # inaccessible / temporarily unavailable: do not crawl
                 elif r.status_code in (404, 410):
@@ -468,7 +478,7 @@ def _attr_str(value: Any) -> str:
     return str(value or "")
 
 
-def grab_media(soup: BeautifulSoup, page_url: str) -> list[dict[str, str]]:
+def grab_media(soup: BeautifulSoup, page_url: str) -> list[dict[str, Any]]:
     found: list[dict[str, str]] = []
     keys = ("src", "data-src", "data-lazy-src", "data-original", "data-image", "poster")
     for tag in soup.find_all(["img", "source", "video", "a", "meta"]):
@@ -510,6 +520,31 @@ def grab_media(soup: BeautifulSoup, page_url: str) -> list[dict[str, str]]:
                 found.append(
                     {"url": url, "source_page": page_url, "alt": "", "discovery": "inline-css"}
                 )
+    dates: dict[str, list[dict]] = {}
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.get_text())
+        except (ValueError, RecursionError):
+            continue
+        pending = data if isinstance(data, list) else [data]
+        for item in list(pending):
+            if isinstance(item, dict) and isinstance(item.get("@graph"), list):
+                pending.extend(item["@graph"])
+        for item in pending:
+            if not isinstance(item, dict) or item.get("@type") not in ("ImageObject", "VideoObject"):
+                continue
+            content = item.get("contentUrl")
+            if not isinstance(content, str):
+                continue
+            url = candidate_url(content, page_url)
+            evidence = publication_evidence(item.get("datePublished"), source_url=page_url,
+                                            field="datePublished", attribution="JSON-LD exact contentUrl")
+            if url and evidence:
+                dates.setdefault(url, []).append(evidence)
+    for asset in found:
+        matches = dates.get(asset["url"], [])
+        if len({match["timestamp_utc"] for match in matches}) == 1:
+            asset["publication_evidence"] = matches[0]
     return found
 
 
@@ -633,7 +668,8 @@ def download_one(
                 return {**base, "status": "invalid_image"}
         sha = hashlib.sha256(blob).hexdigest()
         if sha in seen_sha:
-            return {**base, "status": "duplicate", "same_as": seen_sha[sha], "sha256": sha}
+            return {**base, "status": "duplicate", "same_as": seen_sha[sha], "sha256": sha,
+                    "dimensions": dimensions, "bytes": len(blob), "mime": ctype}
         source_hint = Path(unquote(urlparse(res.url).path)).stem
         fname = slugify(str(candidate.get("alt", "")) or source_hint)[:36] + "-" + sha[:12] + ext
         out = folder / fname
@@ -715,7 +751,7 @@ def collect(
     )
     queue: deque[str] = deque([site_url])
     seen_pages: set[str] = set()
-    candidates: dict[str, dict[str, str]] = {}
+    candidates: dict[tuple[str, str | None], dict[str, Any]] = {}
     pages: list[dict[str, Any]] = []
     social: dict[str, list[str]] = {"instagram": [], "facebook": []}
     problems: list[dict[str, str]] = []
@@ -768,7 +804,8 @@ def collect(
             )
             media = grab_media(soup, res.url)
             for m in media:
-                candidates.setdefault(m["url"], m)
+                evidence = m.get("publication_evidence")
+                candidates.setdefault((m["url"], evidence["source_url"] if evidence else None), m)
             links: list[str] = []
             for a in soup.select("a[href]"):
                 target = candidate_url(_attr_str(a["href"]), res.url)

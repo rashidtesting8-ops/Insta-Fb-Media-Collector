@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/srv
 
 # ffmpeg for Phase 2 frame extraction; ca-certificates for outbound HTTPS.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates libsodium23 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN useradd --create-home --shell /bin/bash appuser
 COPY app ./app
 COPY tests ./tests
+COPY scripts/named_bootstrap.py ./scripts/named_bootstrap.py
 RUN chown -R appuser:appuser /srv
 USER appuser
 

@@ -345,7 +345,7 @@ def run_media_preprocessing(
 
     for item in manifest.get("assets", []):
         status = str(item.get("extraction_status") or "")
-        if status not in ("downloaded", "extracted_frame"):
+        if status not in ("downloaded", "extracted_frame") and not (status == "duplicate" and item.get("local_path")):
             continue  # honest per-item failure rows carry no file to analyze
         disk = _resolve(job_dir, item.get("local_path"))
         if disk is None or not disk.is_file():
@@ -359,7 +359,7 @@ def run_media_preprocessing(
 
         # Date categorization applies to every downloaded asset with a file
         # (verified timestamps only; never inferred from capture time).
-        item["date_category"] = _date_category(item, cutoff_date)
+        item["date_category"] = item.get("date_eligibility") or _date_category(item, cutoff_date)
 
         if ext in _VIDEO_EXTS:
             _process_video(
@@ -609,9 +609,9 @@ def _make_group(
     for aid in members:
         asset = by_id.get(aid, {})
         area = (asset.get("width") or 0) * (asset.get("height") or 0)
-        ranked.append((area, int(asset.get("bytes") or 0), aid))
+        ranked.append((asset.get("date_eligibility") == "in_window", area, int(asset.get("bytes") or 0), aid))
     ranked.sort(reverse=True)
-    rep = ranked[0][2]
+    rep = ranked[0][3]
     for aid in members:
         asset = by_id.get(aid)
         if asset is not None:
@@ -621,9 +621,9 @@ def _make_group(
         result.exact_duplicate_groups += 1
     else:
         result.perceptual_duplicate_groups += 1
-    rep_area = ranked[0][0]
+    rep_area = ranked[0][1]
     reason = (
-        f"representative has the largest pixel area ({rep_area} px²); "
+        f"representative ranked by verified date eligibility and pixel area ({rep_area} px²); "
         "tie-breaks: larger file bytes, then asset_id order"
     )
     group = {

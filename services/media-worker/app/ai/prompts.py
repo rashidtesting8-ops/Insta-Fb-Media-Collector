@@ -12,8 +12,9 @@ sanitizer).
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, get_args
 
+from app.ai.schemas import Category
 from app.legacy_collector import sanitize_prompt_injection
 
 PROMPT_VERSION = "V2.0"
@@ -107,6 +108,12 @@ select fewer than quota if excellent assets are insufficient. Only select
 assets that actually appear in the supplied validated analyses. Do not
 claim visual inspection of anything not supplied."""
 
+_MISSING_ASSET_RULE = (
+    "\nmissing_assets[].category must be one of: " + ", ".join(get_args(Category)) + ". "
+    'Example: {"missing_assets":[{"category":"salon_facilities","note":"No salon photos supplied."}]}. '
+    "Never invent a category or force a match. If no category fits, keep the limitation in "
+    "final_quality_assessment.weaknesses and omit that entry from missing_assets."
+)
 _MODE_B_DIRECTIVE = """\
 You are the Pet Grooming Visual Director V2.0. Curate from the validated
 analyses only. Never invent assets, business facts, identities or dates.
@@ -198,6 +205,7 @@ def build_mode_b_prompt(
     max_images: int,
     max_videos: int,
     asset_metadata: dict[str, dict[str, Any]] | None = None,
+    compact_output: bool = False,
 ) -> str:
     verified: dict[str, Any] = {}
     for key in ("business_name", "business_type", "location", "services", "brand_notes", "visual_preferences"):
@@ -239,5 +247,13 @@ def build_mode_b_prompt(
         f"{json.dumps(evidence, ensure_ascii=False, separators=(',', ':'))}\n"
         "```\n\n"
         f"{_MODE_B_FIELDS}"
+        f"{_MISSING_ASSET_RULE}"
     )
+    if compact_output:
+        prompt += (
+            "\nKeep every required field. Return minified JSON with no extra text. "
+            "Use one brief phrase per text field, one short entry per required list, "
+            "and [] for categories without evidence. For one still image use at most "
+            "one placement, no pairs or videos, and no duplicated commentary."
+        )
     return prompt
