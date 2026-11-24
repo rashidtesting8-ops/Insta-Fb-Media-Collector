@@ -2,13 +2,18 @@ import { readFile, writeFile, mkdtemp } from "node:fs/promises";
 import { spawnSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { makeCanonicalQa, workflowId } from "../canonical-qa-workflow.mjs";
+import { workflowId } from "../canonical-qa-workflow.mjs";
+import { makeApprovalE2eQa } from "./approval-e2e-workflow.mjs";
 import { fixtureKeys, makeProjectExecution } from "./project-execution.mjs";
+import { createDiagnostics } from "./qa_diagnostics.mjs";
 
 const dir = await mkdtemp(join(tmpdir(), "pgm-qa-n8n-"));
 const canonical = JSON.parse(await readFile(new URL("../07-pipeline-orchestration.json", import.meta.url)));
 const loopback = process.env.PGM_QA_LOOPBACK === "1";
-const workflow = loopback ? await makeProjectExecution() : makeCanonicalQa(canonical);
+const diagnostics = createDiagnostics("n8n", loopback && !process.env.PGM_QA_DIAGNOSTICS_ROOT
+  ? { root: join(tmpdir(), "pgm-qa-diagnostics") }
+  : {});
+const workflow = loopback ? await makeProjectExecution() : makeApprovalE2eQa(canonical);
 const admin = { id: "fixtureWorkerKey", name: "Fixture worker key", type: "httpHeaderAuth",
   data: { name: "x-api-key", value: "fixture-admin" } };
 const intake = { id: "fixtureIntakeKey", name: "Fixture intake key", type: "httpHeaderAuth",
@@ -35,13 +40,22 @@ await writeFile(workflowPath, JSON.stringify(workflow));
 try {
   for (const args of [["import:credentials", "--input=" + credentialsPath],
     ["import:workflow", "--input=" + workflowPath], ["publish:workflow", "--id=" + (loopback ? workflow.id : workflowId)]]) {
+    const label = "n8n " + args[0];
+    diagnostics.logEvent("n8n_command", { command: label, status: null });
     const result = spawnSync("n8n", args, { stdio: "inherit" });
+    diagnostics.logEvent("n8n_command_result", { command: label, status: result.status });
     if (result.status !== 0) throw new Error("Disposable n8n fixture setup failed");
   }
+  diagnostics.recordStage("n8n_workflow_published", {
+    id: loopback ? workflow.id : workflowId,
+    name: workflow.name,
+    node_count: workflow.nodes.length,
+  });
 } finally {
   const { unlink } = await import("node:fs/promises");
   await unlink(credentialsPath);
 }
+diagnostics.recordStage("n8n_server_starting", {});
 const n8n = spawn("n8n", ["start"], { stdio: "inherit" });
 process.on("SIGTERM", () => n8n.kill("SIGTERM"));
 n8n.on("close", (code) => { process.exitCode = code ?? 1; });
