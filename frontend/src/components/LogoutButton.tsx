@@ -1,6 +1,7 @@
 "use client";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { LogoutIcon } from "@/components/Icons";
 
 export default function LogoutButton({ className = "" }: { className?: string }) {
   const router = useRouter();
@@ -30,10 +31,11 @@ export default function LogoutButton({ className = "" }: { className?: string })
       onClick={onLogout}
       className={
         className ||
-        "w-full rounded border border-slate-300 px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+        "flex w-full items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-left text-sm font-medium text-[#D7CFC5] transition hover:bg-white/10 hover:text-white disabled:opacity-50"
       }
     >
-      {busy ? "Signing out…" : "Sign out"}
+      <LogoutIcon className="h-4 w-4 shrink-0 text-[#9A9187]" />
+      <span>{busy ? "Signing out…" : "Sign out"}</span>
     </button>
   );
 }
