@@ -1,7 +1,43 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 const SESSION_SECONDS = 8 * 60 * 60;
-const rates = { login: { limit: 10, times: [] as number[] }, submit: { limit: 20, times: [] as number[] } };
+const rates = {
+  login: { limit: 10, times: [] as number[] },
+  submit: { limit: 20, times: [] as number[] },
+  setup: { limit: 5, times: [] as number[] },
+};
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+const FORWARDING_HEADERS = [
+  "x-forwarded-for",
+  "x-real-ip",
+  "forwarded",
+  "cf-connecting-ip",
+  "true-client-ip",
+  "x-forwarded-host",
+];
+
+export function isLoopbackOrigin(origin: string | undefined): boolean {
+  if (!origin) return false;
+  try {
+    const url = new URL(origin);
+    return origin === url.origin && url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export function isLoopbackHost(host: string | null): boolean {
+  if (!host) return false;
+  return /^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?$/i.test(host.trim());
+}
+
+export function hasForwardingHeaders(headers: Headers): boolean {
+  return FORWARDING_HEADERS.some((name) => {
+    const value = headers.get(name);
+    return value !== null && value.trim().length > 0;
+  });
+}
 
 export function dashboardOrigin() {
   const raw = process.env.DASHBOARD_ORIGIN;

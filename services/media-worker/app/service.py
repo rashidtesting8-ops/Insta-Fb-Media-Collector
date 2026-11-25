@@ -222,12 +222,11 @@ def ready() -> JSONResponse:
 @app.get("/status")
 def status() -> object:
     """Authenticated worker status used by the n8n health probe and dashboard settings."""
-    provider = (os.environ.get("AI_PROVIDER") or "").strip().lower()
-    ai_configured = bool(
-        provider
-        and provider != "disabled"
-        and (provider == "mock" or (os.environ.get("AI_API_KEY") or "").strip())
-    )
+    from app.ai.provider import AIProviderConfig, build_provider
+
+    cfg = AIProviderConfig.from_env()
+    provider_obj, provider_status = build_provider(cfg)
+    ai_configured = provider_obj is not None and provider_status in ("ready", "mock")
     collection_engine = (
         "historical"
         if (
@@ -243,8 +242,8 @@ def status() -> object:
         "auth": "verified",
         "token_configured": True,
         "ai_configured": ai_configured,
-        "ai_provider": provider or None,
-        "ai_model": (os.environ.get("AI_MODEL") or "").strip() or None,
+        "ai_provider": cfg.provider or None,
+        "ai_model": cfg.model or None,
         "m4_approval_enabled": m4_approval_enabled(),
         "collection_engine": collection_engine,
     }
@@ -479,10 +478,32 @@ def execute_started_curation(
 
 @app.post("/named/{action}")
 async def named_action(action: str, request: Request):
-    from app.named_auth import dispatch, verify_admin_action
+    from app.named_auth import dispatch, is_local_bootstrap_peer, verify_admin_action
     from starlette.concurrency import run_in_threadpool
 
+    if action in ("bootstrap", "bootstrap-status"):
+        client_host = request.client.host if request.client else ""
+        if not is_local_bootstrap_peer(client_host, request.headers):
+            raise HTTPException(403, "Browser bootstrap requires local loopback access")
+
     enabled = m4_approval_enabled()
+    if action == "collection-resume":
+        if not enabled:
+            raise HTTPException(404, "Approval adapter unavailable")
+        _actor, body = await run_in_threadpool(
+            verify_admin_action,
+            DB,
+            action,
+            await request.body(),
+            request.headers.get("x-named-assertion", ""),
+            request.headers.get("x-named-session", ""),
+        )
+        import re as _re
+        jid = body.get("job_id") if isinstance(body, dict) else None
+        if set(body) != {"job_id"} or not isinstance(jid, str) or not _re.fullmatch(r"[a-f0-9]{32}", jid):
+            raise HTTPException(400, "Valid 32-hex job_id required")
+        out = await run_in_threadpool(resume_collection, jid)
+        return JSONResponse(out, status_code=202)
     if action == "collection-execute":
         if not enabled:
             raise HTTPException(404, "Approval adapter unavailable")

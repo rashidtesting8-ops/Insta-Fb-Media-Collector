@@ -165,11 +165,11 @@ def run_guarded_groq(job_dir: Path, job: dict, approval: ScopedApproval, key: st
                 atomic_write_json(job_dir / "guarded-groq-attempts.json", attempts)
 
     class ApprovedJpegProvider(OpenAICompatibleProvider):
-        def complete(self, prompt, images, tracker):
+        def complete(self, prompt, images, tracker, **kwargs):
             if images:
                 require(len(images) == 1 and images[0].asset_id == approval.asset_id, "Unexpected image payload")
                 images = [ImagePayload(approval.asset_id, "image/jpeg", pixels, "approved original")]
-            return super().complete(prompt, images, tracker)
+            return super().complete(prompt, images, tracker, **kwargs)
 
     consent = {approval.asset_id: (approval.source_url, approval.sha256)}
     with ai_execution.execution(job_dir, approval.job_id, consent, approval.start_etag) as staging:

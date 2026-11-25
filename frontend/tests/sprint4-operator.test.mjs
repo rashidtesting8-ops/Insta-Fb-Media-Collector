@@ -132,12 +132,16 @@ test("JobDetailClient renders video player, filters raw frames, shows counts+cov
     if (u === `/api/jobs/${ID}`) {
       return jsonResponse({
         job_id: ID,
-        status: "extraction_complete",
+        status: "partial_success",
+        collection_mode: "public_checkpoint",
         website_url: "https://www.lilys-club.co.uk/",
-        sources: { website: { status: "completed" }, facebook: { status: "completed" } },
+        sources: { website: { status: "completed" }, facebook: { status: "partial_success" } },
         preprocessing: { status: "completed" },
         ai_curation: { status: "completed" },
       });
+    }
+    if (u === `/api/jobs/${ID}/resume` && opts?.method === "POST") {
+      return jsonResponse({ job_id: ID, status: "queued", resumed: true }, 202);
     }
     if (u === `/api/jobs/${ID}/status`) {
       return jsonResponse({
@@ -195,13 +199,14 @@ test("JobDetailClient renders video player, filters raw frames, shows counts+cov
     }
     if (u === `/api/jobs/${ID}/curation`) {
       return jsonResponse({
-        ai_envelope: { mock: false, prompt_version: "v2", prompt_sha256: "1234567890abcdef" },
+        ai_envelope: { mock: false, prompt_version: "V2.0", prompt_sha256: "1234567890abcdef" },
         curation: {
-          mode: "B",
+          mode: "FINAL_CURATE",
+          business_visual_identity: { style_summary: "Warm salon aesthetic", recommended_design_direction: "Editorial" },
           selected_asset_ids: ["vid_001", "web_001"],
           rights_review_required_ids: ["vid_001"],
-          best_images: [{ asset_id: "web_001", recommended_section: "hero", hero_rank: 1, overall_score: 94 }],
-          best_videos: [{ asset_id: "vid_001", recommended_section: "feature", overall_score: 88 }],
+          hero_selection: [{ rank: 1, asset_id: "web_001", reason: "Clean portrait", desktop_crop: "16:9", mobile_crop: "4:5", focal_point: { x: 0.5, y: 0.4 } }],
+          video_recommendations: [{ asset_id: "vid_001", recommended_section: "grooming_transformation", quality_score: 88, video_review_status: "frames_reviewed" }],
           analysis_coverage: { mock: false },
         },
       });
@@ -270,10 +275,20 @@ test("JobDetailClient renders video player, filters raw frames, shows counts+cov
   assert.ok(container.textContent.includes("Website · Date unverified"));
   assert.ok(container.textContent.includes("Published 2026-09-12"));
   assert.ok(container.textContent.includes("Hero #1"));
+  assert.ok(container.textContent.includes("Warm salon aesthetic"));
+  assert.ok(container.textContent.includes("frames_reviewed"));
   assert.ok(container.textContent.includes('"coverage"'));
   assert.ok(container.textContent.includes('"counts"'));
   assert.ok(container.textContent.includes("Best Images/"));
   assert.ok(container.textContent.includes("Reports/ai-curation-report.json"));
+
+  // Resume checkpoint button triggers POST /resume
+  await act(async () => {
+    fireEvent.click(getByText("Resume Collection (Next Batch)"));
+  });
+  await waitFor(() => assert.ok(calls.some((c) => c.url === `/api/jobs/${ID}/resume` && c.opts?.method === "POST")), {
+    timeout: 2000,
+  });
 
   // Per-asset rights verification
   await act(async () => {

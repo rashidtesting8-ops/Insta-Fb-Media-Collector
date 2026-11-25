@@ -18,6 +18,7 @@ export interface JobSummary {
 export interface JobRecord extends JobSummary {
   instagram_url?: string | null;
   facebook_url?: string | null;
+  collection_mode?: string | null;
   sources?: Record<string, unknown>;
   preprocessing?: { status?: string; [k: string]: unknown } | null;
   ai_curation?: { status?: string; provider?: string; model?: string; error?: string; errors?: string[]; [k: string]: unknown } | null;
@@ -81,17 +82,44 @@ export interface CurationImageRec {
   recommended_section?: string;
   hero_rank?: number | null;
   overall_score?: number;
-  focal_point?: string;
+  focal_point?: string | { x: number; y: number };
   crop_guidance?: string;
+  reason?: string;
   strengths?: string[];
   weaknesses?: string[];
   rights_review_required?: boolean;
+}
+
+export interface CurationHeroRec {
+  rank: number;
+  asset_id: string;
+  reason?: string;
+  composition_notes?: string;
+  desktop_crop?: string;
+  mobile_crop?: string;
+  focal_point?: { x: number; y: number };
+  text_overlay_suitability?: string;
+  limitations?: string | null;
+}
+
+export interface CurationSectionImage {
+  asset_id: string;
+  reason?: string;
+  recommended_section?: string;
+  selection_status?: string;
+  focal_point?: { x: number; y: number } | null;
+  crop_notes?: string | null;
+  limitations?: string | null;
 }
 
 export interface CurationVideoRec {
   asset_id: string;
   recommended_section?: string;
   overall_score?: number;
+  quality_score?: number;
+  video_review_status?: string;
+  evaluated_frames?: number[];
+  reason?: string;
   best_thumbnail_frame_index?: number | null;
   strengths?: string[];
   weaknesses?: string[];
@@ -108,6 +136,24 @@ interface CurationSelection {
   mode?: string;
   selected_asset_ids?: string[];
   rights_review_required_ids?: string[];
+  business_visual_identity?: {
+    style_summary?: string;
+    atmosphere?: string;
+    brand_personality?: string;
+    recommended_design_direction?: string;
+  };
+  final_quality_assessment?: {
+    overall_assessment?: string;
+    meets_premium_standard?: boolean;
+    notes?: string | null;
+  };
+  hero_selection?: CurationHeroRec[];
+  salon_images?: CurationSectionImage[];
+  founder_and_team_images?: CurationSectionImage[];
+  service_images?: CurationSectionImage[];
+  grooming_transformations?: CurationSectionImage[];
+  gallery_images?: CurationSectionImage[];
+  video_recommendations?: CurationVideoRec[];
   best_images?: CurationImageRec[];
   best_videos?: CurationVideoRec[];
   rejected_assets?: CurationRejected[];

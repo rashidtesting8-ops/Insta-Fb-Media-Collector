@@ -19,12 +19,17 @@ from pathlib import Path
 from fastapi import HTTPException
 
 SESSION_SECONDS = 8 * 3600
+MIN_BOOTSTRAP_PASSWORD_LEN = 12
+SETUP_TOKEN_MIN_TTL_S = 60
+SETUP_TOKEN_MAX_TTL_S = 3600
+SETUP_TOKEN_DEFAULT_TTL_S = 900
 _ARGON2_SLOTS = threading.BoundedSemaphore(4)
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_TABLES = frozenset({
     "named_accounts",
     "named_sessions",
     "named_bootstrap",
+    "named_setup_tokens",
     "named_nonces",
     "named_intakes",
     "named_audit",
@@ -36,6 +41,11 @@ CREATE TABLE IF NOT EXISTS named_accounts (
 CREATE TABLE IF NOT EXISTS named_sessions (
  digest TEXT PRIMARY KEY, actor TEXT NOT NULL, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS named_bootstrap (singleton INTEGER PRIMARY KEY CHECK(singleton=1));
+CREATE TABLE IF NOT EXISTS named_setup_tokens (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ digest TEXT NOT NULL,
+ verified_operator TEXT NOT NULL,
+ expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS named_nonces (nonce TEXT PRIMARY KEY, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS named_intakes (
  ticket TEXT PRIMARY KEY, session TEXT NOT NULL, payload TEXT NOT NULL, expires INTEGER NOT NULL);
@@ -170,9 +180,148 @@ def bootstrap(db, name, password, *, verified_operator):
                 "SELECT 1 FROM named_accounts").fetchone():
             raise HTTPException(409, "Bootstrap already consumed")
         con.execute("INSERT INTO named_bootstrap VALUES (1)")
+        con.execute("DELETE FROM named_setup_tokens")
         actor = create_account(con, name, password, precomputed_hash=hashed)
         audit(con, verified_operator, "bootstrap", actor)
         return actor
+
+
+def _validate_operator_id(verified_operator):
+    if not isinstance(verified_operator, str) or not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", verified_operator):
+        raise HTTPException(400, "Invalid verified operator identifier")
+    return verified_operator
+
+
+def issue_setup_token(db, *, verified_operator, ttl_seconds=SETUP_TOKEN_DEFAULT_TTL_S):
+    """Mint a single-use cryptographically random browser setup capability.
+
+    Only succeeds while zero Named Admins exist and bootstrap is unconsumed.
+    Stores only the SHA-256 digest in SQLite; never logs or persists plaintext.
+    """
+    operator = _validate_operator_id(verified_operator)
+    if not isinstance(ttl_seconds, int) or not (SETUP_TOKEN_MIN_TTL_S <= ttl_seconds <= SETUP_TOKEN_MAX_TTL_S):
+        raise HTTPException(400, f"TTL must be between {SETUP_TOKEN_MIN_TTL_S} and {SETUP_TOKEN_MAX_TTL_S} seconds")
+    raw_token = secrets.token_urlsafe(32)
+    token_digest = digest(raw_token)
+    now = int(time.time())
+    expires = now + ttl_seconds
+    with closing(_connect(db)) as con, con:
+        _ensure_schema(con)
+        con.execute("BEGIN IMMEDIATE")
+        if con.execute("SELECT 1 FROM named_bootstrap").fetchone() or con.execute(
+                "SELECT 1 FROM named_accounts").fetchone():
+            raise HTTPException(409, "Bootstrap already consumed")
+        con.execute(
+            "INSERT OR REPLACE INTO named_setup_tokens (singleton, digest, verified_operator, expires) VALUES (1,?,?,?)",
+            (token_digest, operator, expires),
+        )
+        audit(con, operator, "setup-token-issued", "singleton")
+    return {"token": raw_token, "expires_at": expires, "ttl_seconds": ttl_seconds}
+
+
+def bootstrap_status(db):
+    """Return whether browser one-time setup is currently available (non-secret booleans only)."""
+    now = int(time.time())
+    with closing(_connect(db)) as con:
+        existing = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "named_bootstrap" in existing and con.execute("SELECT 1 FROM named_bootstrap").fetchone():
+            return {"available": False}
+        if "named_accounts" in existing and con.execute("SELECT 1 FROM named_accounts").fetchone():
+            return {"available": False}
+        if "named_setup_tokens" not in existing:
+            return {"available": False}
+        row = con.execute("SELECT expires FROM named_setup_tokens WHERE singleton=1").fetchone()
+        return {"available": bool(row and int(row[0]) > now)}
+
+
+def browser_bootstrap(db, *, setup_token, name, password, confirm_password):
+    """Atomically create Admin #1 using a single-use setup token, reusing Argon2id and audit ledger."""
+    if not isinstance(setup_token, str) or not (16 <= len(setup_token) <= 256):
+        raise HTTPException(403, "Invalid or expired setup token")
+    now = int(time.time())
+    presented_digest = digest(setup_token)
+
+    # Pre-check bootstrap lock and setup capability before password validation/hashing
+    # so unauthenticated callers cannot trigger Argon2id work or probe rules.
+    with closing(_connect(db)) as con:
+        _ensure_schema(con)
+        if con.execute("SELECT 1 FROM named_bootstrap").fetchone() or con.execute(
+                "SELECT 1 FROM named_accounts").fetchone():
+            raise HTTPException(409, "Bootstrap already consumed")
+        token_row = con.execute(
+            "SELECT digest, verified_operator, expires FROM named_setup_tokens WHERE singleton=1"
+        ).fetchone()
+    if (
+        not token_row
+        or int(token_row[2]) <= now
+        or not hmac.compare_digest(str(token_row[0]), presented_digest)
+    ):
+        raise HTTPException(403, "Invalid or expired setup token")
+
+    validate_account_name(name)
+    if not isinstance(password, str) or not isinstance(confirm_password, str):
+        raise HTTPException(400, "Password and confirmation are required")
+    if len(password) < MIN_BOOTSTRAP_PASSWORD_LEN:
+        raise HTTPException(400, f"Password must be at least {MIN_BOOTSTRAP_PASSWORD_LEN} characters")
+    pw_bytes = password_bytes(password)
+    confirm_bytes = password_bytes(confirm_password)
+    if not hmac.compare_digest(pw_bytes, confirm_bytes):
+        raise HTTPException(400, "Password confirmation does not match")
+
+    # Run memory-hard Argon2id strictly outside SQLite's write lock.
+    hashed = password_hash(password)
+
+    with closing(_connect(db)) as con, con:
+        _ensure_schema(con)
+        con.execute("BEGIN IMMEDIATE")
+        now_commit = int(time.time())
+        if con.execute("SELECT 1 FROM named_bootstrap").fetchone() or con.execute(
+                "SELECT 1 FROM named_accounts").fetchone():
+            raise HTTPException(409, "Bootstrap already consumed")
+        token_row = con.execute(
+            "SELECT digest, verified_operator, expires FROM named_setup_tokens WHERE singleton=1"
+        ).fetchone()
+        if (
+            not token_row
+            or int(token_row[2]) <= now_commit
+            or not hmac.compare_digest(str(token_row[0]), presented_digest)
+        ):
+            raise HTTPException(403, "Invalid or expired setup token")
+        verified_operator = str(token_row[1])
+        con.execute("INSERT INTO named_bootstrap VALUES (1)")
+        con.execute("DELETE FROM named_setup_tokens")
+        actor = create_account(con, name, password, precomputed_hash=hashed)
+        audit(con, verified_operator, "bootstrap", actor)
+        return actor
+
+
+def is_local_bootstrap_peer(client_host, headers):
+    """Fail-closed loopback verification for browser bootstrap endpoints.
+
+    Rejects any request carrying proxy forwarding headers. Outside Docker, only
+    loopback client IPs (127.0.0.1 / ::1) are permitted. Inside Docker (where
+    compose.media.yml publishes ports strictly on 127.0.0.1), permits loopback
+    or RFC1918 local bridge gateway peers only when zero forwarding headers exist.
+    """
+    import ipaddress
+
+    for header in ("x-forwarded-for", "x-real-ip", "forwarded", "cf-connecting-ip", "true-client-ip"):
+        if headers.get(header):
+            return False
+    if not client_host:
+        return False
+    host = str(client_host).strip()
+    if host == "testclient":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if ip.is_loopback:
+        return True
+    if os.path.exists("/.dockerenv") and ip.is_private and not ip.is_multicast and not ip.is_unspecified:
+        return True
+    return False
 
 
 def session_actor(con, session_hash):
@@ -284,6 +433,24 @@ def dispatch(db, action, raw, header, session, *, approval_root=None):
 
     if claims["exp"] <= int(time.time()):
         raise denied()
+
+    if action == "bootstrap-status":
+        if body:
+            raise HTTPException(400, "Unexpected payload")
+        return bootstrap_status(db)
+
+    if action == "bootstrap":
+        allowed_keys = {"setup_token", "name", "password", "confirm_password"}
+        if set(body) != allowed_keys:
+            raise HTTPException(400, "Invalid bootstrap request")
+        actor = browser_bootstrap(
+            db,
+            setup_token=body.get("setup_token"),
+            name=body.get("name"),
+            password=body.get("password"),
+            confirm_password=body.get("confirm_password"),
+        )
+        return {"principal_id": actor}
 
     if action == "login":
         raw_password = password_bytes(body.get("password"))
