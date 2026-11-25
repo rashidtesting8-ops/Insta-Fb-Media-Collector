@@ -17,7 +17,10 @@ from requests import HTTPError
 
 
 class InferenceHeld(ValueError):
-    pass
+    def __init__(self, message: str, *, claimed: bool = False, claim_nonce: str | None = None) -> None:
+        super().__init__(message)
+        self.claimed = claimed
+        self.claim_nonce = claim_nonce
 
 
 SCHEMA = """
@@ -61,7 +64,8 @@ class Execution:
     def transaction(self):
         # mode=rw deliberately cannot create a missing job database.
         try:
-            with closing(sqlite3.connect(self.db.as_uri() + "?mode=rw", uri=True)) as con, con:
+            with closing(sqlite3.connect(self.db.as_uri() + "?mode=rw", uri=True, timeout=10)) as con, con:
+                con.execute("PRAGMA busy_timeout=5000;")
                 con.execute("BEGIN IMMEDIATE")
                 yield con
         except sqlite3.Error as exc:
@@ -120,23 +124,28 @@ def execution(job_dir, job, processing_consent, start_etag):
         con.execute("INSERT INTO ai_execution_claims VALUES (?,?,?,?,?,?)",
                     (job, review["revision"], decision, run.nonce, run.tag, now()))
 
-    with TemporaryDirectory(prefix="pgm-ai-", dir=run.db.parent) as tmp:
-        run.staging = Path(tmp)
-        (run.staging / "manifest.json").write_bytes(raw)
-        for candidate in selected["candidates"]:
-            for rel, expected in candidate["files"]:
-                source = (folder / rel).resolve()
-                target = (run.staging / rel).resolve()
-                require(source.is_relative_to(folder) and target.is_relative_to(run.staging), "Unsafe payload file")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, target)
-                with target.open("rb") as stream:
-                    require(file_digest(stream, "sha256").hexdigest() == expected, "Payload checksum changed")
-        token = _current.set(run)
-        try:
-            yield run.staging
-        finally:
-            _current.reset(token)
+    try:
+        with TemporaryDirectory(prefix="pgm-ai-", dir=run.db.parent) as tmp:
+            run.staging = Path(tmp)
+            (run.staging / "manifest.json").write_bytes(raw)
+            for candidate in selected["candidates"]:
+                for rel, expected in candidate["files"]:
+                    source = (folder / rel).resolve()
+                    target = (run.staging / rel).resolve()
+                    require(source.is_relative_to(folder) and target.is_relative_to(run.staging), "Unsafe payload file")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+                    with target.open("rb") as stream:
+                        require(file_digest(stream, "sha256").hexdigest() == expected, "Payload checksum changed")
+            token = _current.set(run)
+            try:
+                yield run.staging
+            finally:
+                _current.reset(token)
+    except InferenceHeld as exc:
+        exc.claimed = True
+        exc.claim_nonce = run.nonce
+        raise
 
 
 def require_pipeline(folder, job):

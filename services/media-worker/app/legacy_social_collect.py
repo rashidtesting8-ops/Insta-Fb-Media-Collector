@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
 from app.publication import aware_timestamp, publication_evidence
+from app.security import sanitized_subprocess_env
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -97,10 +98,15 @@ def check_social_url(platform: str, url: str) -> str:
     if platform not in SOCIAL_HOSTS:
         raise ValueError("Choose instagram or facebook")
     u = urlparse(url)
+    try:
+        port = u.port
+    except ValueError:
+        raise ValueError("Invalid URL port") from None
     if (
         u.scheme != "https"
-        or u.username
-        or u.password
+        or u.username is not None
+        or u.password is not None
+        or port is not None
         or (u.hostname or "").lower() not in SOCIAL_HOSTS[platform]
     ):
         raise ValueError(
@@ -355,6 +361,7 @@ def _execute_subprocess(
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             cwd=str(stage),
+            env=sanitized_subprocess_env(stage=stage, allow_proxy=True),
             shell=False,
         )
         started = time.monotonic()

@@ -1,14 +1,30 @@
-# Pet Grooming AI Media Intelligence Platform — Developer Guide v2.0
+# Pet Grooming AI Media Intelligence Platform — Developer Guide v2.1
 
-**Date:** 20 November 2026  
-**Status:** Approved development architecture with Collection V1.1 requirements. Implementation status is tracked separately.
+**Date:** 25 November 2026  
+**Status:** Approved V2.1 Website + Facebook SaaS V1 architecture (Owner Approved 25 Nov 2026; supersedes V1.1 3-URL mandate and n8n-hosted Groq split). Implementation status is tracked separately.
 
 **Audience:** OpenCode agent, developer, n8n engineer, QA reviewer  
 **Source baseline:** User-supplied `pet-gromming-agent-factory-main (1).zip`  
-**Creative baseline:** Premium Pet Grooming Website Visual Director V2.0  
-**Target:** Any publicly accessible pet grooming business website and publicly visible Facebook/Instagram pages, subject to legitimate access and reuse permissions.
+**Creative baseline:** Premium Pet Grooming Website Visual Director V2.0 (`docs/AI_VISUAL_DIRECTOR_V2.md`)  
+**Target:** Any publicly accessible business website and publicly visible Facebook Page (with Instagram parked/optional), subject to legitimate access and reuse permissions.
 
-> **North star:** A non-technical operator enters the business website, Instagram and Facebook URLs. The platform collects accessible and permitted images and videos published in the preceding 365 days, verifies coverage, checks quality and removes duplicates before Groq selection, and delivers only approved selections.
+> **North star (V2.1):** A non-technical operator enters a business's Website URL and Facebook Page URL (Instagram is optional/parked). The platform automatically collects accessible and permitted images and videos published in the preceding 365 days, deduplicates and validates media quality before Groq Visual Director V2 selection, and delivers only rights-cleared originals to an organized Google Drive folder.
+
+## 00 — V2.1 Approved Architecture & Product Pivot (25 Nov 2026)
+
+1. **Primary V1 Sources — Website + Facebook (Instagram Parked / Optional):**
+   - Live Stage 3G/3I validation proved reliable anonymous multi-batch Facebook photo-set collection (`100` dated photos, `0` blocks) and Website crawl + deduplication (`57` canonical assets including `.mp4` videos), while anonymous Instagram is consistently blocked by platform `429`/login gates.
+   - **V1 SaaS scope:** Business Website and Facebook Page are primary. `instagram_url` is demoted from mandatory to **optional** (parked for anonymous scraping; existing parser/normalizers remain dormant for future owner-supplied Instagram export ZIPs or authorized access).
+   - *Migration note:* Existing 3-URL intake validation stays backward-compatible during Sprint 1 (P0 worker hardening) and switches to Website + Facebook optional-Instagram across worker, n8n, and frontend together in Sprint 2.
+2. **Unified Layer Ownership (Resolves Python vs. n8n Split-Brain):**
+   - **Next.js Frontend (`frontend/`):** SaaS operator UI (Website + Facebook intake, live job status, visual gallery & video preview, undated-website review toggle, one-click Start AI, AI curation review, per-asset rights decisions, and Google Drive delivery trigger + folder link).
+   - **Python Media Worker (`services/media-worker/`):** Single heavy-compute engine owning multi-tenant 365-day Website + Facebook collection & checkpoint resume, bounded binary downloads, FFmpeg/Pillow preprocessing, **and async background Groq AI Visual Director V2 execution** (`docs/AI_VISUAL_DIRECTOR_V2.md`).
+   - **n8n (`n8n-media/`):** Thin workflow & integration controller owning intake webhooks, job status polling/notifications, and **Google Drive v3 OAuth binary delivery** (`Pet Grooming AI Media/<business-domain>/Best Images|Best Videos|Reports`). n8n does not execute Vision AI directly.
+3. **Single Multi-Tenant Collection Engine:**
+   - The tested `CollectionCheckpoint` + Historical Mode collector (`website_inventory.py`, `social_discovery.py`) replaces the legacy single-shot collector as the unified multi-tenant engine behind `POST /jobs`, paired with a single immutable M4 approval & rights ledger.
+4. **Pragmatic Policy for Undated Website Media (`unknown_date`):**
+   - Website media without media-specific JSON-LD `datePublished` keeps honest `date_status: "unknown_date"` (upload paths and capture times are never fabricated as publication dates).
+   - To avoid locking out valid business website photography/video on CMS platforms (e.g., WordPress/Elementor), undated website assets may enter AI curation **only via an explicit per-job operator approval toggle** ("Include undated website media in AI curation"), preserving a `Website · Date unverified` provenance flag through curation and delivery reports.
 
 ## 01 — Product scope and hard boundaries
 
@@ -447,3 +463,4 @@ For a repeat run, locate the business folder and reuse it; create a new dated re
 **Document change log**
 - v1.0 — Initial local-first developer blueprint; primarily VS Code/Cursor oriented; creative prompt original preserved.
 - **v2.0 (20 Nov 2026)** — OpenCode-first launch, root/nested AGENTS.md risk, extracted ZIP workflow, strict source-vs-plan distinction, Creative Director V2.0 two-stage integration, verified n8n 2.x shared file access restriction, fuller job/status contracts, milestone gates, safer Compose baseline and OpenCode first prompt.
+- **v2.1 (25 Nov 2026)** — Owner-approved Website + Facebook SaaS V1 pivot: Instagram parked/optional for anonymous collection; resolved Python-vs-n8n split-brain (Python worker owns multi-tenant collection, preprocessing, and async Groq AI Visual Director V2; n8n owns intake, orchestration, and Google Drive v3 OAuth delivery); explicit per-job operator review toggle for undated website media (`unknown_date`).

@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import mimetypes
 import os
 import sqlite3
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from threading import BoundedSemaphore, Lock
 from typing import Any
 
@@ -31,6 +32,17 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from app.publication import frozen_window, window_bounds
 from app.security import WorkerSecurity
+
+_SAFE_PREVIEW_MIMES = frozenset({
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "image/avif",
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+})
 
 app = FastAPI(title="Pet Grooming Media Worker", version="0.9.0", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(WorkerSecurity)
@@ -54,8 +66,18 @@ DB = DATA_DIR / "_system" / "jobs.sqlite"
 DB.parent.mkdir(parents=True, exist_ok=True)
 
 
+class ClosingConnection(sqlite3.Connection):
+    """SQLite connection that commits/rolls back and always closes its FD on context exit."""
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self.close()
+
+
 def connect() -> sqlite3.Connection:
-    con = sqlite3.connect(DB, timeout=10)
+    con = sqlite3.connect(DB, timeout=10, factory=ClosingConnection)
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
     con.execute("PRAGMA busy_timeout=5000;")
@@ -66,11 +88,18 @@ def connect() -> sqlite3.Connection:
 
 
 def store(record: dict[str, Any], *, collection_base: int | None = None) -> None:
+    prepared_snapshot = None
+    if collection_base is not None:
+        from app.collection_approval import accept, snapshot
+        try:
+            prepared_snapshot = snapshot(DATA_DIR, record)
+        except (HTTPException, OSError, ValueError, KeyError, TypeError):
+            prepared_snapshot = None
     with lock, connect() as con:
         if collection_base is not None:
             from app.collection_approval import accept
             con.execute("BEGIN IMMEDIATE")
-            accept(con, DATA_DIR, record, collection_base)
+            accept(con, DATA_DIR, record, collection_base, precomputed_snapshot=prepared_snapshot)
         con.execute(
             "INSERT OR REPLACE INTO jobs (id, payload) VALUES (?,?)",
             (record["job_id"], json.dumps(record)),
@@ -293,18 +322,25 @@ def execute_started_curation(
                 })
                 raise HTTPException(503, f"AI provider {status}")
 
-    store({
-        **rec,
-        "ai_curation": {
-            "status": "started",
-            "provider": getattr(provider, "name", cfg.provider),
-            "model": cfg.model or getattr(provider, "model", ""),
-            "actor": actor,
-            "start_etag": start_etag,
-            "started_at": now,
-        },
-        "updated_at": now,
-    })
+    claimed_by_self = False
+
+    def _mark_started() -> None:
+        nonlocal claimed_by_self
+        claimed_by_self = True
+        started_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        latest_rec = fetch(job_id) or rec
+        store({
+            **latest_rec,
+            "ai_curation": {
+                "status": "started",
+                "provider": getattr(provider, "name", cfg.provider),
+                "model": cfg.model or getattr(provider, "model", ""),
+                "actor": actor,
+                "start_etag": start_etag,
+                "started_at": started_at,
+            },
+            "updated_at": started_at,
+        })
 
     try:
         outcome = run_started_curation(
@@ -312,6 +348,7 @@ def execute_started_curation(
             job_id,
             processing_consent=consent_map,
             start_etag=start_etag,
+            on_claimed=_mark_started,
             config=cfg,
             provider=provider,
             business_context=rec.get("business_context"),
@@ -320,13 +357,9 @@ def execute_started_curation(
             batch_size=cfg.batch_size,
         )
     except InferenceHeld as exc:
-        finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        with connect() as con:
-            claimed = bool(
-                con.execute("SELECT 1 FROM ai_execution_claims WHERE job=? AND revision=?", (job_id, rev)).fetchone()
-            )
-        latest = fetch(job_id) or rec
-        if claimed:
+        if exc.claimed or claimed_by_self:
+            finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            latest = fetch(job_id) or rec
             store({
                 **latest,
                 "ai_curation": {
@@ -339,26 +372,27 @@ def execute_started_curation(
                 },
                 "updated_at": finished,
             })
-        else:
-            store({**latest, "ai_curation": previous_ai, "updated_at": finished})
+        # If this caller never won the claim (e.g. concurrent loser or bad consent),
+        # leave the job record untouched so another caller's started/completed state is never clobbered.
         raise HTTPException(409, str(exc)) from None
     except Exception as exc:  # noqa: BLE001 — fail honestly without leaking secrets
-        finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
         safe_err = scrub_secrets(str(exc))[:240]
-        latest = fetch(job_id) or rec
-        store({
-            **latest,
-            "ai_curation": {
-                "status": "failed",
-                "provider": getattr(provider, "name", cfg.provider),
-                "model": cfg.model or getattr(provider, "model", ""),
-                "actor": actor,
-                "start_etag": start_etag,
-                "errors": [safe_err],
-                "finished_at": finished,
-            },
-            "updated_at": finished,
-        })
+        if claimed_by_self:
+            finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            latest = fetch(job_id) or rec
+            store({
+                **latest,
+                "ai_curation": {
+                    "status": "failed",
+                    "provider": getattr(provider, "name", cfg.provider),
+                    "model": cfg.model or getattr(provider, "model", ""),
+                    "actor": actor,
+                    "start_etag": start_etag,
+                    "errors": [safe_err],
+                    "finished_at": finished,
+                },
+                "updated_at": finished,
+            })
         return JSONResponse({"job_id": job_id, "status": "failed", "errors": [safe_err]}, status_code=502)
 
     finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -802,6 +836,33 @@ def list_jobs() -> dict[str, Any]:
     return {"jobs": items, "total": len(items)}
 
 
+def _manifest_preview_allowlist(job_dir: Path) -> dict[str, str | None]:
+    """Return {relative_posix_path: recorded_mime} for manifest-declared media files only."""
+    manifest_file = job_dir / "manifest.json"
+    if not manifest_file.is_file():
+        return {}
+    try:
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    allowed: dict[str, str | None] = {}
+    for asset in manifest.get("assets") or []:
+        if not isinstance(asset, dict):
+            continue
+        if asset.get("extraction_status") in ("downloaded", "duplicate", "extracted_frame"):
+            rel = asset.get("local_path")
+            if isinstance(rel, str) and rel:
+                mime = asset.get("mime")
+                clean_mime = str(mime).split(";", 1)[0].strip().lower() if isinstance(mime, str) else None
+                allowed[rel] = clean_mime
+        for frame in asset.get("frames") or []:
+            if isinstance(frame, dict):
+                f_rel = frame.get("local_path")
+                if isinstance(f_rel, str) and f_rel:
+                    allowed[f_rel] = "image/jpeg"
+    return allowed
+
+
 @app.get("/jobs/{job_id}/file")
 def get_job_file(job_id: str, path: str) -> Any:
     from fastapi.responses import FileResponse
@@ -814,15 +875,45 @@ def get_job_file(job_id: str, path: str) -> Any:
         raise HTTPException(400, "Invalid job directory")
     if not job_dir.is_dir():
         raise HTTPException(404, "Job directory missing")
-    # Strict traversal guard: only files inside the job directory.
-    candidate = (job_dir / (path or "")).resolve()
+    # Strict traversal guard FIRST (before manifest lookup): reject absolute, backslash, drive, or .. escapes.
+    if (
+        not isinstance(path, str)
+        or not path
+        or "\\" in path
+        or PureWindowsPath(path).drive
+        or Path(path).is_absolute()
+        or ".." in Path(path).parts
+    ):
+        raise HTTPException(400, "Invalid path")
+    candidate = (job_dir / path).resolve()
     try:
-        candidate.relative_to(job_dir)
+        rel_posix = candidate.relative_to(job_dir).as_posix()
     except ValueError:
         raise HTTPException(400, "Invalid path")
+    # Manifest media allowlist: never serve internal SQLite DBs, snapshots, manifests, or unindexed files.
+    allowed = _manifest_preview_allowlist(job_dir)
+    if rel_posix not in allowed:
+        raise HTTPException(404, "File not found")
     if not candidate.is_file():
         raise HTTPException(404, "File not found")
-    return FileResponse(candidate, headers={"X-Content-Type-Options": "nosniff"})
+    recorded_mime = allowed[rel_posix]
+    if recorded_mime == "image/jpg":
+        recorded_mime = "image/jpeg"
+    guessed_mime, _ = mimetypes.guess_type(candidate.name)
+    safe_mime = recorded_mime if recorded_mime in _SAFE_PREVIEW_MIMES else (
+        guessed_mime if guessed_mime in _SAFE_PREVIEW_MIMES else None
+    )
+    if safe_mime is None:
+        raise HTTPException(415, "Unsupported media type")
+    return FileResponse(
+        candidate,
+        media_type=safe_mime,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "attachment",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+        },
+    )
 
 
 @app.get("/jobs/{job_id}")
