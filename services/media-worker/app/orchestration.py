@@ -289,9 +289,18 @@ def derive_stage(job: Mapping[str, Any], delivery: Mapping[str, Any] | None = No
     elif job_status == "failed":
         stage, detail = "failed", str(job.get("error") or "Extraction failed for all attempted sources.")
     elif job_status == "partial_success":
-        stage, detail = "partial_success", str(job.get("error") or "Partial extraction success.")
+        if ai_status in ("queued", "started"):
+            stage, detail = "ai_processing", "AI Visual Director V2 curation in progress."
+        elif ai_status == "completed" and ai_record.get("mock") is True:
+            stage, detail = "blocked", "Mock curation is available for QA only."
+        elif ai_status == "completed":
+            stage, detail = "awaiting_rights_approval", "AI curation completed; awaiting rights approval."
+        else:
+            stage, detail = "partial_success", str(job.get("error") or "Partial extraction success.")
     elif job_status == "extraction_complete":
-        if run_ai:
+        if ai_status in ("queued", "started"):
+            stage, detail = "ai_processing", "AI Visual Director V2 curation in progress."
+        elif run_ai or ai_status == "completed":
             if ai_status == "awaiting_collection_approval":
                 stage, detail = "blocked", "Collection review and a separate named Start AI are required."
             elif ai_status == "completed" and ai_record.get("mock") is True:

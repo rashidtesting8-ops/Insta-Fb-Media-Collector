@@ -482,6 +482,23 @@ async def named_action(action: str, request: Request):
     from starlette.concurrency import run_in_threadpool
 
     enabled = m4_approval_enabled()
+    if action == "collection-resume":
+        if not enabled:
+            raise HTTPException(404, "Approval adapter unavailable")
+        _actor, body = await run_in_threadpool(
+            verify_admin_action,
+            DB,
+            action,
+            await request.body(),
+            request.headers.get("x-named-assertion", ""),
+            request.headers.get("x-named-session", ""),
+        )
+        import re as _re
+        jid = body.get("job_id") if isinstance(body, dict) else None
+        if set(body) != {"job_id"} or not isinstance(jid, str) or not _re.fullmatch(r"[a-f0-9]{32}", jid):
+            raise HTTPException(400, "Valid 32-hex job_id required")
+        out = await run_in_threadpool(resume_collection, jid)
+        return JSONResponse(out, status_code=202)
     if action == "collection-execute":
         if not enabled:
             raise HTTPException(404, "Approval adapter unavailable")

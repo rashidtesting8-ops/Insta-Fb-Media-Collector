@@ -113,12 +113,15 @@ def _package_client_reports(
     ai_env = envelope.get("ai_envelope") if isinstance(envelope.get("ai_envelope"), dict) else {}
 
     best_images = []
+    seen_img_ids: set[str] = set()
     for rec in curation_body.get("best_images") or []:
         if not isinstance(rec, dict) or rec.get("asset_id") not in released_by_id:
             continue
-        asset_info = released_by_id[rec["asset_id"]]
+        aid = rec["asset_id"]
+        seen_img_ids.add(aid)
+        asset_info = released_by_id[aid]
         best_images.append({
-            "asset_id": rec["asset_id"],
+            "asset_id": aid,
             "filename": asset_info["filename"],
             "target_subfolder": asset_info["target_subfolder"],
             "recommended_section": rec.get("recommended_section"),
@@ -130,13 +133,75 @@ def _package_client_reports(
             "weaknesses": rec.get("weaknesses") or [],
         })
 
+    # Real Visual Director V2 ModeBResponse sections (hero_selection + section lists)
+    hero_selection = []
+    for rec in curation_body.get("hero_selection") or []:
+        if not isinstance(rec, dict) or rec.get("asset_id") not in released_by_id:
+            continue
+        aid = rec["asset_id"]
+        asset_info = released_by_id[aid]
+        entry = {
+            **rec,
+            "filename": asset_info["filename"],
+            "target_subfolder": asset_info["target_subfolder"],
+        }
+        hero_selection.append(entry)
+        if aid not in seen_img_ids:
+            seen_img_ids.add(aid)
+            best_images.append({
+                "asset_id": aid,
+                "filename": asset_info["filename"],
+                "target_subfolder": asset_info["target_subfolder"],
+                "recommended_section": "hero",
+                "hero_rank": rec.get("rank"),
+                "focal_point": rec.get("focal_point"),
+                "crop_guidance": f"desktop: {rec.get('desktop_crop', '')}; mobile: {rec.get('mobile_crop', '')}".strip("; "),
+                "reason": rec.get("reason"),
+            })
+
+    curated_sections: dict[str, list[dict[str, Any]]] = {}
+    for sec_key in (
+        "salon_images",
+        "founder_and_team_images",
+        "service_images",
+        "grooming_transformations",
+        "gallery_images",
+    ):
+        sec_items = []
+        for rec in curation_body.get(sec_key) or []:
+            if not isinstance(rec, dict) or rec.get("asset_id") not in released_by_id:
+                continue
+            aid = rec["asset_id"]
+            asset_info = released_by_id[aid]
+            sec_items.append({
+                **rec,
+                "filename": asset_info["filename"],
+                "target_subfolder": asset_info["target_subfolder"],
+            })
+            if aid not in seen_img_ids:
+                seen_img_ids.add(aid)
+                best_images.append({
+                    "asset_id": aid,
+                    "filename": asset_info["filename"],
+                    "target_subfolder": asset_info["target_subfolder"],
+                    "recommended_section": rec.get("recommended_section") or sec_key,
+                    "focal_point": rec.get("focal_point"),
+                    "crop_guidance": rec.get("crop_notes"),
+                    "reason": rec.get("reason"),
+                })
+        if sec_items:
+            curated_sections[sec_key] = sec_items
+
     best_videos = []
+    seen_vid_ids: set[str] = set()
     for rec in curation_body.get("best_videos") or []:
         if not isinstance(rec, dict) or rec.get("asset_id") not in released_by_id:
             continue
-        asset_info = released_by_id[rec["asset_id"]]
+        aid = rec["asset_id"]
+        seen_vid_ids.add(aid)
+        asset_info = released_by_id[aid]
         best_videos.append({
-            "asset_id": rec["asset_id"],
+            "asset_id": aid,
             "filename": asset_info["filename"],
             "target_subfolder": asset_info["target_subfolder"],
             "recommended_section": rec.get("recommended_section"),
@@ -146,8 +211,32 @@ def _package_client_reports(
             "weaknesses": rec.get("weaknesses") or [],
         })
 
+    video_recommendations = []
+    for rec in curation_body.get("video_recommendations") or []:
+        if not isinstance(rec, dict) or rec.get("asset_id") not in released_by_id:
+            continue
+        aid = rec["asset_id"]
+        asset_info = released_by_id[aid]
+        video_recommendations.append({
+            **rec,
+            "filename": asset_info["filename"],
+            "target_subfolder": asset_info["target_subfolder"],
+        })
+        if aid not in seen_vid_ids:
+            seen_vid_ids.add(aid)
+            best_videos.append({
+                "asset_id": aid,
+                "filename": asset_info["filename"],
+                "target_subfolder": asset_info["target_subfolder"],
+                "recommended_section": rec.get("recommended_section"),
+                "overall_score": rec.get("quality_score"),
+                "video_review_status": rec.get("video_review_status"),
+                "evaluated_frames": rec.get("evaluated_frames") or [],
+                "reason": rec.get("reason"),
+            })
+
     ai_report = {
-        "schema_version": "1.0-client-ai-report",
+        "schema_version": "1.1-client-ai-report",
         "job_id": job_id,
         "folder_name": folder_name,
         "prompt_version": ai_env.get("prompt_version"),
@@ -156,8 +245,15 @@ def _package_client_reports(
         "released_asset_count": len(released_assets),
         "pending_rights_count": len(pending_rights_ids),
         "released_asset_ids": [a["asset_id"] for a in released_assets],
+        "business_visual_identity": curation_body.get("business_visual_identity"),
+        "hero_selection": hero_selection,
+        "curated_sections": curated_sections,
+        "video_recommendations": video_recommendations,
         "best_images": best_images,
         "best_videos": best_videos,
+        "design_art_direction": curation_body.get("design_art_direction"),
+        "final_quality_assessment": curation_body.get("final_quality_assessment"),
+        "missing_assets": curation_body.get("missing_assets") or [],
         "selection_summary": curation_body.get("selection_summary") or {},
         "note": "Commercial use applies only to rights-verified assets listed in released_asset_ids.",
     }

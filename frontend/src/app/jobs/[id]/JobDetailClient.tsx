@@ -97,6 +97,8 @@ export default function JobDetailClient({ id }: { id: string }) {
   const [releaseConfirmed, setReleaseConfirmed] = useState(false);
   const [delivering, setDelivering] = useState(false);
   const [deliveryMessage, setDeliveryMessage] = useState<string | null>(null);
+  const [resuming, setResuming] = useState(false);
+  const [resumeMessage, setResumeMessage] = useState<string | null>(null);
 
   const triggerRefresh = useCallback(() => {
     setRefreshTick((t) => t + 1);
@@ -155,8 +157,48 @@ export default function JobDetailClient({ id }: { id: string }) {
     for (const rec of selection?.best_images || []) {
       if (rec?.asset_id) imgMap.set(rec.asset_id, rec);
     }
+    for (const rec of selection?.hero_selection || []) {
+      if (rec?.asset_id && !imgMap.has(rec.asset_id)) {
+        imgMap.set(rec.asset_id, {
+          asset_id: rec.asset_id,
+          recommended_section: "hero",
+          hero_rank: rec.rank,
+          focal_point: rec.focal_point,
+          crop_guidance: [rec.desktop_crop, rec.mobile_crop].filter(Boolean).join(" / "),
+          reason: rec.reason,
+        });
+      }
+    }
+    const sectionBuckets = [
+      ["salon_facilities", selection?.salon_images],
+      ["founder_team", selection?.founder_and_team_images],
+      ["service", selection?.service_images],
+      ["grooming_transformation", selection?.grooming_transformations],
+      ["gallery", selection?.gallery_images],
+    ] as const;
+    for (const [secName, list] of sectionBuckets) {
+      for (const rec of list || []) {
+        if (rec?.asset_id && !imgMap.has(rec.asset_id)) {
+          imgMap.set(rec.asset_id, {
+            asset_id: rec.asset_id,
+            recommended_section: rec.recommended_section || secName,
+            focal_point: rec.focal_point ?? undefined,
+            crop_guidance: rec.crop_notes ?? undefined,
+            reason: rec.reason,
+          });
+        }
+      }
+    }
     for (const rec of selection?.best_videos || []) {
       if (rec?.asset_id) vidMap.set(rec.asset_id, rec);
+    }
+    for (const rec of selection?.video_recommendations || []) {
+      if (rec?.asset_id && !vidMap.has(rec.asset_id)) {
+        vidMap.set(rec.asset_id, {
+          ...rec,
+          overall_score: rec.overall_score ?? rec.quality_score,
+        });
+      }
     }
     for (const rec of selection?.rejected_assets || []) {
       if (rec?.asset_id) rejMap.set(rec.asset_id, rec);
@@ -213,6 +255,30 @@ export default function JobDetailClient({ id }: { id: string }) {
       setRightsMessage("Rights decision request failed.");
     } finally {
       setRightsBusy(null);
+    }
+  }
+
+  async function triggerResumeCollection() {
+    if (resuming) return;
+    setResuming(true);
+    setResumeMessage(null);
+    try {
+      const res = await fetch(`/api/jobs/${id}/resume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setResumeMessage(data.error || `Unable to resume collection (HTTP ${res.status}).`);
+        return;
+      }
+      setResumeMessage("Historical collection resumed from saved checkpoint — polling live progress.");
+      triggerRefresh();
+    } catch {
+      setResumeMessage("Resume collection request unavailable.");
+    } finally {
+      setResuming(false);
     }
   }
 
@@ -319,6 +385,23 @@ export default function JobDetailClient({ id }: { id: string }) {
         {job.error && (
           <div className="mt-3 rounded border border-red-200 bg-red-50 p-3 text-sm text-red-700">{job.error}</div>
         )}
+        {job.collection_mode === "public_checkpoint" && !["queued", "running"].includes(String(job.status)) && (
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              disabled={resuming}
+              onClick={triggerResumeCollection}
+              className="rounded border border-blue-300 bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-800 hover:bg-blue-100 disabled:opacity-50"
+            >
+              {resuming ? "Resuming checkpoint…" : "Resume Collection (Next Batch)"}
+            </button>
+            {resumeMessage && (
+              <span className="text-xs text-slate-700" role="status">
+                {resumeMessage}
+              </span>
+            )}
+          </div>
+        )}
       </section>
 
       <section className="space-y-4 rounded-lg border border-slate-200 bg-white p-4">
@@ -367,8 +450,7 @@ export default function JobDetailClient({ id }: { id: string }) {
             </div>
             <div>
               <span className="text-slate-500">Selected:</span>{" "}
-              <strong>{selectedIds.length}</strong> ({selection.best_images?.length ?? 0} img /{" "}
-              {selection.best_videos?.length ?? 0} vid)
+              <strong>{selectedIds.length}</strong> ({imageRecById.size} img / {videoRecById.size} vid)
             </div>
             <div>
               <span className="text-slate-500">Rights verified:</span>{" "}
@@ -383,6 +465,18 @@ export default function JobDetailClient({ id }: { id: string }) {
                 {curation?.ai_envelope?.prompt_sha256 ? ` (${curation.ai_envelope.prompt_sha256.slice(0, 8)})` : ""}
               </span>
             </div>
+          </div>
+        )}
+
+        {selection?.business_visual_identity?.style_summary && (
+          <div className="rounded border border-blue-100 bg-blue-50/50 p-3 text-xs text-slate-800">
+            <div className="font-medium text-blue-950">AI Visual Direction Summary</div>
+            <p className="mt-1">{selection.business_visual_identity.style_summary}</p>
+            {selection.business_visual_identity.recommended_design_direction && (
+              <p className="mt-1 text-slate-600">
+                Direction: {selection.business_visual_identity.recommended_design_direction}
+              </p>
+            )}
           </div>
         )}
 
@@ -494,16 +588,27 @@ export default function JobDetailClient({ id }: { id: string }) {
                             {imgRec.hero_rank ? ` · Hero #${imgRec.hero_rank}` : ""}
                             {typeof imgRec.overall_score === "number" ? ` · ${imgRec.overall_score}/100` : ""}
                           </div>
-                          {imgRec.focal_point && <div>Focus: {imgRec.focal_point}</div>}
+                          {imgRec.focal_point && (
+                            <div>
+                              Focus:{" "}
+                              {typeof imgRec.focal_point === "string"
+                                ? imgRec.focal_point
+                                : `(${imgRec.focal_point.x}, ${imgRec.focal_point.y})`}
+                            </div>
+                          )}
                           {imgRec.crop_guidance && <div>Crop: {imgRec.crop_guidance}</div>}
+                          {imgRec.reason && <div className="text-blue-800">{imgRec.reason}</div>}
                         </div>
                       )}
                       {vidRec && (
                         <div className="mt-1.5 rounded bg-indigo-50 p-1.5 text-[11px] text-indigo-900">
                           <div className="font-semibold">
-                            AI Video · {vidRec.recommended_section || "feature"}
-                            {typeof vidRec.overall_score === "number" ? ` · ${vidRec.overall_score}/100` : ""}
+                            AI Video · {vidRec.recommended_section || "video"}
+                            {typeof (vidRec.overall_score ?? vidRec.quality_score) === "number"
+                              ? ` · ${vidRec.overall_score ?? vidRec.quality_score}/100`
+                              : ""}
                           </div>
+                          {vidRec.video_review_status && <div>Review: {vidRec.video_review_status}</div>}
                         </div>
                       )}
                       {rejRec && !isSelected && (
