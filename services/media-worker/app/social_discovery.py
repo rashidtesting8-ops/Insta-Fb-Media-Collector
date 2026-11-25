@@ -66,10 +66,54 @@ _FB_PAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_CHALLENGE_PATTERNS = ("checkpoint", "challenge", "captcha", "cf-mitigated", "verify your identity")
-_AUTH_ERROR_PATTERNS = ("authenticationerror", "authenticationrequired", "authorizationerror", "loginrequiredexception")
+_CHALLENGE_PATTERNS = (
+    "checkpoint",
+    "challenge",
+    "challengeerror",
+    "captcha",
+    "cf-mitigated",
+    "verify your identity",
+)
+_AUTH_ERROR_PATTERNS = (
+    "authenticationerror",
+    "authenticationrequired",
+    "authorizationerror",
+    "authrequired",
+    "loginrequiredexception",
+    "you must be logged in",
+    "must be logged in",
+    "http redirect to login page",
+    "account credentials required",
+    "posts are private",
+)
+_HOME_REDIRECT_AUTH_RE = re.compile(
+    r"(?:"
+    r"http redirect to home page\s*\(\s*https?://(?:www\.|m\.|mobile\.|web\.)?(?:instagram|facebook)\.com/?\s*\)"
+    r"|http redirect to home page[^\n]{0,160}\b(?:instagram|facebook|login|auth|account|cookie|session|sign\s*in|private|restricted)\b"
+    r"|\b(?:instagram|facebook|login|auth|account|cookie|session|sign\s*in|private|restricted)\b[^\n]{0,160}http redirect to home page"
+    r")"
+)
+_HTTP_RESTRICTED_RE = re.compile(
+    r"(?:"
+    r"\b(?:401\s*unauthorized|403\s*forbidden)\b"
+    r"|(?:http(?:error|\s+error|\s+status)?|status(?:_code)?|response(?:\s+code)?|code)\s*[:=\[\('\"\\\s]{1,6}(?:401|403)\b"
+    r"|\"error\"\s*:\s*\"httperror\"\s*,\s*\"message\"\s*:\s*\"'?(?:401|403)(?:\b|\s|')"
+    r"|'(?:401|403)\s*[^']*'\s+for\s+'"
+    r"|\b(?:401|403)\s+client\s+error\b"
+    r"|\(\s*(?:401|403)\s*\)"
+    r")"
+)
 _EXTRACTOR_RUNTIME_ERRORS = ("unboundlocalerror", "indexerror", "valueerror", "runtimeerror", "parseerror")
-_RATE_LIMIT_RE = re.compile(r"(?:\b429\b|too many requests|rate[_ ]?limit|ratelimit|please wait a few minutes)")
+_RATE_LIMIT_RE = re.compile(
+    r"(?:"
+    r"\b429\b"
+    r"|too many requests"
+    r"|rate[_ ]?limit"
+    r"|ratelimit"
+    r"|please wait a few minutes"
+    r"|temporarily blocked(?: from viewing images)?"
+    r")"
+)
 _NOT_FOUND_RE = re.compile(r"(?:\b404\b|not found|unsupported url)")
 _GDL_USER_NOT_FOUND_RE = re.compile(r"notfounderror.{0,120}(?:requested user could not be found|user)|requested user could not be found")
 _INSTALOADER_NOT_EXISTS_RE = re.compile(r"profilenotexistsexception|profile\s+\S+\s+does not exist|does not exist\.")
@@ -220,7 +264,12 @@ def classify_cli_outcome(
         return None
     if _RATE_LIMIT_RE.search(low):
         return "rate_limited"
-    if any(token in low for token in _CHALLENGE_PATTERNS) or any(token in low for token in _AUTH_ERROR_PATTERNS):
+    if (
+        any(token in low for token in _CHALLENGE_PATTERNS)
+        or any(token in low for token in _AUTH_ERROR_PATTERNS)
+        or _HOME_REDIRECT_AUTH_RE.search(low)
+        or _HTTP_RESTRICTED_RE.search(low)
+    ):
         return "restricted"
     base = classify_social_failure(exit_code, diag)
     if base == "rate_limited":

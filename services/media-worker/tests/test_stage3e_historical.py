@@ -1053,3 +1053,293 @@ def test_consolidated_historical_mode_through_m4_approval_start_ai_rights_ledger
     assert st == 200 and plan["status"] == "ready" and plan["visibility"] == "private" and plan["public_sharing"] is False
     assert [a["asset_id"] for a in plan["assets"]] == [fb_ok["asset_id"]]
     assert plan["assets"][0]["filename"].endswith(".jpg")
+
+
+@pytest.mark.parametrize(
+    ("label", "code", "output", "expected_class", "expected_stop", "expected_term"),
+    [
+        (
+            "ig_login_redirect_with_code6",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "AbortExtraction", "message": "HTTP redirect to login page (https://www.instagram.com/accounts/login/)"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "ig_home_redirect_auth_with_code6",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "AbortExtraction", "message": "HTTP redirect to home page (https://www.instagram.com/)"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "ig_home_redirect_stderr_context",
+            1,
+            "[instagram][error] AbortExtraction: HTTP redirect to home page",
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "ig_challenge_redirect_with_code6",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "AbortExtraction", "message": "HTTP redirect to challenge page (https://www.instagram.com/challenge/)"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "ig_challenge_error_envelope",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "ChallengeError", "message": "Cloudflare challenge (403 Forbidden) for 'https://www.instagram.com/'"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "fb_auth_required_must_be_logged_in_with_code6",
+            0,
+            json.dumps([
+                [6, FB, {}],
+                [-1, {"error": "AuthRequired", "message": "You must be logged in to continue viewing images.\nYou can use this URL..."}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "fb_auth_required_profile_cookies",
+            0,
+            json.dumps([
+                [-1, {"error": "AuthRequired", "message": "authenticated cookies needed to access this profile ('This content isn't available right now')"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "plain_you_must_be_logged_in",
+            1,
+            "You must be logged in to continue viewing images.",
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "fb_temporarily_blocked_comet_with_code6",
+            0,
+            json.dumps([
+                [6, FB, {}],
+                [-1, {"error": "AbortExtraction", "message": "You've been temporarily blocked from viewing images.\nPlease try using a different account, using a VPN or waiting before you retry."}],
+            ]),
+            "rate_limited",
+            "rate_limited",
+            "rate_limited",
+        ),
+        (
+            "http_401_empty_reason_with_code6",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "HttpError", "message": "'401 ' for 'https://www.instagram.com/api/v1/users/web_profile_info/'"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "http_403_empty_reason_with_code6",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "HttpError", "message": "'403 ' for 'https://www.instagram.com/api/v1/users/web_profile_info/'"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "http_429_empty_reason_with_code6",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "HttpError", "message": "'429 ' for 'https://www.instagram.com/api/v1/users/web_profile_info/'"}],
+            ]),
+            "rate_limited",
+            "rate_limited",
+            "rate_limited",
+        ),
+        (
+            "ig_posts_are_private_warning",
+            0,
+            "[instagram][warning] lilysclubuk's posts are private\n[]",
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "ig_checkpoint_required_with_code6",
+            0,
+            json.dumps([[6, IG, {"message": "checkpoint_required"}]]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+    ],
+)
+def test_stage3g1_gallery_dl_13220_restrictions_never_trigger_instaloader_fallback(
+    tmp_path, label, code, output, expected_class, expected_stop, expected_term,
+):
+    """Stage 3G.1 Task 1: All real gallery-dl 1.32.20 access restrictions and temporary blocks
+    must hard-stop without ever triggering Instaloader fallback, even alongside gallery-dl code 6."""
+    from app.social_discovery import _extract_diagnostic_text, classify_cli_outcome
+    from app.social_normalizers import gallery_error_codes, parse_gallery_json
+
+    records = parse_gallery_json(output)
+    diag = _extract_diagnostic_text("gallery-dl", output, records)
+    classified = classify_cli_outcome("gallery-dl", code, output, gallery_error_codes(records), diagnostic_text=diag)
+    assert classified == expected_class, (label, classified, diag)
+
+    for mode_idx, historical_mode in enumerate((True, False)):
+        calls: list[str] = []
+
+        def runner(cmd: list[str], _stage: Path) -> tuple[int, str]:
+            calls.append(cmd[0])
+            return code, output
+
+        job_dir = tmp_path / f"{abs(hash((label, mode_idx))) % 10**32:032x}"
+        job_dir.mkdir(exist_ok=True)
+        cp = CollectionCheckpoint(job_dir, {"job_id": job_dir.name, **WINDOW})
+        inv = OpenSourceSocialInventory(
+            "instagram",
+            IG,
+            permission_confirmed=True,
+            window_start_utc=WINDOW["window_start_utc"],
+            item_limit=10,
+            request_budget=4,
+            time_budget_seconds=30,
+            allow_fallbacks=True,
+            runner=runner,
+            historical_mode=historical_mode,
+            batch_size=5,
+            include_reels=historical_mode,
+        )
+        rep = cp.run_source("instagram", IG, inv, lambda *_: None, page_budget=3, transfer_budget=0, byte_limit=1024)
+        assert calls == ["gallery-dl"], (label, historical_mode, calls)
+        assert rep["stop_reason"] == expected_stop, (label, historical_mode, rep["stop_reason"])
+        assert rep["termination_reason"] == expected_term, (label, historical_mode, rep["termination_reason"])
+        assert rep["coverage"] == "incomplete" and rep["coverage_percentage"] is None
+
+
+def test_stage3g1_non_restriction_fallbacks_preserved_and_non_auth_redirects_or_500_not_misclassified(tmp_path):
+    """Stage 3G.1 Task 1 & 2:
+    1. Non-auth generic home redirect and HTTP 500 with '/403/' in URL are NOT misclassified as restricted.
+    2. Ambiguous non-restriction gallery-dl failures (user_lookup_not_found, plain code 6, extractor_broken)
+       still trigger single bounded Instaloader fallback.
+    3. Both Facebook and Instagram Historical Mode generated commands omit --date-after while preserving
+       frozen 365-day UTC publication-evidence filtering and honest incomplete coverage."""
+    from app.social_discovery import _extract_diagnostic_text, classify_cli_outcome
+    from app.social_normalizers import gallery_error_codes, parse_gallery_json
+
+    # Non-auth generic home redirect must NOT be misclassified as restricted.
+    generic_home = json.dumps([
+        [-1, {"error": "AbortExtraction", "message": "HTTP redirect to home page (https://example.org/)"}],
+    ])
+    recs_gh = parse_gallery_json(generic_home)
+    assert classify_cli_outcome(
+        "gallery-dl", 0, generic_home, gallery_error_codes(recs_gh),
+        diagnostic_text=_extract_diagnostic_text("gallery-dl", generic_home, recs_gh),
+    ) == "source_stopped"
+
+    # HTTP 500 whose URL path happens to contain '/403/' must NOT false-positive as 403 restricted.
+    http_500 = json.dumps([
+        [-1, {"error": "HttpError", "message": "'500 Internal Server Error' for 'https://www.instagram.com/p/403/'"}],
+    ])
+    recs_500 = parse_gallery_json(http_500)
+    assert classify_cli_outcome(
+        "gallery-dl", 0, http_500, gallery_error_codes(recs_500),
+        diagnostic_text=_extract_diagnostic_text("gallery-dl", http_500, recs_500),
+    ) == "source_stopped"
+
+    # Ambiguous non-restriction failures STILL trigger Instaloader fallback in Historical Mode.
+    for idx, (gdl_code, gdl_out, expected_gdl_outcome) in enumerate((
+        (0, json.dumps([[-1, {"error": "NotFoundError", "message": "Requested user could not be found"}]]), "user_lookup_not_found"),
+        (0, json.dumps([[6, IG, {"message": "Instagram feed endpoint gated"}]]), "gallery_dl_error_6"),
+        (0, json.dumps([[-1, {"error": "UnboundLocalError", "message": "cannot access local variable"}]]), "extractor_broken"),
+    )):
+        tools_seen: list[str] = []
+        gdl_cmds: list[list[str]] = []
+
+        def ok_fallback_runner(cmd: list[str], stage: Path, c=gdl_code, o=gdl_out, i=idx) -> tuple[int, str]:
+            tools_seen.append(cmd[0])
+            if cmd[0] == "gallery-dl":
+                gdl_cmds.append(cmd)
+                return c, o
+            sidecar = {
+                "instaloader": {"version": "4.16", "node_type": "Post"},
+                "node": {
+                    "id": f"ig-ambig-{i}",
+                    "shortcode": f"IgAmbig{i}",
+                    "is_video": False,
+                    "display_url": f"{APPROVED_CDN}/ig-ambig-{i}.jpg",
+                    "taken_at_timestamp": int(datetime(2026, 11, 10, 12, 0, tzinfo=UTC).timestamp()),
+                },
+            }
+            (stage / f"2026-11-10_12-00-0{i}_UTC.json").write_text(json.dumps(sidecar), encoding="utf-8")
+            return 0, ""
+
+        jd = tmp_path / f"{(idx + 10):032x}"
+        jd.mkdir()
+        cp = CollectionCheckpoint(jd, {"job_id": jd.name, **WINDOW})
+        inv = OpenSourceSocialInventory(
+            "instagram", IG, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+            item_limit=10, request_budget=4, time_budget_seconds=30, allow_fallbacks=True,
+            runner=ok_fallback_runner, historical_mode=True, batch_size=5, include_reels=False,
+        )
+        rep = cp.run_source("instagram", IG, inv, lambda *_: None, page_budget=2, transfer_budget=0, byte_limit=1024)
+        assert tools_seen == ["gallery-dl", "instaloader"]
+        assert inv.tools_executed[0]["outcome"] == expected_gdl_outcome
+        assert len(gdl_cmds) == 1 and "--date-after" not in gdl_cmds[0]
+        assert len(rep["assets"]) == 1 and rep["assets"][0]["date_eligibility"] == "in_window"
+
+    # Explicit Task 2 verification: Facebook Historical Mode commands NEVER pass --date-after
+    # (even when photos_albums and &setextract continuation execute), and cutoff_reached keeps coverage incomplete.
+    fb_cmds: list[list[str]] = []
+
+    def fb_cmd_check(cmd: list[str], _stage: Path) -> tuple[int, str]:
+        fb_cmds.append(cmd)
+        assert "--date-after" not in cmd
+        return 0, json.dumps([
+            [3, f"{APPROVED_CDN}/fb-cut-1.jpg", {"category": "facebook", "subcategory": "photos", "id": "95000001", "set_id": "pb.c", "date": "2024-01-01 10:00:00", "extension": "jpg", "next_photo_id": "95000002"}],
+            [3, f"{APPROVED_CDN}/fb-cut-2.jpg", {"category": "facebook", "subcategory": "photos", "id": "95000002", "set_id": "pb.c", "date": "2024-01-02 10:00:00", "extension": "jpg", "next_photo_id": "95000003"}],
+            [3, f"{APPROVED_CDN}/fb-cut-3.jpg", {"category": "facebook", "subcategory": "photos", "id": "95000003", "set_id": "pb.c", "date": "2024-01-03 10:00:00", "extension": "jpg", "next_photo_id": "95000004"}],
+        ])
+
+    jd_fb = tmp_path / ("f" * 30 + "99")
+    jd_fb.mkdir()
+    cp_fb = CollectionCheckpoint(jd_fb, {"job_id": jd_fb.name, **WINDOW})
+    inv_fb = OpenSourceSocialInventory(
+        "facebook", FB, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+        item_limit=10, request_budget=4, time_budget_seconds=30, runner=fb_cmd_check,
+        historical_mode=True, batch_size=5, cutoff_consecutive_older=3, include_albums=False,
+    )
+    rep_fb = cp_fb.run_source("facebook", FB, inv_fb, lambda *_: None, page_budget=3, transfer_budget=0, byte_limit=1024)
+    assert len(fb_cmds) == 1 and "--date-after" not in fb_cmds[0]
+    assert rep_fb["stop_reason"] == "cutoff_reached"
+    assert rep_fb["termination_reason"] == "cutoff_reached_with_evidence"
+    assert rep_fb["coverage"] == "incomplete" and rep_fb["coverage_percentage"] is None
+    assert all(a["date_eligibility"] == "out_of_window" for a in rep_fb["assets"])
