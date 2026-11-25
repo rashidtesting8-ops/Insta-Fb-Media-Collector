@@ -13,9 +13,13 @@ This runbook defines the exact, reversible operator steps to cut over the live l
    ```powershell
    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
    ```
-2. Back up the live SQLite database before any schema migration (replace `D:/pgm-media-storage/jobs` with your actual `MEDIA_STORAGE_DIR`):
+2. Take an online WAL-consistent backup of the live SQLite database before any schema migration (do **not** use raw `Copy-Item` / `cp` against a WAL-mode database, as uncommitted `-wal` frames will be dropped):
    ```powershell
-   Copy-Item "D:/pgm-media-storage/jobs/_system/jobs.sqlite" "D:/pgm-media-storage/jobs/_system/jobs.sqlite.pre-v2.1.bak"
+   docker exec pgm-media-collector-1 python /srv/scripts/sqlite_backup.py --db /data/projects/_system/jobs.sqlite --out-dir /data/projects/_system/backups --keep 14
+   ```
+   Verify the created backup file and SHA-256 sidecar before proceeding:
+   ```powershell
+   docker exec pgm-media-collector-1 python /srv/scripts/sqlite_backup.py --verify /data/projects/_system/backups/<backup-filename>.bak
    ```
 3. Confirm your local `.env` (never committed) defines all required V2.1 variables from `.env.example`:
    - `MEDIA_STORAGE_DIR=D:/pgm-media-storage/jobs` (or your chosen host storage directory)
@@ -24,7 +28,7 @@ This runbook defines the exact, reversible operator steps to cut over the live l
    - `M4_COLLECTION_APPROVAL_ENABLED=1`
    - `NAMED_ASSERTION_SECRET=<independent 32+ char secret>`
    - `MEDIA_WORKER_TOKEN=<admin token>` and `MEDIA_WORKER_DASHBOARD_TOKEN=<separate read token>`
-   - `AI_PROVIDER=openai_compatible`, `AI_MODEL=qwen/qwen3.8-27b`, `AI_ENDPOINT=https://api.groq.com/openai/v1/chat/completions`, `AI_API_KEY=<groq key>`, `AI_BATCH_SIZE=1`, `AI_MAX_IMAGES_PER_REQUEST=3`, `AI_MAX_REQUESTS_PER_JOB=40`, `AI_MODE_A_MAX_OUTPUT_TOKENS=1200`, `AI_MODE_B_MAX_OUTPUT_TOKENS=1800`
+   - `AI_PROVIDER=openai_compatible`, `AI_MODEL=qwen/qwen3.8-27b`, `AI_ENDPOINT=https://api.groq.com/openai/v1/chat/completions`, `AI_ALLOWED_ENDPOINTS=https://api.groq.com/openai/v1/chat/completions`, `AI_API_KEY=<groq key>`, `AI_BATCH_SIZE=1`, `AI_MAX_IMAGES_PER_REQUEST=1`, `AI_MIN_REQUEST_SPACING_S=5`, `AI_MAX_RETRIES=3`, `AI_MAX_REQUESTS_PER_JOB=25`, `AI_MODE_A_MAX_OUTPUT_TOKENS=850`, `AI_MODE_B_MAX_OUTPUT_TOKENS=950`, `AI_MAX_COST_USD_PER_JOB=0.25`, `AI_PRICE_IN_PER_1K=0.0008`, `AI_PRICE_OUT_PER_1K=0.004` *(increase `AI_MODE_A/B_MAX_OUTPUT_TOKENS` and `AI_MAX_IMAGES_PER_REQUEST` only after upgrading Groq past the `1,000` OTPM `on_demand` tier)*
    - `N8N_PIPELINE_TOKEN=<pipeline webhook token>` and `N8N_ADMIN_WEBHOOK_TOKEN=<separate admin webhook token>`
    - `GOOGLE_DRIVE_READY=1` (only after confirming Google Drive OAuth2 credential in n8n)
 4. Validate rendered Compose config without starting containers:
