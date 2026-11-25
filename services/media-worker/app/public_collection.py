@@ -24,9 +24,125 @@ _ROBOTS_SITEMAP_RE = re.compile(r"^\s*sitemap\s*:\s*(\S+)\s*$", re.IGNORECASE | 
 
 def origin(url):
     parts = urlsplit(url)
-    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username is not None:
+    if (
+        parts.scheme not in ("http", "https")
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+    ):
         raise ValueError("Expected a credential-free public HTTP(S) origin")
     return parts.scheme, parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+
+
+def _origin_str(url: str) -> str:
+    scheme, host, port = origin(url)
+    default_port = 443 if scheme == "https" else 80
+    netloc = host if port == default_port else f"{host}:{port}"
+    return f"{scheme}://{netloc}"
+
+
+def _website_media_origins(website_url: str) -> list[str]:
+    scheme, host, port = origin(website_url)
+    default_port = 443 if scheme == "https" else 80
+    hosts = [host]
+    if host.startswith("www.") and len(host) > 4:
+        hosts.append(host[4:])
+    elif "." in host and not host.startswith("www."):
+        hosts.append("www." + host)
+    out: list[str] = []
+    for h in hosts:
+        netloc = h if port == default_port else f"{h}:{port}"
+        candidate = f"{scheme}://{netloc}"
+        if candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def build_multitenant_collection_config(job: dict) -> dict:
+    """Build a bounded, multi-tenant V2.1 historical collection config from any submitted job."""
+    website_url = str(job["website_url"])
+    facebook_url = job.get("facebook_url")
+    instagram_url = job.get("instagram_url")
+    social_confirmed = job.get("social_permission_confirmed") is True
+
+    web_pages = max(1, min(int(job.get("max_pages") or 10), 25))
+    web_media = max(1, min(int(job.get("max_media") or 30), 80))
+    social_files = max(1, min(int(job.get("max_social_files") or 20), 60))
+
+    sources: dict[str, dict] = {
+        "website": {
+            "url": website_url,
+            "sitemaps": [],
+            "discover_robots_sitemaps": True,
+            "media_origins": _website_media_origins(website_url),
+            "download_authorized": True,
+            "page_budget": web_pages,
+            "entry_limit": web_media,
+            "transfer_budget": web_media,
+            "request_budget": max(32, web_pages * 4 + web_media * 2),
+            "document_limit": 2 * 1024 * 1024,
+            "byte_limit": 25 * 1024 * 1024,
+            "source_byte_budget": 150 * 1024 * 1024,
+            "time_budget_seconds": 120,
+            "validate_content_magic": True,
+        },
+    }
+    if facebook_url:
+        sources["facebook"] = {
+            "url": str(facebook_url),
+            "discovery_mode": "open_source_cli",
+            "download_authorized": social_confirmed,
+            "media_origins": [_origin_str(str(facebook_url))],
+            "media_host_suffixes": [".fbcdn.net", ".fbsbx.com"],
+            "allow_fallbacks": True,
+            "page_budget": 6,
+            "cli_request_budget": 8,
+            "batch_size": 10,
+            "entry_limit": social_files,
+            "transfer_budget": social_files if social_confirmed else 0,
+            "request_budget": max(32, social_files * 2 + 16),
+            "byte_limit": 25 * 1024 * 1024,
+            "source_byte_budget": 150 * 1024 * 1024,
+            "time_budget_seconds": 180,
+            "include_albums": True,
+            "album_limit": 3,
+            "skip_out_of_window_downloads": True,
+            "validate_content_magic": True,
+        }
+    if instagram_url:
+        sources["instagram"] = {
+            "url": str(instagram_url),
+            "discovery_mode": "open_source_cli",
+            "download_authorized": social_confirmed,
+            "media_origins": [_origin_str(str(instagram_url))],
+            "media_host_suffixes": [".cdninstagram.com", ".fbcdn.net"],
+            "allow_fallbacks": True,
+            "page_budget": 4,
+            "cli_request_budget": 4,
+            "batch_size": 10,
+            "entry_limit": social_files,
+            "transfer_budget": social_files if social_confirmed else 0,
+            "request_budget": max(32, social_files * 2 + 16),
+            "byte_limit": 25 * 1024 * 1024,
+            "source_byte_budget": 150 * 1024 * 1024,
+            "time_budget_seconds": 120,
+            "include_reels": True,
+            "skip_out_of_window_downloads": True,
+            "validate_content_magic": True,
+        }
+
+    return {
+        "collection_profile": "historical",
+        "run_preprocessing": True,
+        "global_budgets": {
+            "max_pages": 40,
+            "max_items": 200,
+            "max_transfers": 120,
+            "max_bytes": 250 * 1024 * 1024,
+            "max_time_seconds": 300,
+        },
+        "sources": sources,
+    }
 
 
 def limit(config, key, *, minimum=1):
@@ -47,6 +163,11 @@ class PublicHTTP:
     def __init__(self, source_url, config, session, held_origins=None):
         self.origin = origin(source_url)
         self.media_origins = {origin(url) for url in config["media_origins"]}
+        self.media_host_suffixes = tuple(
+            s.lower()
+            for s in (config.get("media_host_suffixes") or ())
+            if isinstance(s, str) and s.startswith(".") and len(s) >= 4 and "/" not in s
+        )
         self.session = session
         self.robots = {}
         self.held_origins = held_origins if held_origins is not None else {}
@@ -57,10 +178,23 @@ class PublicHTTP:
         if time.monotonic() >= self.deadline:
             raise SourceStop("time_budget")
 
-    def _network_policy(self, url, allowed):
+    def _origin_matches(self, current, allowed, *, allow_media_suffixes=False):
+        if current in allowed:
+            return True
+        if allow_media_suffixes and self.media_host_suffixes:
+            scheme, host, port = current
+            low_host = host.lower().rstrip(".")
+            if scheme == "https" and port == 443 and any(
+                low_host.endswith(suffix) and len(low_host) > len(suffix)
+                for suffix in self.media_host_suffixes
+            ):
+                return True
+        return False
+
+    def _network_policy(self, url, allowed, *, allow_media_suffixes=False):
         self._clock()
         current = origin(url)
-        if current not in allowed:
+        if not self._origin_matches(current, allowed, allow_media_suffixes=allow_media_suffixes):
             raise SourceStop("access_blocked")
         if current in self.held_origins:
             raise SourceStop(self.held_origins[current])
@@ -88,17 +222,17 @@ class PublicHTTP:
         return origin(url) == self.origin and self._robots(url)
 
     def media_permitted(self, url):
-        # Discovery checks origin only. Robots rules are checked for each actual download hop.
-        return origin(url) in self.media_origins
+        # Discovery checks origin/suffix only. Robots rules are checked for each actual download hop.
+        return self._origin_matches(origin(url), self.media_origins, allow_media_suffixes=True)
 
-    def _get(self, url, allowed, headers=None):
+    def _get(self, url, allowed, headers=None, *, allow_media_suffixes=False):
         def check_hop(hop):
             path = urlsplit(hop).path.lower().rstrip("/")
             if path in ("/login", "/login.php", "/accounts/login", "/checkpoint", "/challenge"):
                 raise SourceStop("restricted")
-            if origin(hop) not in allowed or not self._robots(hop):
+            if not self._origin_matches(origin(hop), allowed, allow_media_suffixes=allow_media_suffixes) or not self._robots(hop):
                 raise SourceStop("access_blocked")
-            self._network_policy(hop, allowed)
+            self._network_policy(hop, allowed, allow_media_suffixes=allow_media_suffixes)
 
         response = response_get(self.session, url, stream=True, url_policy=check_hop, headers=headers)
         try:
@@ -146,7 +280,7 @@ class PublicHTTP:
         if offset and revision:
             headers.update(Range=f"bytes={offset}-", **{"If-Range": revision})
         try:
-            response = self._get(url, self.media_origins, headers)
+            response = self._get(url, self.media_origins, headers, allow_media_suffixes=True)
         except HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else 0
             if offset and status_code == 416:
@@ -311,14 +445,33 @@ def collect_public_job(
         )
 
     configs = configuration["sources"]
+    active_sources: list[str] = []
     for source in SOURCES:
-        if configs[source]["url"] != job[source + "_url"]:
+        submitted_url = job.get(source + "_url")
+        if source == "instagram" and not submitted_url:
+            continue
+        if source not in configs or configs[source].get("url") != submitted_url:
             raise ValueError("Public collection configuration does not match the submitted source URLs")
+        active_sources.append(source)
     state = CollectionCheckpoint(job_dir, job)
     reports = {}
     tools_by_source = {}
     held_origins = {}
     for source in SOURCES:
+        if source not in active_sources:
+            reports[source] = {
+                "status": "not_requested",
+                "coverage": "not_requested",
+                "coverage_percentage": None,
+                "items": [],
+                "assets": [],
+                "unknown_date_review": [],
+                "issues": [],
+                "stop_reason": None,
+                "termination_reason": None,
+                "listing_exhausted": False,
+            }
+            continue
         config = configs[source]
         url = config["url"]
         with session_factory() as session:
@@ -371,6 +524,7 @@ def collect_public_job(
                 "url": url,
                 "media_origins": sorted(transport.media_origins),
                 "sitemaps": config.get("sitemaps", []),
+                **({"media_host_suffixes": list(transport.media_host_suffixes)} if transport.media_host_suffixes else {}),
                 **({"discovery_mode": config["discovery_mode"]} if config.get("discovery_mode") else {}),
                 **({"collection_profile": profile} if is_historical else {}),
             }
@@ -450,6 +604,7 @@ def publish_checkpoint_manifest(
     global_budget_usage=None,
 ):
     manifest = {"job_id": job["job_id"], "schema_version": SCHEMA_VERSION,
+                "website_url": job.get("website_url"),
                 **{field: job[field] for field in WINDOW_FIELDS},
                 "collection_mode": mode, "collection_gate": COLLECTION_HOLD,
                 "sources": {}, "assets": []}
@@ -460,7 +615,7 @@ def publish_checkpoint_manifest(
     by_digest = {}
     for source, report in reports.items():
         manifest["sources"][source] = {
-            key: report[key] for key in ("items", "coverage", "coverage_percentage", "cursor",
+            key: report[key] for key in ("status", "items", "coverage", "coverage_percentage", "cursor",
                                         "stop_reason", "termination_reason", "issues", "listing_exhausted")
             if key in report
         }

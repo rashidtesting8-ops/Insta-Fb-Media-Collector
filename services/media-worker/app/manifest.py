@@ -24,7 +24,7 @@ import os
 import tempfile
 from datetime import UTC, datetime, timedelta
 from app.publication import record_publication_review
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 SCHEMA_VERSION = "3.0-unified"
@@ -214,7 +214,7 @@ def validate_against_disk(job_dir: str | Path, manifest: dict[str, Any]) -> list
     Returns a list of problems (empty = valid). Never mutates the manifest.
     """
     problems: list[str] = []
-    root = Path(job_dir)
+    root = Path(job_dir).resolve()
     seen_ids: set[str] = set()
     for item in manifest.get("assets", []):
         asset_id = item.get("asset_id")
@@ -225,10 +225,20 @@ def validate_against_disk(job_dir: str | Path, manifest: dict[str, Any]) -> list
         if item.get("extraction_status") not in (DOWNLOADED, "extracted_frame"):
             continue
         rel = item.get("local_path")
-        if not rel or isinstance(rel, str) and (rel.startswith("/") or ".." in Path(rel).parts):
+        if (
+            not isinstance(rel, str)
+            or not rel
+            or "\\" in rel
+            or PureWindowsPath(rel).drive
+            or Path(rel).is_absolute()
+            or ".." in Path(rel).parts
+        ):
             problems.append(f"{asset_id}: unsafe local_path {rel!r}")
             continue
-        disk = root / str(rel)
+        disk = (root / rel).resolve()
+        if not disk.is_relative_to(root):
+            problems.append(f"{asset_id}: unsafe local_path {rel!r}")
+            continue
         if not disk.is_file():
             problems.append(f"{asset_id}: missing file {rel}")
             continue

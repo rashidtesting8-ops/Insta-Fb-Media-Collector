@@ -49,6 +49,7 @@ from app.legacy_social_collect import (
 )
 from app.manifest import build_social_item, validate_against_disk
 from app.publication import aware_timestamp, publication_evidence
+from app.security import sanitized_subprocess_env
 
 RunnerFn = Callable[[list[str], Path], tuple[int, str]]
 
@@ -88,7 +89,11 @@ def _tool_version(executable: str, runner: RunnerFn | None) -> str | None:
         return None
     try:
         proc = subprocess.run(
-            [executable, "--version"], capture_output=True, text=True, timeout=15
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=sanitized_subprocess_env(allow_proxy=False),
         )
     except (OSError, subprocess.SubprocessError):
         return None

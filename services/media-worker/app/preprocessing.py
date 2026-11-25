@@ -31,12 +31,17 @@ import json
 import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
 from app.manifest import atomic_write_json, utc_now_iso, validate_against_disk
+from app.security import sanitized_subprocess_env
+
+# Bound Pillow decode size to prevent decompression-bomb OOMs in a 1 GiB worker container.
+MAX_IMAGE_PIXELS = 25_000_000
+Image.MAX_IMAGE_PIXELS = min(Image.MAX_IMAGE_PIXELS or MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS)
 
 # --- Bounded resource limits (deterministic; documented in PHASE_4_REPORT) ---
 MAX_VIDEO_DURATION_S = 600.0     # skip longer videos (bounded by design)
@@ -221,6 +226,7 @@ def probe_video(path: Path) -> dict[str, Any]:
         capture_output=True,
         text=True,
         timeout=FFPROBE_TIMEOUT_S,
+        env=sanitized_subprocess_env(allow_proxy=False),
     )
     if proc.returncode != 0:
         raise ValueError((proc.stderr or "ffprobe failed").strip()[-200:])
@@ -270,7 +276,13 @@ def extract_frames(
             str(target),
         ]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_S)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=FFMPEG_TIMEOUT_S,
+                env=sanitized_subprocess_env(allow_proxy=False),
+            )
         except subprocess.TimeoutExpired:
             frames.append({"index": index, "timestamp_s": timestamp, "error": "ffmpeg_timeout"})
             continue
@@ -302,12 +314,16 @@ def extract_frames(
 # ---------------------------------------------------------------------------
 
 def _resolve(job_dir: Path, local_path: str | None) -> Path | None:
-    if not local_path:
+    if not isinstance(local_path, str) or not local_path or "\\" in local_path or PureWindowsPath(local_path).drive:
         return None
     candidate = Path(local_path)
     if candidate.is_absolute() or ".." in candidate.parts:
         return None  # unsafe path is reported, never followed
-    return job_dir / candidate
+    resolved_root = job_dir.resolve()
+    resolved = (job_dir / candidate).resolve()
+    if not resolved.is_relative_to(resolved_root):
+        return None
+    return resolved
 
 
 def _date_category(item: dict[str, Any], cutoff_iso: str | None) -> str:
@@ -343,7 +359,19 @@ def run_media_preprocessing(
     duplicate_groups: list[dict[str, Any]] = []
     frame_assets: list[dict[str, Any]] = []
 
+    # Make re-runs idempotent: drop previously derived ffmpeg frame entries before regenerating them.
+    manifest["assets"] = [
+        item for item in manifest.get("assets", [])
+        if not (
+            item.get("type") == "frame"
+            and item.get("extraction_status") == "extracted_frame"
+            and (item.get("detail") or {}).get("origin") == "ffmpeg_frame_extraction"
+        )
+    ]
+
     for item in manifest.get("assets", []):
+        item.pop("duplicate_group_id", None)
+        item.pop("representative", None)
         status = str(item.get("extraction_status") or "")
         if status not in ("downloaded", "extracted_frame") and not (status == "duplicate" and item.get("local_path")):
             continue  # honest per-item failure rows carry no file to analyze
@@ -393,7 +421,7 @@ def run_media_preprocessing(
             item["phash"] = phashes[item["asset_id"]] = phash_file(disk)
             item["preprocessing"] = {"outcome": "processed"}
             result.images_analyzed += 1
-        except (UnidentifiedImageError, OSError, ValueError) as exc:
+        except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError) as exc:
             item["quality"] = None
             item["preprocessing"] = {"outcome": "corrupted", "note": str(exc)[:160]}
             result.images_problem += 1
@@ -423,28 +451,40 @@ def run_media_preprocessing(
         (aid, phashes[aid])
         for aid in sorted(phashes)
     ]
-    assigned: dict[str, str] = {}
+    parent: dict[str, str] = {}
+
+    def _find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a: str, b: str) -> None:
+        parent.setdefault(a, a)
+        parent.setdefault(b, b)
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            if ra < rb:
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
     for i in range(len(hash_items)):
         aid_a, hash_a = hash_items[i]
         for j in range(i + 1, len(hash_items)):
             aid_b, hash_b = hash_items[j]
             if exact_map.get(aid_a) and exact_map.get(aid_a) == exact_map.get(aid_b):
                 continue  # already grouped by exact sha256
-            if assigned.get(aid_a) and assigned.get(aid_a) == assigned.get(aid_b):
-                continue
-            distance = _hamming_hex(hash_a, hash_b)
-            if distance > NEAR_DUP_HAMMING_MAX:
-                continue
-            group_id = assigned.get(aid_a) or assigned.get(aid_b)
-            if group_id is None:
-                group_no += 1
-                group_id = f"dg_{group_no:04d}"
-            assigned[aid_a] = group_id
-            assigned[aid_b] = group_id
-    for group_id in sorted(set(assigned.values())):
-        members = sorted(a for a, g in assigned.items() if g == group_id)
+            if _hamming_hex(hash_a, hash_b) <= NEAR_DUP_HAMMING_MAX:
+                _union(aid_a, aid_b)
+
+    components: dict[str, list[str]] = {}
+    for aid in sorted(parent):
+        components.setdefault(_find(aid), []).append(aid)
+    for members in sorted((sorted(m) for m in components.values() if len(m) >= 2), key=lambda m: m[0]):
+        group_no += 1
         duplicate_groups.append(
-            _make_group(group_id, "perceptual_dhash", members, manifest, result)
+            _make_group(f"dg_{group_no:04d}", "perceptual_dhash", members, manifest, result)
         )
 
     # singletons get deterministic group ids for explainability
@@ -649,11 +689,12 @@ def _make_group(
     if method == "perceptual_dhash":
         hashes = [by_id.get(m, {}).get("phash") for m in members]
         if all(hashes):
-            group["hamming_distances"] = {
+            distances = {
                 f"{members[i]}~{members[j]}": _hamming_hex(hashes[i], hashes[j])
                 for i in range(len(members))
                 for j in range(i + 1, len(members))
             }
-            group["max_hamming_distance"] = max(group["hamming_distances"].values())
+            group["hamming_distances"] = distances
+            group["max_hamming_distance"] = max(distances.values()) if distances else 0
             group["threshold"] = NEAR_DUP_HAMMING_MAX
     return group

@@ -117,6 +117,33 @@ def build_delivery_plan(
         if not ok:
             return {"status": "blocked_unverified_collection", "job_id": job_id, "assets": [], "reason": reason}
         use_rights_ledger = True
+    elif db_path is not None and not _fixture_or_mock(envelope):
+        # Unify M4 immutable rights ledger across standard (non-checkpoint) M4-approved jobs too,
+        # while keeping pre-M4 historical jobs (no collection_revisions row) backward-compatible.
+        import sqlite3
+        from contextlib import closing
+
+        has_revision = False
+        try:
+            with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as con:
+                con.execute("PRAGMA busy_timeout=5000;")
+                has_table = con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_revisions'"
+                ).fetchone()
+                if has_table:
+                    has_revision = bool(
+                        con.execute("SELECT 1 FROM collection_revisions WHERE job=? LIMIT 1", (job_id,)).fetchone()
+                    )
+        except sqlite3.Error:
+            has_revision = False
+        if has_revision:
+            from app.collection_approval import verify_checkpoint_release
+
+            root = Path(projects_root) if projects_root is not None else job_dir.parent
+            ok, reason, verified_rights, eligible_ids = verify_checkpoint_release(Path(db_path), root, job_id, manifest)
+            if not ok:
+                return {"status": "blocked_unverified_collection", "job_id": job_id, "assets": [], "reason": reason}
+            use_rights_ledger = True
     by_id = {a.get("asset_id"): a for a in manifest.get("assets", [])}
     selected = list(dict.fromkeys(envelope.get("curation", {}).get("selected_asset_ids", [])))
     rights_review = set(envelope.get("curation", {}).get("rights_review_required_ids", []))

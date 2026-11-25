@@ -127,7 +127,7 @@ def snapshot(root, record):
     return raw, subset_text, inventory
 
 
-def accept(con, root, record, expected_revision):
+def accept(con, root, record, expected_revision, *, precomputed_snapshot=None):
     """Each accepted collection publication is a revision, including identical re-collections."""
     job = record["job_id"]
     previous = con.execute("""SELECT revision,created_utc,window_start_utc,window_end_utc,submitter
@@ -141,7 +141,7 @@ def accept(con, root, record, expected_revision):
         raise HTTPException(412, "Concurrent collection publication")
     if previous and previous[1:] != binding:
         raise conflict("Original window or submitter changed")
-    raw, subset, inventory = snapshot(root, record)
+    raw, subset, inventory = precomputed_snapshot if precomputed_snapshot is not None else snapshot(root, record)
     revision = previous[0] + 1 if previous else 1
     con.execute("INSERT INTO collection_revisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job, revision, *binding, sha(raw), sha(subset.encode()), raw, subset, inventory, utc()))
@@ -155,7 +155,23 @@ def epoch(con, actor):
         AND (event='suspend' OR event LIKE 'role/%')""", (actor,)).fetchone()[0]
 
 
-def review_state(con, root, job):
+def _matching_precomputed_snapshot(precomputed_snapshot, payload_raw, root, job):
+    if precomputed_snapshot is None:
+        return None
+    expected_payload, expected_stat, snap = precomputed_snapshot
+    if expected_payload != payload_raw:
+        return None
+    try:
+        manifest_path = Path(root).resolve() / job / "manifest.json"
+        st = manifest_path.stat()
+        if (st.st_mtime_ns, st.st_size) == expected_stat:
+            return snap
+    except OSError:
+        return None
+    return None
+
+
+def review_state(con, root, job, *, precomputed_snapshot=None):
     row = con.execute("SELECT payload FROM jobs WHERE id=?", (job,)).fetchone()
     if not row:
         raise HTTPException(404, "Unknown job")
@@ -168,7 +184,8 @@ def review_state(con, root, job):
     current = False
     if record["status"] in ("partial_success", "extraction_complete") and record.get("submitter_principal_id") == submitter:
         try:
-            raw, subset, sources = snapshot(root, record)
+            snap = _matching_precomputed_snapshot(precomputed_snapshot, row[0], root, job)
+            raw, subset, sources = snap if snap is not None else snapshot(root, record)
             current = (sha(raw), sha(subset.encode()), sources) == (manifest_sha, subset_sha, inventory)
         except (OSError, ValueError, KeyError, TypeError, HTTPException):
             pass
@@ -273,7 +290,8 @@ def verify_checkpoint_release(
         "ai_provider_attempts",
     }
     try:
-        with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as con:
+        with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=10)) as con:
+            con.execute("PRAGMA busy_timeout=5000;")
             existing = {
                 row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
             }
@@ -323,7 +341,7 @@ def verify_checkpoint_release(
         return False, "m4_release_verification_failed", {}, set()
 
 
-def handle(con, root, operation, body, actor):
+def handle(con, root, operation, body, actor, *, precomputed_snapshot=None):
     """Trusted caller has verified the Stage 1 assertion/session in this write transaction."""
     action = operation.removeprefix("collection-")
     if action == "rights-review":
@@ -342,7 +360,9 @@ def handle(con, root, operation, body, actor):
     if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_revisions'").fetchone():
         raise HTTPException(503, "M4 collection ledger is not migrated")
     job = body["job_id"]
-    result, submitter, current, sequence, decision, start = review_state(con, root, job)
+    result, submitter, current, sequence, decision, start = review_state(
+        con, root, job, precomputed_snapshot=precomputed_snapshot
+    )
     tag, rev, state = result['etag'], result['revision'], result['state']
     if action == 'panel':
         from app.approval_panel import panel
@@ -434,7 +454,7 @@ def handle(con, root, operation, body, actor):
             raise conflict("Decision already recorded")
         con.execute("INSERT INTO collection_decisions VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (job, rev, sequence + 1, actor, actor_epoch, action, body["reason"].strip(), utc(), key, fingerprint))
-    return handle(con, root, "collection-review", {"job_id": job}, actor)
+    return handle(con, root, "collection-review", {"job_id": job}, actor, precomputed_snapshot=precomputed_snapshot)
 
 
 if __name__ == "__main__":

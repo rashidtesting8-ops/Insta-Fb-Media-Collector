@@ -134,7 +134,7 @@ def validate_intake(payload: Any) -> dict[str, Any]:
             resume = True
 
     website_url = _check_url(payload.get("website_url"), "website_url", errors, required=not resume)
-    instagram_url = _check_url(payload.get("instagram_url"), "instagram_url", errors, required=not resume)
+    instagram_url = _check_url(payload.get("instagram_url"), "instagram_url", errors, required=False)
     facebook_url = _check_url(payload.get("facebook_url"), "facebook_url", errors, required=not resume)
 
     lookback_days = _as_int(payload.get("lookback_days", 365), 365, 1, 366)

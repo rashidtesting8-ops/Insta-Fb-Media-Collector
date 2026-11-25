@@ -231,9 +231,11 @@ def _truncate_to_limits(
     return response, warnings
 
 
-def run_started_curation(job_dir, job_id, *, processing_consent, start_etag, **options):
+def run_started_curation(job_dir, job_id, *, processing_consent, start_etag, on_claimed=None, **options):
     """Internal post-collection dispatch. No intake body supplies consent or ledger location."""
     with ai_execution.execution(job_dir, job_id, processing_consent, start_etag) as staging:
+        if callable(on_claimed):
+            on_claimed()
         result = run_ai_curation(staging, job_id, **options)
         with ai_execution.publication():
             if result.mode_b is not None and (staging / "curation.json").is_file():

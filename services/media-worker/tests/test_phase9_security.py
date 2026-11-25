@@ -102,13 +102,16 @@ def test_job_retry_reuses_existing_id_while_slots_are_full(worker, monkeypatch):
     assert len(submitted) == 1
 
 
-@pytest.mark.parametrize("field, wrong_platform", [
-    ("website_url", "https://www.facebook.com/example/"),
-    ("instagram_url", "https://www.facebook.com/example/"),
-    ("facebook_url", "https://www.instagram.com/example/"),
+@pytest.mark.parametrize("field, wrong_platform, required", [
+    ("website_url", "https://www.facebook.com/example/", True),
+    ("instagram_url", "https://www.facebook.com/example/", False),
+    ("facebook_url", "https://www.instagram.com/example/", True),
 ])
-def test_new_jobs_require_all_source_urls(worker, field, wrong_platform):
-    for value in (None, "", "not a URL", "https://example.test:bad/", wrong_platform):
+def test_new_jobs_require_website_and_facebook_and_validate_optional_instagram(worker, field, wrong_platform, required):
+    bad_values = (None, "", "not a URL", "https://example.test:bad/", wrong_platform) if required else (
+        "not a URL", "https://example.test:bad/", wrong_platform
+    )
+    for value in bad_values:
         payload = {**SOURCE_URLS, field: value}
         if value is None:
             del payload[field]
@@ -119,6 +122,15 @@ def test_new_jobs_require_all_source_urls(worker, field, wrong_platform):
         assert validation["valid"] is False
         assert any(error.startswith(field + ":") for error in validation["errors"])
         assert request(worker.app, "/jobs", "POST", "test-admin", body)[0] == 422
+    if not required:
+        for omitted in (None, ""):
+            payload = {**SOURCE_URLS, field: omitted}
+            if omitted is None:
+                del payload[field]
+            status, _, result = request(worker.app, "/intake/validate", "POST", "test-admin", (json.dumps(payload).encode(),))
+            assert status == 200
+            validation = json.loads(result)
+            assert validation["valid"] is True and validation["create"][field] is None
     with worker.connect() as db:
         assert db.execute("SELECT id FROM jobs").fetchall() == [("a" * 32,)]
 

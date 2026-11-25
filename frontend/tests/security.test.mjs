@@ -70,13 +70,16 @@ test("intake goes only to n8n and excludes rights and resume fields", async () =
   assert.equal(bad.status, 502);
 });
 
-test("invalid or missing source URLs never reach n8n", async () => {
-  for (const [field, wrongPlatform] of [
-    ["website_url", sourceUrls.facebook_url],
-    ["instagram_url", sourceUrls.facebook_url],
-    ["facebook_url", sourceUrls.instagram_url],
+test("invalid or missing required source URLs never reach n8n while Instagram is optional", async () => {
+  for (const [field, wrongPlatform, required] of [
+    ["website_url", sourceUrls.facebook_url, true],
+    ["instagram_url", sourceUrls.facebook_url, false],
+    ["facebook_url", sourceUrls.instagram_url, true],
   ]) {
-    for (const value of [undefined, null, " ", "invalid", "https://example.test:bad/", wrongPlatform]) {
+    const badValues = required
+      ? [undefined, null, " ", "invalid", "https://example.test:bad/", wrongPlatform]
+      : ["invalid", "https://example.test:bad/", wrongPlatform];
+    for (const value of badValues) {
       const result = await submitIntake(
         { ...sourceUrls, [field]: value }, "http://n8n:5678", "test-only",
         () => assert.fail("Invalid job must not reach n8n"),
@@ -85,6 +88,13 @@ test("invalid or missing source URLs never reach n8n", async () => {
       assert.ok(result.body.error.startsWith(field + ":"));
     }
   }
+  const jobId = "cd".repeat(16);
+  const webAndFbOnly = { website_url: sourceUrls.website_url, facebook_url: sourceUrls.facebook_url };
+  const ok = await submitIntake(webAndFbOnly, "http://n8n:5678", "test-only", async (_url, init) => {
+    assert.deepEqual(JSON.parse(init.body), webAndFbOnly);
+    return Response.json({ job_id: jobId }, { status: 202 });
+  });
+  assert.deepEqual(ok, { status: 202, body: { job_id: jobId } });
 });
 
 test("staging workflow retains intake and status without Drive credentials", () => {

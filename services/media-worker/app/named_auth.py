@@ -9,14 +9,26 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import closing
 from functools import lru_cache
+from pathlib import Path
 
 from fastapi import HTTPException
 
 SESSION_SECONDS = 8 * 3600
+_ARGON2_SLOTS = threading.BoundedSemaphore(4)
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_TABLES = frozenset({
+    "named_accounts",
+    "named_sessions",
+    "named_bootstrap",
+    "named_nonces",
+    "named_intakes",
+    "named_audit",
+})
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS named_accounts (
  id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, password TEXT NOT NULL,
@@ -64,12 +76,50 @@ def password_bytes(password):
     return password.encode()
 
 
+def _connect(db):
+    con = sqlite3.connect(db, timeout=10)
+    con.execute("PRAGMA busy_timeout=5000;")
+    mode_row = con.execute("PRAGMA journal_mode;").fetchone()
+    if not mode_row or str(mode_row[0]).lower() != "wal":
+        with _SCHEMA_LOCK:
+            mode_row = con.execute("PRAGMA journal_mode;").fetchone()
+            if not mode_row or str(mode_row[0]).lower() != "wal":
+                con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    return con
+
+
+def _ensure_schema(con):
+    existing = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if not _SCHEMA_TABLES <= existing:
+        with _SCHEMA_LOCK:
+            existing = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if not _SCHEMA_TABLES <= existing:
+                con.executescript(SCHEMA)
+
+
+def _parse_json_body(raw):
+    try:
+        body = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(400, "Invalid JSON body") from None
+    if not isinstance(body, dict):
+        raise denied()
+    return body
+
+
 def password_hash(password):
     raw = password_bytes(password)
     encoded = ctypes.create_string_buffer(128)
-    if sodium().crypto_pwhash_str_alg(encoded, raw, len(raw), 3, 64 * 1024**2, 2):
-        raise RuntimeError("Argon2id unavailable")
+    with _ARGON2_SLOTS:
+        if sodium().crypto_pwhash_str_alg(encoded, raw, len(raw), 3, 64 * 1024**2, 2):
+            raise RuntimeError("Argon2id unavailable")
     return encoded.value.decode()
+
+
+def verify_password(stored_hash, raw_password):
+    with _ARGON2_SLOTS:
+        return sodium().crypto_pwhash_str_verify(stored_hash.encode(), raw_password, len(raw_password)) == 0
 
 
 @lru_cache(maxsize=1)
@@ -77,13 +127,19 @@ def dummy_hash():
     return password_hash(secrets.token_urlsafe(32))
 
 
-def create_account(con, name, password):
+def validate_account_name(name):
     if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", name):
         raise HTTPException(400, "Invalid account name")
+    return name
+
+
+def create_account(con, name, password, *, precomputed_hash=None):
+    validate_account_name(name)
+    hashed = precomputed_hash if precomputed_hash is not None else password_hash(password)
     principal = uuid.uuid4().hex
     try:
         con.execute("INSERT INTO named_accounts VALUES (?,?,?,'admin',1)",
-                    (principal, name, password_hash(password)))
+                    (principal, name, hashed))
     except sqlite3.IntegrityError:
         raise HTTPException(409, "Account already exists") from None
     return principal
@@ -98,14 +154,23 @@ def bootstrap(db, name, password, *, verified_operator):
     # Only a trusted local caller can provide the independently verified operator.
     if not verified_operator:
         raise denied()
-    with closing(sqlite3.connect(db)) as con, con:
-        con.executescript(SCHEMA)
+    validate_account_name(name)
+    password_bytes(password)
+    with closing(_connect(db)) as con:
+        _ensure_schema(con)
+        if con.execute("SELECT 1 FROM named_bootstrap").fetchone() or con.execute(
+                "SELECT 1 FROM named_accounts").fetchone():
+            raise HTTPException(409, "Bootstrap already consumed")
+    # Run memory-hard Argon2id outside SQLite's write lock.
+    hashed = password_hash(password)
+    with closing(_connect(db)) as con, con:
+        _ensure_schema(con)
         con.execute("BEGIN IMMEDIATE")
         if con.execute("SELECT 1 FROM named_bootstrap").fetchone() or con.execute(
                 "SELECT 1 FROM named_accounts").fetchone():
             raise HTTPException(409, "Bootstrap already consumed")
         con.execute("INSERT INTO named_bootstrap VALUES (1)")
-        actor = create_account(con, name, password)
+        actor = create_account(con, name, password, precomputed_hash=hashed)
         audit(con, verified_operator, "bootstrap", actor)
         return actor
 
@@ -155,24 +220,49 @@ def verify_ticket(con, data):
     return session_actor(con, row[0])[0]
 
 
+def _consume_nonce(con, claims, now):
+    con.execute("BEGIN IMMEDIATE")
+    con.execute("DELETE FROM named_nonces WHERE expires<=?", (now,))
+    try:
+        con.execute("INSERT INTO named_nonces VALUES (?,?)", (claims["jti"], claims["exp"]))
+    except sqlite3.IntegrityError:
+        raise denied() from None
+    con.commit()
+
+
+def _precompute_collection_snapshot(db, approval_root, body):
+    """Hash manifest/payload files outside BEGIN IMMEDIATE for collection-* actions."""
+    job_id = body.get("job_id")
+    if not approval_root or not isinstance(job_id, str) or not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        return None
+    try:
+        with closing(_connect(db)) as con:
+            row = con.execute("SELECT payload FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            return None
+        record = json.loads(row[0])
+        if record.get("status") not in ("partial_success", "extraction_complete"):
+            return None
+        manifest_path = Path(approval_root).resolve() / job_id / "manifest.json"
+        if not manifest_path.is_file():
+            return None
+        st = manifest_path.stat()
+        from app.collection_approval import snapshot
+        snap = snapshot(approval_root, record)
+        return (row[0], (st.st_mtime_ns, st.st_size), snap)
+    except (sqlite3.Error, OSError, ValueError, KeyError, TypeError, HTTPException):
+        return None
+
+
 def verify_admin_action(db, action, raw, header, session):
     """Verify HMAC assertion, single-use replay nonce, and active named Admin session, then release DB lock."""
     claims = verify_assertion(header, action, raw, session)
-    body = json.loads(raw)
-    if not isinstance(body, dict):
-        raise denied()
+    body = _parse_json_body(raw)
     session_hash = digest(session)
     now = int(time.time())
-    with closing(sqlite3.connect(db)) as con, con:
-        con.executescript(SCHEMA)
-        con.execute("BEGIN IMMEDIATE")
-        con.execute("DELETE FROM named_nonces WHERE expires<=?", (now,))
-        try:
-            con.execute("INSERT INTO named_nonces VALUES (?,?)", (claims["jti"], claims["exp"]))
-        except sqlite3.IntegrityError:
-            raise denied() from None
-        con.commit()
-        con.execute("BEGIN IMMEDIATE")
+    with closing(_connect(db)) as con, con:
+        _ensure_schema(con)
+        _consume_nonce(con, claims, now)
         if claims["exp"] <= int(time.time()):
             raise denied()
         actor, role = session_actor(con, session_hash)
@@ -183,31 +273,42 @@ def verify_admin_action(db, action, raw, header, session):
 
 def dispatch(db, action, raw, header, session, *, approval_root=None):
     claims = verify_assertion(header, action, raw, session)
-    body = json.loads(raw)
-    if not isinstance(body, dict):
-        raise denied()
+    body = _parse_json_body(raw)
     session_hash = digest(session)
     now = int(time.time())
-    with closing(sqlite3.connect(db)) as con, con:
-        con.executescript(SCHEMA)
-        con.execute("BEGIN IMMEDIATE")
-        con.execute("DELETE FROM named_nonces WHERE expires<=?", (now,))
-        try:
-            con.execute("INSERT INTO named_nonces VALUES (?,?)", (claims["jti"], claims["exp"]))
-        except sqlite3.IntegrityError:
-            raise denied() from None
-        con.commit()
-        con.execute("BEGIN IMMEDIATE")
-        if claims["exp"] <= int(time.time()):
+
+    # Consume replay nonce in a minimal write transaction first.
+    with closing(_connect(db)) as con, con:
+        _ensure_schema(con)
+        _consume_nonce(con, claims, now)
+
+    if claims["exp"] <= int(time.time()):
+        raise denied()
+
+    if action == "login":
+        raw_password = password_bytes(body.get("password"))
+        if not isinstance(body.get("name"), str):
             raise denied()
-        if action == "login":
-            raw_password = password_bytes(body.get("password"))
-            if not isinstance(body.get("name"), str):
+        with closing(_connect(db)) as con:
+            account = con.execute(
+                "SELECT id,password FROM named_accounts WHERE name=? AND active=1 AND role='admin'",
+                (body.get("name"),),
+            ).fetchone()
+        stored_hash = account[1] if account else dummy_hash()
+        # Run memory-hard Argon2id verify strictly outside any SQLite transaction/lock.
+        verified = verify_password(stored_hash, raw_password)
+        if not verified or not account:
+            raise denied()
+        with closing(_connect(db)) as con, con:
+            con.execute("BEGIN IMMEDIATE")
+            if claims["exp"] <= int(time.time()):
                 raise denied()
-            account = con.execute("SELECT id,password FROM named_accounts WHERE name=? AND active=1 AND role='admin'",
-                                  (body.get("name"),)).fetchone()
-            stored_hash = account[1] if account else dummy_hash()
-            if sodium().crypto_pwhash_str_verify(stored_hash.encode(), raw_password, len(raw_password)) or not account:
+            # Re-verify account status atomically after Argon2id verify (prevents suspension TOCTOU).
+            still_active = con.execute(
+                "SELECT 1 FROM named_accounts WHERE id=? AND active=1 AND role='admin'",
+                (account[0],),
+            ).fetchone()
+            if not still_active:
                 raise denied()
             token = secrets.token_urlsafe(32)
             con.execute("DELETE FROM named_sessions WHERE digest=? OR expires<=?", (session_hash, now))
@@ -215,6 +316,25 @@ def dispatch(db, action, raw, header, session, *, approval_root=None):
                         (digest(token), account[0], now + SESSION_SECONDS))
             audit(con, account[0], "login", account[0])
             return {"session": token}
+
+    precomputed_hash = None
+    if action == "create":
+        with closing(_connect(db)) as con:
+            _actor, _role = session_actor(con, session_hash)
+            if _role != "admin":
+                raise denied()
+        validate_account_name(body.get("name"))
+        # Run Argon2id hashing outside SQLite's write lock.
+        precomputed_hash = password_hash(body.get("password"))
+
+    precomputed_snapshot = None
+    if action.startswith("collection-") and approval_root is not None:
+        precomputed_snapshot = _precompute_collection_snapshot(db, approval_root, body)
+
+    with closing(_connect(db)) as con, con:
+        con.execute("BEGIN IMMEDIATE")
+        if claims["exp"] <= int(time.time()):
+            raise denied()
         actor, role = session_actor(con, session_hash)
         if action == "session":
             return {"principal_id": actor, "role": role}
@@ -231,7 +351,11 @@ def dispatch(db, action, raw, header, session, *, approval_root=None):
             ticket = "named-" + hmac.digest(os.environ["NAMED_ASSERTION_SECRET"].encode(),
                                              (actor + "|" + data["idempotency_key"]).encode(), "sha256").hex()
             data["idempotency_key"] = ticket
-            previous = con.execute("SELECT payload FROM named_intakes WHERE ticket=?", (ticket,)).fetchone()
+            con.execute("DELETE FROM named_intakes WHERE expires<=?", (now,))
+            previous = con.execute(
+                "SELECT payload FROM named_intakes WHERE ticket=? AND expires>?",
+                (ticket, now),
+            ).fetchone()
             if previous and previous[0] != intake_digest(data):
                 raise HTTPException(409, "Intake key already used for different inputs")
             con.execute("INSERT OR REPLACE INTO named_intakes VALUES (?,?,?,?)",
@@ -243,17 +367,30 @@ def dispatch(db, action, raw, header, session, *, approval_root=None):
             from app.collection_approval import ACTIONS, handle
             if approval_root is None or action not in ACTIONS:
                 raise HTTPException(404, "Approval adapter unavailable")
-            return handle(con, approval_root, action, body, actor)
+            return handle(con, approval_root, action, body, actor, precomputed_snapshot=precomputed_snapshot)
         if action == "create":
-            target = create_account(con, body.get("name"), body.get("password"))
+            target = create_account(con, body.get("name"), body.get("password"), precomputed_hash=precomputed_hash)
         else:
             target = body.get("principal_id")
             if not isinstance(target, str) or not con.execute(
                     "SELECT 1 FROM named_accounts WHERE id=?", (target,)).fetchone():
                 raise denied()
             if action == "suspend":
+                remaining = con.execute(
+                    "SELECT count(*) FROM named_accounts WHERE active=1 AND role='admin' AND id!=?",
+                    (target,),
+                ).fetchone()[0]
+                if remaining < 1:
+                    raise HTTPException(409, "Cannot suspend the last active admin")
                 con.execute("UPDATE named_accounts SET active=0 WHERE id=?", (target,))
             elif action == "role" and body.get("role") in ("none", "admin"):
+                if body["role"] == "none":
+                    remaining = con.execute(
+                        "SELECT count(*) FROM named_accounts WHERE active=1 AND role='admin' AND id!=?",
+                        (target,),
+                    ).fetchone()[0]
+                    if remaining < 1:
+                        raise HTTPException(409, "Cannot demote the last active admin")
                 con.execute("UPDATE named_accounts SET role=? WHERE id=?", (body["role"], target))
             elif action == "request-recovery":
                 audit(con, actor, "recovery-requested", target)

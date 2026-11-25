@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import mimetypes
 import os
 import sqlite3
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from threading import BoundedSemaphore, Lock
 from typing import Any
 
@@ -31,6 +32,17 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from app.publication import frozen_window, window_bounds
 from app.security import WorkerSecurity
+
+_SAFE_PREVIEW_MIMES = frozenset({
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "image/avif",
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+})
 
 app = FastAPI(title="Pet Grooming Media Worker", version="0.9.0", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(WorkerSecurity)
@@ -54,11 +66,26 @@ DB = DATA_DIR / "_system" / "jobs.sqlite"
 DB.parent.mkdir(parents=True, exist_ok=True)
 
 
+class ClosingConnection(sqlite3.Connection):
+    """SQLite connection that commits/rolls back and always closes its FD on context exit."""
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self.close()
+
+
 def connect() -> sqlite3.Connection:
-    con = sqlite3.connect(DB, timeout=10)
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
+    con = sqlite3.connect(DB, timeout=10, factory=ClosingConnection)
     con.execute("PRAGMA busy_timeout=5000;")
+    mode_row = con.execute("PRAGMA journal_mode;").fetchone()
+    if not mode_row or str(mode_row[0]).lower() != "wal":
+        with lock:
+            mode_row = con.execute("PRAGMA journal_mode;").fetchone()
+            if not mode_row or str(mode_row[0]).lower() != "wal":
+                con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
     con.execute(
         "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
     )
@@ -66,11 +93,18 @@ def connect() -> sqlite3.Connection:
 
 
 def store(record: dict[str, Any], *, collection_base: int | None = None) -> None:
+    prepared_snapshot = None
+    if collection_base is not None:
+        from app.collection_approval import accept, snapshot
+        try:
+            prepared_snapshot = snapshot(DATA_DIR, record)
+        except (HTTPException, OSError, ValueError, KeyError, TypeError):
+            prepared_snapshot = None
     with lock, connect() as con:
         if collection_base is not None:
             from app.collection_approval import accept
             con.execute("BEGIN IMMEDIATE")
-            accept(con, DATA_DIR, record, collection_base)
+            accept(con, DATA_DIR, record, collection_base, precomputed_snapshot=prepared_snapshot)
         con.execute(
             "INSERT OR REPLACE INTO jobs (id, payload) VALUES (?,?)",
             (record["job_id"], json.dumps(record)),
@@ -111,8 +145,12 @@ with connect() as _db:
 
 
 class CreateJobRequest(BaseModel):
-    website_url: str = Field(min_length=1, max_length=2048, description="Required pet grooming business website URL")
-    instagram_url: str = Field(min_length=1, max_length=2048, description="Required public Instagram URL")
+    website_url: str = Field(min_length=1, max_length=2048, description="Required business website URL")
+    instagram_url: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="Optional public Instagram URL (parked by default in V2.1)",
+    )
     facebook_url: str = Field(min_length=1, max_length=2048, description="Required public Facebook URL")
     lookback_days: int = Field(default=365, ge=1, le=366)
     max_selected_images: int = Field(default=30, ge=1, le=200)
@@ -153,12 +191,13 @@ class CreateJobRequest(BaseModel):
 
     @field_validator("website_url", "instagram_url", "facebook_url")
     @classmethod
-    def validate_url(cls, value: str, info) -> str:
+    def validate_url(cls, value: str | None, info) -> str | None:
         from app.orchestration import _check_url
 
+        is_required = info.field_name != "instagram_url"
         errors: list[str] = []
-        normalized = _check_url(value, info.field_name, errors, required=True)
-        if normalized is None:
+        normalized = _check_url(value, info.field_name, errors, required=is_required)
+        if errors:
             raise ValueError(errors[0])
         return normalized
 
@@ -293,18 +332,25 @@ def execute_started_curation(
                 })
                 raise HTTPException(503, f"AI provider {status}")
 
-    store({
-        **rec,
-        "ai_curation": {
-            "status": "started",
-            "provider": getattr(provider, "name", cfg.provider),
-            "model": cfg.model or getattr(provider, "model", ""),
-            "actor": actor,
-            "start_etag": start_etag,
-            "started_at": now,
-        },
-        "updated_at": now,
-    })
+    claimed_by_self = False
+
+    def _mark_started() -> None:
+        nonlocal claimed_by_self
+        claimed_by_self = True
+        started_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        latest_rec = fetch(job_id) or rec
+        store({
+            **latest_rec,
+            "ai_curation": {
+                "status": "started",
+                "provider": getattr(provider, "name", cfg.provider),
+                "model": cfg.model or getattr(provider, "model", ""),
+                "actor": actor,
+                "start_etag": start_etag,
+                "started_at": started_at,
+            },
+            "updated_at": started_at,
+        })
 
     try:
         outcome = run_started_curation(
@@ -312,6 +358,7 @@ def execute_started_curation(
             job_id,
             processing_consent=consent_map,
             start_etag=start_etag,
+            on_claimed=_mark_started,
             config=cfg,
             provider=provider,
             business_context=rec.get("business_context"),
@@ -320,13 +367,9 @@ def execute_started_curation(
             batch_size=cfg.batch_size,
         )
     except InferenceHeld as exc:
-        finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        with connect() as con:
-            claimed = bool(
-                con.execute("SELECT 1 FROM ai_execution_claims WHERE job=? AND revision=?", (job_id, rev)).fetchone()
-            )
-        latest = fetch(job_id) or rec
-        if claimed:
+        if exc.claimed or claimed_by_self:
+            finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            latest = fetch(job_id) or rec
             store({
                 **latest,
                 "ai_curation": {
@@ -339,26 +382,27 @@ def execute_started_curation(
                 },
                 "updated_at": finished,
             })
-        else:
-            store({**latest, "ai_curation": previous_ai, "updated_at": finished})
+        # If this caller never won the claim (e.g. concurrent loser or bad consent),
+        # leave the job record untouched so another caller's started/completed state is never clobbered.
         raise HTTPException(409, str(exc)) from None
     except Exception as exc:  # noqa: BLE001 — fail honestly without leaking secrets
-        finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
         safe_err = scrub_secrets(str(exc))[:240]
-        latest = fetch(job_id) or rec
-        store({
-            **latest,
-            "ai_curation": {
-                "status": "failed",
-                "provider": getattr(provider, "name", cfg.provider),
-                "model": cfg.model or getattr(provider, "model", ""),
-                "actor": actor,
-                "start_etag": start_etag,
-                "errors": [safe_err],
-                "finished_at": finished,
-            },
-            "updated_at": finished,
-        })
+        if claimed_by_self:
+            finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            latest = fetch(job_id) or rec
+            store({
+                **latest,
+                "ai_curation": {
+                    "status": "failed",
+                    "provider": getattr(provider, "name", cfg.provider),
+                    "model": cfg.model or getattr(provider, "model", ""),
+                    "actor": actor,
+                    "start_etag": start_etag,
+                    "errors": [safe_err],
+                    "finished_at": finished,
+                },
+                "updated_at": finished,
+            })
         return JSONResponse({"job_id": job_id, "status": "failed", "errors": [safe_err]}, status_code=502)
 
     finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -485,7 +529,10 @@ def register_job(req: CreateJobRequest) -> dict[str, Any]:
     }
     if os.environ.get("RECORDED_EXTRACTOR_HANDOFF") == "1":
         payload["collection_mode"] = "recorded_extractor"
-    elif os.environ.get("PUBLIC_COLLECTION_CHECKPOINTS") == "1":
+    elif (
+        os.environ.get("PUBLIC_COLLECTION_CHECKPOINTS") == "1"
+        or os.environ.get("COLLECTION_ENGINE", "").strip().lower() == "historical"
+    ):
         payload["collection_mode"] = "public_checkpoint"
     try:
         if named:
@@ -550,20 +597,35 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
 
         mode = payload.get("collection_mode")
         if mode in ("public_checkpoint", "recorded_extractor"):
-            from app.public_collection import COLLECTION_HOLD, collect_public_job
+            from app.public_collection import (
+                COLLECTION_HOLD,
+                build_multitenant_collection_config,
+                collect_public_job,
+            )
 
             if mode == "recorded_extractor":
                 from app.recorded_collection import collect_recorded_job
 
-                flag, config_key, collect = "RECORDED_EXTRACTOR_HANDOFF", "RECORDED_EXTRACTOR_CONFIG", collect_recorded_job
+                if os.environ.get("RECORDED_EXTRACTOR_HANDOFF") != "1":
+                    raise ValueError("Checkpoint collection mode is disabled")
+                config_path = os.environ.get("RECORDED_EXTRACTOR_CONFIG")
+                if not config_path:
+                    raise ValueError("Checkpoint collection requires an explicit source configuration")
+                source_cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+                manifest = collect_recorded_job(job_dir, payload, source_cfg)
             else:
-                flag, config_key, collect = "PUBLIC_COLLECTION_CHECKPOINTS", "PUBLIC_COLLECTION_CONFIG", collect_public_job
-            if os.environ.get(flag) != "1":
-                raise ValueError("Checkpoint collection mode is disabled")
-            config_path = os.environ.get(config_key)
-            if not config_path:
-                raise ValueError("Checkpoint collection requires an explicit source configuration")
-            manifest = collect(job_dir, payload, json.loads(Path(config_path).read_text(encoding="utf-8")))
+                checkpoint_enabled = (
+                    os.environ.get("PUBLIC_COLLECTION_CHECKPOINTS") == "1"
+                    or os.environ.get("COLLECTION_ENGINE", "").strip().lower() == "historical"
+                )
+                if not checkpoint_enabled:
+                    raise ValueError("Checkpoint collection mode is disabled")
+                config_path = os.environ.get("PUBLIC_COLLECTION_CONFIG")
+                if config_path:
+                    source_cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+                else:
+                    source_cfg = build_multitenant_collection_config(payload)
+                manifest = collect_public_job(job_dir, payload, source_cfg)
             store({
                 **payload, "status": "partial_success", "sources": manifest["sources"],
                 "collection_gate": COLLECTION_HOLD, "ai_curation": {"status": COLLECTION_HOLD},
@@ -802,6 +864,33 @@ def list_jobs() -> dict[str, Any]:
     return {"jobs": items, "total": len(items)}
 
 
+def _manifest_preview_allowlist(job_dir: Path) -> dict[str, str | None]:
+    """Return {relative_posix_path: recorded_mime} for manifest-declared media files only."""
+    manifest_file = job_dir / "manifest.json"
+    if not manifest_file.is_file():
+        return {}
+    try:
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    allowed: dict[str, str | None] = {}
+    for asset in manifest.get("assets") or []:
+        if not isinstance(asset, dict):
+            continue
+        if asset.get("extraction_status") in ("downloaded", "duplicate", "extracted_frame"):
+            rel = asset.get("local_path")
+            if isinstance(rel, str) and rel:
+                mime = asset.get("mime")
+                clean_mime = str(mime).split(";", 1)[0].strip().lower() if isinstance(mime, str) else None
+                allowed[rel] = clean_mime
+        for frame in asset.get("frames") or []:
+            if isinstance(frame, dict):
+                f_rel = frame.get("local_path")
+                if isinstance(f_rel, str) and f_rel:
+                    allowed[f_rel] = "image/jpeg"
+    return allowed
+
+
 @app.get("/jobs/{job_id}/file")
 def get_job_file(job_id: str, path: str) -> Any:
     from fastapi.responses import FileResponse
@@ -814,15 +903,45 @@ def get_job_file(job_id: str, path: str) -> Any:
         raise HTTPException(400, "Invalid job directory")
     if not job_dir.is_dir():
         raise HTTPException(404, "Job directory missing")
-    # Strict traversal guard: only files inside the job directory.
-    candidate = (job_dir / (path or "")).resolve()
+    # Strict traversal guard FIRST (before manifest lookup): reject absolute, backslash, drive, or .. escapes.
+    if (
+        not isinstance(path, str)
+        or not path
+        or "\\" in path
+        or PureWindowsPath(path).drive
+        or Path(path).is_absolute()
+        or ".." in Path(path).parts
+    ):
+        raise HTTPException(400, "Invalid path")
+    candidate = (job_dir / path).resolve()
     try:
-        candidate.relative_to(job_dir)
+        rel_posix = candidate.relative_to(job_dir).as_posix()
     except ValueError:
         raise HTTPException(400, "Invalid path")
+    # Manifest media allowlist: never serve internal SQLite DBs, snapshots, manifests, or unindexed files.
+    allowed = _manifest_preview_allowlist(job_dir)
+    if rel_posix not in allowed:
+        raise HTTPException(404, "File not found")
     if not candidate.is_file():
         raise HTTPException(404, "File not found")
-    return FileResponse(candidate, headers={"X-Content-Type-Options": "nosniff"})
+    recorded_mime = allowed[rel_posix]
+    if recorded_mime == "image/jpg":
+        recorded_mime = "image/jpeg"
+    guessed_mime, _ = mimetypes.guess_type(candidate.name)
+    safe_mime = recorded_mime if recorded_mime in _SAFE_PREVIEW_MIMES else (
+        guessed_mime if guessed_mime in _SAFE_PREVIEW_MIMES else None
+    )
+    if safe_mime is None:
+        raise HTTPException(415, "Unsupported media type")
+    return FileResponse(
+        candidate,
+        media_type=safe_mime,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "attachment",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+        },
+    )
 
 
 @app.get("/jobs/{job_id}")
@@ -883,6 +1002,40 @@ def post_orchestration(job_id: str, body: dict[str, Any]) -> dict[str, Any]:
     store(rec)
     return {"ok": True, "job_id": job_id, "stage": stage}
 
+@app.post("/jobs/{job_id}/resume-collection", status_code=202)
+def resume_collection(job_id: str) -> dict[str, Any]:
+    """Resume an existing public_checkpoint job from its persisted CollectionCheckpoint cursor."""
+    with submission_lock:
+        rec = fetch(job_id)
+        if rec is None:
+            raise HTTPException(404, "Unknown job")
+        if rec.get("collection_mode") != "public_checkpoint":
+            raise HTTPException(409, "Only checkpoint-backed jobs can resume collection")
+        if rec.get("status") in ("queued", "running"):
+            raise HTTPException(409, "Job is already running")
+        checkpoint_enabled = (
+            os.environ.get("PUBLIC_COLLECTION_CHECKPOINTS") == "1"
+            or os.environ.get("COLLECTION_ENGINE", "").strip().lower() == "historical"
+        )
+        if not checkpoint_enabled:
+            raise HTTPException(503, "Checkpoint collection mode is disabled")
+        if not slots.acquire(blocking=False):
+            raise HTTPException(429, "Worker busy; retry later")
+        resumed = {
+            **rec,
+            "status": "queued",
+            "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        }
+        try:
+            store(resumed)
+            executor.submit(_process_job, job_id, resumed)
+        except Exception:
+            slots.release()
+            store(rec)
+            raise
+        return {"job_id": job_id, "status": "queued", "resumed": True}
+
+
 @app.get("/jobs/{job_id}/delivery-plan")
 def get_delivery_plan(job_id: str, business_name: str = "") -> dict[str, Any]:
     rec = fetch(job_id)
@@ -893,12 +1046,13 @@ def get_delivery_plan(job_id: str, business_name: str = "") -> dict[str, Any]:
     is_checkpoint = rec.get("collection_mode") in ("public_checkpoint", "recorded_extractor")
     if is_checkpoint and not m4_approval_enabled():
         return {"status": "blocked_unverified_collection", "job_id": job_id, "assets": []}
+    use_m4_db = is_checkpoint or m4_approval_enabled()
     return build_delivery_plan(
         Path(DATA_DIR) / job_id,
         job_id,
         business_name,
-        db_path=DB if is_checkpoint else None,
-        projects_root=DATA_DIR if is_checkpoint else None,
+        db_path=DB if use_m4_db else None,
+        projects_root=DATA_DIR if use_m4_db else None,
     )
 
 
@@ -914,13 +1068,14 @@ def post_delivery_result(job_id: str, payload: dict[str, Any]) -> dict[str, Any]
     is_checkpoint = rec.get("collection_mode") in ("public_checkpoint", "recorded_extractor")
     if is_checkpoint and not m4_approval_enabled():
         raise HTTPException(409, "blocked_unverified_collection")
+    use_m4_db = is_checkpoint or m4_approval_enabled()
     job_dir = Path(DATA_DIR) / job_id
     plan = build_delivery_plan(
         job_dir,
         job_id,
         str(payload.get("business_name") or ""),
-        db_path=DB if is_checkpoint else None,
-        projects_root=DATA_DIR if is_checkpoint else None,
+        db_path=DB if use_m4_db else None,
+        projects_root=DATA_DIR if use_m4_db else None,
     )
     if plan["status"] != "ready":
         raise HTTPException(409, plan["status"])

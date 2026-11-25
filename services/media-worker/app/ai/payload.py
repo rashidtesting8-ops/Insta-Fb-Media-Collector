@@ -21,13 +21,16 @@ from __future__ import annotations
 import io
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
 from app.ai.provider import ImagePayload
 from app.publication import date_eligibility, window_bounds
+
+MAX_IMAGE_PIXELS = 25_000_000
+Image.MAX_IMAGE_PIXELS = min(Image.MAX_IMAGE_PIXELS or MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS)
 
 SENDABLE_IMAGE_MIMES = {"image/jpeg", "image/png"}
 DEFAULT_MAX_IMAGE_DIM = 1024
@@ -62,17 +65,22 @@ def select_ai_candidates(
     max_assets: int = 40,
 ) -> SelectionReport:
     job_dir = Path(job_dir)
+    resolved_root = job_dir.resolve()
     report = SelectionReport()
 
-    def on_disk(item: dict[str, Any]) -> Path | None:
-        rel = item.get("local_path")
-        if not rel:
+    def safe_file(rel: Any) -> Path | None:
+        if not isinstance(rel, str) or not rel or "\\" in rel or PureWindowsPath(rel).drive:
             return None
-        candidate = Path(str(rel))
+        candidate = Path(rel)
         if candidate.is_absolute() or ".." in candidate.parts:
             return None
-        path = job_dir / candidate
+        path = (job_dir / candidate).resolve()
+        if not path.is_relative_to(resolved_root):
+            return None
         return path if path.is_file() else None
+
+    def on_disk(item: dict[str, Any]) -> Path | None:
+        return safe_file(item.get("local_path"))
 
     bounds = window_bounds(manifest)
     # Pre-partition by honest exclusion reasons
@@ -101,12 +109,14 @@ def select_ai_candidates(
             report.excluded.append({"asset_id": item["asset_id"], "reason": "missing_file"})
             continue
         if item.get("type") == "video":
-            frames = [
-                job_dir / f["local_path"]
-                for f in (item.get("frames") or [])
-                if (job_dir / f["local_path"]).is_file()
-            ]
-            if not frames:
+            frame_pairs = []
+            for f in (item.get("frames") or []):
+                if not isinstance(f, dict):
+                    continue
+                fpath = safe_file(f.get("local_path"))
+                if fpath is not None:
+                    frame_pairs.append((fpath, float(f.get("timestamp_s") or 0.0)))
+            if not frame_pairs:
                 report.excluded.append(
                     {"asset_id": item["asset_id"], "reason": "no_frames_extracted"}
                 )
@@ -115,8 +125,8 @@ def select_ai_candidates(
                 Candidate(
                     asset=item,
                     kind="video",
-                    payload_files=frames,
-                    frame_timestamps=[float(f.get("timestamp_s") or 0.0) for f in item.get("frames") or []],
+                    payload_files=[p for p, _ in frame_pairs],
+                    frame_timestamps=[ts for _, ts in frame_pairs],
                 )
             )
         else:
