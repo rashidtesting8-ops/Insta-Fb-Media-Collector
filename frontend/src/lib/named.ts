@@ -24,7 +24,7 @@ export async function namedCall(
   action: string,
   body: Record<string, unknown>,
   session = "",
-  timeoutMs = 5000,
+  timeoutMs = 20_000,
 ) {
   const key = process.env.NAMED_ASSERTION_SECRET;
   const dashboard = process.env.MEDIA_WORKER_DASHBOARD_TOKEN;

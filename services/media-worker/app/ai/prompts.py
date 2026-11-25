@@ -159,7 +159,8 @@ assets that actually appear in the supplied validated analyses. Do not
 claim visual inspection of anything not supplied."""
 
 _MISSING_ASSET_RULE = (
-    "\nmissing_assets[].category must be one of: " + ", ".join(get_args(Category)) + ". "
+    "\nselection_status must be one of: recommended, considered, rejected (never 'selected'). "
+    "missing_assets[].category must be one of: " + ", ".join(get_args(Category)) + ". "
     "video_recommendations[].recommended_section must be one of: " + ", ".join(get_args(VideoSection)) + ". "
     'Example: {"missing_assets":[{"category":"salon_facilities","note":"No salon photos supplied."}]}. '
     "Never invent a category or force a match. If no category fits, keep the limitation in "
@@ -381,8 +382,8 @@ def build_mode_b_prompt(
     if compact_output:
         prompt += (
             "\nKeep every required field. Return minified JSON with no extra text. "
-            "Use one brief phrase per text field, one short entry per required list, "
-            "and [] for categories without evidence. For one still image use at most "
-            "one placement, no pairs or videos, and no duplicated commentary."
+            "Use one brief phrase per text field, 1-2 short entries per required list, "
+            "and [] for categories without evidence so the full JSON fits comfortably "
+            "within the output token budget. Never include extra keys outside the schema."
         )
     return prompt

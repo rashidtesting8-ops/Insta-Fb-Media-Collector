@@ -1,9 +1,7 @@
 "use client";
 import { useState } from "react";
-import { useRouter } from "next/navigation";
 
 export default function Login() {
-  const router = useRouter();
   const [password, setPassword] = useState("");
   const [named, setNamed] = useState(false);
   const [name, setName] = useState("");
@@ -20,7 +18,9 @@ export default function Login() {
         body: JSON.stringify(named ? { name, password } : { password }),
       });
       if (!res.ok) throw new Error("Sign-in failed");
-      router.push("/");
+      // Full navigation clears Next.js App Router prefetch cache after HttpOnly auth cookie change.
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+      window.location.assign("/");
     } catch (err: unknown) { setError(err instanceof Error ? err.message : String(err)); }
     finally { setLoading(false); }
   }

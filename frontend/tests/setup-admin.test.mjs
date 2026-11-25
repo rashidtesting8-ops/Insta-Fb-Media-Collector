@@ -53,15 +53,30 @@ test("setup-admin enforces loopback origin, loopback host, and rejects reverse-p
       assert.equal(r.status, 403);
     }
 
-    // Reverse-proxy forwarding headers are always rejected.
-    for (const fwdHeader of ["x-forwarded-for", "x-real-ip", "forwarded", "cf-connecting-ip", "x-forwarded-host"]) {
+    // Reverse-proxy forwarding headers with non-loopback/external peers are always rejected.
+    for (const [fwdHeader, fwdVal] of [
+      ["x-forwarded-for", "203.0.113.10"],
+      ["x-forwarded-for", "203.0.113.10, 127.0.0.1"],
+      ["x-real-ip", "203.0.113.10"],
+      ["forwarded", "for=203.0.113.10"],
+      ["cf-connecting-ip", "203.0.113.10"],
+      ["x-forwarded-host", "evil.example:3000"],
+    ]) {
       const r = await handleSetupSubmit(
-        makeReq("POST", { setup_token: "t", name: "a", password: "p", confirm_password: "p" }, { [fwdHeader]: "203.0.113.10" }),
+        makeReq("POST", { setup_token: "t", name: "a", password: "p", confirm_password: "p" }, { [fwdHeader]: fwdVal }),
         neverCall,
         nextWindow(),
       );
       assert.equal(r.status, 403);
     }
+
+    // Next.js standalone internal loopback headers are accepted for direct local connections.
+    const localStandalone = await handleSetupStatus(
+      makeReq("GET", null, { "x-forwarded-for": "::ffff:127.0.0.1", "x-forwarded-host": "localhost:3000" }),
+      async () => Response.json({ available: true }),
+    );
+    assert.equal(localStandalone.status, 200);
+    assert.deepEqual(localStandalone.body, { available: true });
   } finally {
     if (prevOrigin === undefined) delete process.env.DASHBOARD_ORIGIN;
     else process.env.DASHBOARD_ORIGIN = prevOrigin;

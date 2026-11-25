@@ -8,14 +8,13 @@ const rates = {
 };
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
-const FORWARDING_HEADERS = [
-  "x-forwarded-for",
-  "x-real-ip",
-  "forwarded",
-  "cf-connecting-ip",
-  "true-client-ip",
-  "x-forwarded-host",
-];
+
+function isLoopbackIp(raw: string): boolean {
+  const value = raw.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (value === "::1" || value === "127.0.0.1" || value === "::ffff:127.0.0.1") return true;
+  const ipv4 = value.startsWith("::ffff:") ? value.slice(7) : value;
+  return /^127\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)$/.test(ipv4);
+}
 
 export function isLoopbackOrigin(origin: string | undefined): boolean {
   if (!origin) return false;
@@ -32,11 +31,30 @@ export function isLoopbackHost(host: string | null): boolean {
   return /^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?$/i.test(host.trim());
 }
 
+/**
+ * Returns true if request headers indicate a non-loopback reverse proxy or remote peer.
+ * Next.js standalone internally attaches loopback x-forwarded-for / x-forwarded-host for
+ * direct local connections; every hop in x-forwarded-for and x-real-ip must be loopback,
+ * x-forwarded-host must be a loopback host, and external CDN/proxy headers are always denied.
+ */
 export function hasForwardingHeaders(headers: Headers): boolean {
-  return FORWARDING_HEADERS.some((name) => {
+  for (const name of ["forwarded", "cf-connecting-ip", "true-client-ip"]) {
     const value = headers.get(name);
-    return value !== null && value.trim().length > 0;
-  });
+    if (value !== null && value.trim().length > 0) return true;
+  }
+  const xff = headers.get("x-forwarded-for");
+  if (xff !== null && xff.trim().length > 0) {
+    const hops = xff.split(",").map((s) => s.trim()).filter(Boolean);
+    if (hops.length === 0 || hops.some((hop) => !isLoopbackIp(hop))) return true;
+  }
+  const realIp = headers.get("x-real-ip");
+  if (realIp !== null && realIp.trim().length > 0 && !isLoopbackIp(realIp)) return true;
+  const xfh = headers.get("x-forwarded-host");
+  if (xfh !== null && xfh.trim().length > 0) {
+    const hosts = xfh.split(",").map((s) => s.trim()).filter(Boolean);
+    if (hosts.length === 0 || hosts.some((h) => !isLoopbackHost(h))) return true;
+  }
+  return false;
 }
 
 export function dashboardOrigin() {

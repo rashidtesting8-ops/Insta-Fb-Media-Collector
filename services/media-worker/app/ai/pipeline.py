@@ -560,7 +560,7 @@ def run_ai_curation(
         max_images=max_images,
         max_videos=max_videos,
         asset_metadata=manifest_ids,
-        compact_output=cfg.bounded_acceptance and cfg.mode_b_max_output_tokens <= 900,
+        compact_output=cfg.mode_b_max_output_tokens <= 1000,
         user_selection_notes=user_selection_notes,
         include_directive=not use_system_prompt,
     )
@@ -600,23 +600,81 @@ def run_ai_curation(
             continue
         try:
             data = json.loads(extract_json_text(completion.text))
-            # The model occasionally emits a non-V2 category in missing_assets.
-            # Drop those items with a recorded warning rather than inventing a
-            # valid value — no silent relabeling, no fabricated data.
-            if not cfg.bounded_acceptance and isinstance(data, dict) and isinstance(data.get("missing_assets"), list):
-                allowed = set(Category.__args__)
-                invalid = [
-                    m for m in data["missing_assets"]
-                    if not isinstance(m, dict) or m.get("category") not in allowed
-                ]
-                if invalid:
-                    data["missing_assets"] = [
-                        m for m in data["missing_assets"] if m not in invalid
+            # Normalize harmless model wording drift (never inventing asset ids,
+            # facts, or hiding rights) with recorded warnings.
+            if not cfg.bounded_acceptance and isinstance(data, dict):
+                if isinstance(data.get("missing_assets"), list):
+                    allowed = set(Category.__args__)
+                    invalid = [
+                        m for m in data["missing_assets"]
+                        if not isinstance(m, dict) or m.get("category") not in allowed
                     ]
+                    if invalid:
+                        data["missing_assets"] = [
+                            m for m in data["missing_assets"] if m not in invalid
+                        ]
+                        result.warnings.append(
+                            f"MODE B: dropped {len(invalid)} missing_assets item(s) with "
+                            "a category outside the V2.0 enum"
+                        )
+                normalized_status = 0
+                curated_fields = {
+                    "asset_id", "reason", "recommended_section", "selection_status",
+                    "focal_point", "crop_notes", "limitations",
+                }
+                team_fields = curated_fields | {"identity_verification"}
+                hero_fields = {
+                    "rank", "asset_id", "reason", "composition_notes", "desktop_crop",
+                    "mobile_crop", "focal_point", "text_overlay_suitability", "limitations",
+                }
+                video_fields = {
+                    "asset_id", "filename", "source", "video_review_status", "evaluated_frames",
+                    "quality_score", "recommended_section", "selection_status", "reason", "limitations",
+                }
+                section_map = [
+                    ("salon_images", curated_fields),
+                    ("founder_and_team_images", team_fields),
+                    ("service_images", curated_fields),
+                    ("grooming_transformations", curated_fields),
+                    ("gallery_images", curated_fields),
+                    ("hero_selection", hero_fields),
+                    ("video_recommendations", video_fields),
+                ]
+                for sec_name, allowed_keys in section_map:
+                    sec_items = data.get(sec_name)
+                    if not isinstance(sec_items, list):
+                        continue
+                    cleaned_items = []
+                    for entry in sec_items:
+                        if not isinstance(entry, dict):
+                            continue
+                        item_copy = {k: v for k, v in entry.items() if k in allowed_keys}
+                        if item_copy.get("selection_status") == "selected":
+                            item_copy["selection_status"] = "recommended"
+                            normalized_status += 1
+                        cleaned_items.append(item_copy)
+                    data[sec_name] = cleaned_items
+                if normalized_status:
                     result.warnings.append(
-                        f"MODE B: dropped {len(invalid)} missing_assets item(s) with "
-                        "a category outside the V2.0 enum"
+                        f"MODE B: normalized selection_status 'selected' -> 'recommended' on {normalized_status} item(s)"
                     )
+                # Ensure truthful pipeline-computed analysis_coverage metadata.
+                cov = data.get("analysis_coverage")
+                if not isinstance(cov, dict):
+                    cov = {}
+                data["analysis_coverage"] = {
+                    "assets_supplied": len(candidates),
+                    "assets_analyzed": len(analyzed),
+                    "inherited_from_duplicates": inherited,
+                    "unavailable": sum(
+                        1 for i in mode_a_items if i.get("visual_analysis_status") == "unavailable"
+                    ),
+                    "prompt_version": PROMPT_VERSION,
+                    "provider": result.provider,
+                    "model": result.model,
+                    "mock": result.mock,
+                    "usage": tracker.as_dict(),
+                }
             candidate_response = ModeBResponse.model_validate(data)
         except Exception as exc:  # noqa: BLE001
             mode_b_errors.append(f"MODE B validation: {str(exc)[:200]}")

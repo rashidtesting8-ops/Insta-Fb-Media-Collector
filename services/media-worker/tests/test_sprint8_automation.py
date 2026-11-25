@@ -191,3 +191,142 @@ def test_named_collection_resume_enforces_auth_and_resumes_checkpoint(worker, id
     assert status == 202
     assert data == {"job_id": job_id, "status": "queued", "resumed": True}
     assert len(submitted) == 1
+
+
+def test_mode_b_normalizes_selected_status_and_compact_otpm_prompt(tmp_path, isolated_provider_unit):
+    from PIL import Image
+    from app.ai.pipeline import run_ai_curation
+    from app.ai.prompts import system_prompt_for_mode
+    from app.ai.provider import AIProviderConfig, CompletionResult, VisionProvider
+
+    assert "never 'selected'" in system_prompt_for_mode("B")
+
+    job_dir = tmp_path / "job_otpm"
+    (job_dir / "media").mkdir(parents=True)
+    img_path = job_dir / "media" / "dog.jpg"
+    Image.new("RGB", (640, 480), color=(210, 150, 120)).save(img_path, format="JPEG")
+    manifest = {
+        "job_id": "job_otpm",
+        "website_url": "https://example.test/",
+        "created_at": "2026-11-25T00:00:00+00:00",
+        "window_start_utc": "2025-11-25T00:00:00+00:00",
+        "window_end_utc": "2026-11-25T00:00:00+00:00",
+        "assets": [
+            {
+                "asset_id": "img_01",
+                "filename": "dog.jpg",
+                "platform": "website",
+                "type": "image",
+                "media_type": "image",
+                "extraction_status": "downloaded",
+                "local_path": "media/dog.jpg",
+                "mime_type": "image/jpeg",
+                "sha256": "a" * 64,
+                "rights_status": "unverified",
+                "preprocessing": {"outcome": "processed"},
+            }
+        ],
+    }
+    (job_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    class _QwenDriftProvider(VisionProvider):
+        name = "openai_compatible"
+        model = "qwen/qwen3.8-27b"
+
+        def complete(self, prompt, images, tracker, **_kwargs):
+            if images:
+                tracker.record({"input_tokens": 200, "output_tokens": 120}, retries=0)
+                return CompletionResult(
+                    text=json.dumps({
+                        "mode": "ANALYZE_BATCH",
+                        "items": [{
+                            "asset_id": "img_01",
+                            "filename": "dog.jpg",
+                            "source": "website",
+                            "media_type": "image",
+                            "detected_content": "Groomed dog portrait",
+                            "possible_categories": ["service"],
+                            "quality_score": 80.0,
+                            "score_breakdown": {
+                                "technical_quality": 20.0,
+                                "business_relevance_authenticity": 20.0,
+                                "composition_usability": 16.0,
+                                "emotion_aesthetics": 12.0,
+                                "distinctiveness_collection_fit": 8.0,
+                                "evidence_confidence": 4.0,
+                            },
+                            "visual_strengths": ["Clear subject"],
+                            "visual_weaknesses": ["Plain background"],
+                            "verification_status": "unverified",
+                            "visual_analysis_status": "analyzed",
+                            "recommended_use": "service",
+                            "selection_status": "recommended",
+                            "selection_reason": "Clear grooming sample",
+                        }],
+                    }),
+                    usage={"input_tokens": 200, "output_tokens": 120},
+                )
+            assert "minified JSON" in prompt
+            tracker.record({"input_tokens": 300, "output_tokens": 180}, retries=0)
+            return CompletionResult(
+                text=json.dumps({
+                    "schema_version": "visual-director-v2.0",
+                    "job_id": "job_otpm",
+                    "mode": "FINAL_CURATE",
+                    "business_visual_identity": {
+                        "style_summary": "Warm salon",
+                        "atmosphere": "Friendly",
+                        "brand_personality": "Caring",
+                        "key_visual_strengths": ["Authentic pets"],
+                        "recommended_design_direction": "Clean editorial",
+                    },
+                    "analysis_coverage": {"bogus_ignored": True},
+                    "service_images": [{
+                        "asset_id": "img_01",
+                        "reason": "Clear service visual",
+                        "recommended_section": "service",
+                        "selection_status": "selected",
+                        "extra_model_field": "dropped_safely",
+                    }],
+                    "design_art_direction": {
+                        "narrative": "Warm grooming story",
+                        "layout_guidance": "Grid",
+                        "color_and_lighting": "Bright",
+                        "typography_mood": "Modern",
+                        "section_pairing": "Hero+Service",
+                        "diversity_notes": "Limited sample",
+                    },
+                    "selected_asset_ids": ["img_01"],
+                    "rights_review_required_ids": [],
+                    "final_quality_assessment": {
+                        "overall_assessment": "Good sample",
+                        "strengths": ["Sharp"],
+                        "weaknesses": ["Single photo"],
+                        "meets_premium_standard": False,
+                    },
+                }),
+                usage={"input_tokens": 300, "output_tokens": 180},
+            )
+
+    cfg = AIProviderConfig(
+        provider="openai_compatible",
+        model="qwen/qwen3.8-27b",
+        endpoint="https://api.groq.com/openai/v1/chat/completions",
+        api_key="test-key",
+        mode_a_max_output_tokens=850,
+        mode_b_max_output_tokens=950,
+        max_images_per_request=1,
+    )
+    res = run_ai_curation(
+        job_dir,
+        "job_otpm",
+        include_undated_website=True,
+        config=cfg,
+        provider=_QwenDriftProvider(),
+    )
+    assert res.status == "completed", res.errors
+    assert res.mode_b["service_images"][0]["selection_status"] == "recommended"
+    assert "extra_model_field" not in res.mode_b["service_images"][0]
+    assert res.mode_b["analysis_coverage"]["assets_analyzed"] == 1
+    assert res.mode_b["rights_review_required_ids"] == ["img_01"]
+    assert any("selected" in w and "recommended" in w for w in res.warnings)
