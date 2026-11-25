@@ -560,7 +560,11 @@ def run_ai_curation(
         max_images=max_images,
         max_videos=max_videos,
         asset_metadata=manifest_ids,
-        compact_output=(not cfg.bounded_acceptance and cfg.mode_b_max_output_tokens <= 1000),
+        compact_output=(
+            cfg.mode_b_max_output_tokens <= 900
+            if cfg.bounded_acceptance
+            else cfg.mode_b_max_output_tokens <= 1000
+        ),
         user_selection_notes=user_selection_notes,
         include_directive=not use_system_prompt,
     )
