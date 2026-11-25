@@ -145,6 +145,20 @@ class BeforeAfterPair(BaseModel):
     reason: str = Field(min_length=1)
 
 
+VideoSection = Literal[
+    "hero",
+    "salon_facilities",
+    "founder_team",
+    "service",
+    "grooming_transformation",
+    "gallery",
+    "emotional_storytelling",
+    "video",
+    "story",
+    "transformation",
+]
+
+
 class VideoRecommendation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -154,7 +168,7 @@ class VideoRecommendation(BaseModel):
     video_review_status: VideoReviewStatus
     evaluated_frames: list[float] = Field(default_factory=list)
     quality_score: float = Field(ge=0, le=100)
-    recommended_section: Literal["hero", "service", "gallery", "story", "transformation"]
+    recommended_section: VideoSection
     selection_status: SelectionStatus
     reason: str = Field(min_length=1)
     limitations: str | None = None

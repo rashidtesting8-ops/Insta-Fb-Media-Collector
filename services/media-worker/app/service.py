@@ -253,8 +253,15 @@ def execute_started_curation(
     from app.ai_execution import InferenceHeld
     from app.collection_approval import review_state
 
-    if not isinstance(body, dict) or set(body) != {"job_id", "if_match", "processing_consent"}:
+    if (
+        not isinstance(body, dict)
+        or not {"job_id", "if_match", "processing_consent"} <= set(body)
+        or not set(body) <= {"job_id", "if_match", "processing_consent", "async"}
+    ):
         raise HTTPException(400, "Expected job_id, if_match, and processing_consent")
+    run_async = body.get("async", False)
+    if not isinstance(run_async, bool):
+        raise HTTPException(400, "Field async must be boolean")
     job_id = body["job_id"]
     start_etag = body["if_match"]
     raw_consent = body["processing_consent"]
@@ -332,95 +339,123 @@ def execute_started_curation(
                 })
                 raise HTTPException(503, f"AI provider {status}")
 
-    claimed_by_self = False
+    def _run_curation_sync() -> Any:
+        claimed_by_self = False
 
-    def _mark_started() -> None:
-        nonlocal claimed_by_self
-        claimed_by_self = True
-        started_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        latest_rec = fetch(job_id) or rec
-        store({
-            **latest_rec,
-            "ai_curation": {
-                "status": "started",
-                "provider": getattr(provider, "name", cfg.provider),
-                "model": cfg.model or getattr(provider, "model", ""),
-                "actor": actor,
-                "start_etag": start_etag,
-                "started_at": started_at,
-            },
-            "updated_at": started_at,
-        })
-
-    try:
-        outcome = run_started_curation(
-            job_dir,
-            job_id,
-            processing_consent=consent_map,
-            start_etag=start_etag,
-            on_claimed=_mark_started,
-            config=cfg,
-            provider=provider,
-            business_context=rec.get("business_context"),
-            max_images=int(rec.get("max_selected_images") or 30),
-            max_videos=int(rec.get("max_selected_videos") or 10),
-            batch_size=cfg.batch_size,
-        )
-    except InferenceHeld as exc:
-        if exc.claimed or claimed_by_self:
-            finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
-            latest = fetch(job_id) or rec
+        def _mark_started() -> None:
+            nonlocal claimed_by_self
+            claimed_by_self = True
+            started_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            latest_rec = fetch(job_id) or rec
             store({
-                **latest,
+                **latest_rec,
                 "ai_curation": {
-                    "status": "failed",
-                    "held": True,
-                    "error": scrub_secrets(str(exc))[:240],
-                    "actor": actor,
-                    "start_etag": start_etag,
-                    "finished_at": finished,
-                },
-                "updated_at": finished,
-            })
-        # If this caller never won the claim (e.g. concurrent loser or bad consent),
-        # leave the job record untouched so another caller's started/completed state is never clobbered.
-        raise HTTPException(409, str(exc)) from None
-    except Exception as exc:  # noqa: BLE001 — fail honestly without leaking secrets
-        safe_err = scrub_secrets(str(exc))[:240]
-        if claimed_by_self:
-            finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
-            latest = fetch(job_id) or rec
-            store({
-                **latest,
-                "ai_curation": {
-                    "status": "failed",
+                    "status": "started",
                     "provider": getattr(provider, "name", cfg.provider),
                     "model": cfg.model or getattr(provider, "model", ""),
                     "actor": actor,
                     "start_etag": start_etag,
-                    "errors": [safe_err],
-                    "finished_at": finished,
+                    "started_at": started_at,
                 },
-                "updated_at": finished,
+                "updated_at": started_at,
             })
-        return JSONResponse({"job_id": job_id, "status": "failed", "errors": [safe_err]}, status_code=502)
 
-    finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    latest = fetch(job_id) or rec
-    store({
-        **latest,
-        "ai_curation": {
-            **outcome.as_dict(),
-            "actor": actor,
-            "start_etag": start_etag,
-            "finished_at": finished,
-        },
-        "updated_at": finished,
-    })
-    payload_out = {"job_id": job_id, **outcome.as_dict()}
-    if outcome.status not in ("completed", "partial"):
-        return JSONResponse(payload_out, status_code=502)
-    return payload_out
+        try:
+            outcome = run_started_curation(
+                job_dir,
+                job_id,
+                processing_consent=consent_map,
+                start_etag=start_etag,
+                on_claimed=_mark_started,
+                config=cfg,
+                provider=provider,
+                business_context=rec.get("business_context"),
+                user_selection_notes=rec.get("user_selection_notes"),
+                include_undated_website=bool(rec.get("include_undated_website")),
+                max_images=int(rec.get("max_selected_images") or 30),
+                max_videos=int(rec.get("max_selected_videos") or 10),
+                batch_size=cfg.batch_size,
+                max_images_per_request=cfg.max_images_per_request,
+            )
+        except InferenceHeld as exc:
+            if exc.claimed or claimed_by_self:
+                finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                latest = fetch(job_id) or rec
+                store({
+                    **latest,
+                    "ai_curation": {
+                        "status": "failed",
+                        "held": True,
+                        "error": scrub_secrets(str(exc))[:240],
+                        "actor": actor,
+                        "start_etag": start_etag,
+                        "finished_at": finished,
+                    },
+                    "updated_at": finished,
+                })
+            # If this caller never won the claim (e.g. concurrent loser or bad consent),
+            # leave the job record untouched so another caller's started/completed state is never clobbered.
+            raise HTTPException(409, str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 — fail honestly without leaking secrets
+            safe_err = scrub_secrets(str(exc))[:240]
+            if claimed_by_self:
+                finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                latest = fetch(job_id) or rec
+                store({
+                    **latest,
+                    "ai_curation": {
+                        "status": "failed",
+                        "provider": getattr(provider, "name", cfg.provider),
+                        "model": cfg.model or getattr(provider, "model", ""),
+                        "actor": actor,
+                        "start_etag": start_etag,
+                        "errors": [safe_err],
+                        "finished_at": finished,
+                    },
+                    "updated_at": finished,
+                })
+            return JSONResponse({"job_id": job_id, "status": "failed", "errors": [safe_err]}, status_code=502)
+
+        finished = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        latest = fetch(job_id) or rec
+        store({
+            **latest,
+            "ai_curation": {
+                **outcome.as_dict(),
+                "actor": actor,
+                "start_etag": start_etag,
+                "finished_at": finished,
+            },
+            "updated_at": finished,
+        })
+        payload_out = {"job_id": job_id, **outcome.as_dict()}
+        if outcome.status not in ("completed", "partial"):
+            return JSONResponse(payload_out, status_code=502)
+        return payload_out
+
+    if run_async:
+        if not slots.acquire(blocking=False):
+            raise HTTPException(429, "Worker busy; retry later")
+
+        def _bg_worker() -> None:
+            try:
+                _run_curation_sync()
+            except HTTPException:
+                pass
+            finally:
+                slots.release()
+
+        try:
+            executor.submit(_bg_worker)
+        except Exception:
+            slots.release()
+            raise
+        return JSONResponse(
+            {"job_id": job_id, "status": "queued", "async": True, "start_etag": start_etag},
+            status_code=202,
+        )
+
+    return _run_curation_sync()
 
 
 @app.post("/named/{action}")

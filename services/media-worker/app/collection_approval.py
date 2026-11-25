@@ -19,6 +19,7 @@ ACTIONS = {
     "collection-start",
     "collection-rights-review",
     "collection-rights-decide",
+    "collection-website-policy",
 }
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS collection_revisions (
@@ -111,7 +112,10 @@ def snapshot(root, record):
             rel = item.get("local_path")
             if rel and (Path(rel).is_absolute() or not (folder / rel).resolve().is_relative_to(folder)):
                 raise conflict("Unsafe asset path")
-    candidates = select_ai_candidates(manifest, folder)
+    include_undated_website = bool(record.get("include_undated_website"))
+    candidates = select_ai_candidates(
+        manifest, folder, include_undated_website=include_undated_website
+    )
     subset = []
     for candidate in candidates.candidates:
         files = []
@@ -122,7 +126,10 @@ def snapshot(root, record):
         if candidate.kind == "image" and candidate.asset.get("sha256") != files[0][1]:
             raise conflict("Eligible image checksum mismatch")
         subset.append({"asset_id": candidate.asset["asset_id"], "files": files})
-    subset_text = canonical({"candidates": subset, "inherited": candidates.inherited})
+    subset_doc = {"candidates": subset, "inherited": candidates.inherited}
+    if include_undated_website:
+        subset_doc["include_undated_website"] = True
+    subset_text = canonical(subset_doc)
     inventory = canonical(record.get("sources", {}))
     return raw, subset_text, inventory
 
@@ -348,11 +355,20 @@ def handle(con, root, operation, body, actor, *, precomputed_snapshot=None):
         fields = {"job_id"}
     elif action == "rights-decide":
         fields = {"job_id", "asset_id", "decision", "reason", "evidence_ref", "if_match", "request_key"}
+    elif action == "website-policy":
+        fields = {"job_id", "include_undated_website", "reason", "if_match", "request_key"}
     else:
         fields = {"job_id"} if action in ("review", "panel") else {"job_id", "if_match", "request_key"}
         if action in ("approve", "deny", "revoke"):
             fields.add("reason")
-    if set(body) != fields or not all(isinstance(v, str) and v.strip() for v in body.values()):
+    if action == "website-policy":
+        if (
+            set(body) != fields
+            or not isinstance(body.get("include_undated_website"), bool)
+            or not all(isinstance(body[k], str) and body[k].strip() for k in fields - {"include_undated_website"})
+        ):
+            raise HTTPException(400, "Invalid website policy fields")
+    elif set(body) != fields or not all(isinstance(v, str) and v.strip() for v in body.values()):
         raise HTTPException(400, "Invalid approval fields")
     actor_epoch = epoch(con, actor)
     if actor_epoch is None:
@@ -375,6 +391,22 @@ def handle(con, root, operation, body, actor, *, precomputed_snapshot=None):
     if len(key) > 128:
         raise HTTPException(400, "Invalid request key")
     fingerprint = sha(canonical([operation, actor, body]).encode())
+    if action == "website-policy":
+        if not current or body["if_match"] != tag:
+            raise HTTPException(412, "Collection or decision changed")
+        if not submitter or not con.execute("SELECT 1 FROM named_accounts WHERE id=?", (submitter,)).fetchone():
+            raise HTTPException(403, "Verified submitter required")
+        row = con.execute("SELECT payload FROM jobs WHERE id=?", (job,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Unknown job")
+        record = json.loads(row[0])
+        include_flag = bool(body["include_undated_website"])
+        updated = {**record, "include_undated_website": include_flag, "updated_at": utc()}
+        accept(con, root, updated, rev)
+        con.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(updated), job))
+        from app.named_auth import audit
+        audit(con, actor, "website-policy/" + ("include" if include_flag else "exclude"), job)
+        return handle(con, root, "collection-review", {"job_id": job}, actor)
     if action == "rights-decide":
         if not _rights_table_exists(con):
             raise HTTPException(503, "Rights ledger not migrated")

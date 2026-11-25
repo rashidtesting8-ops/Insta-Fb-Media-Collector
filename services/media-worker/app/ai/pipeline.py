@@ -36,9 +36,16 @@ from app.ai.payload import (
     DEFAULT_MAX_IMAGE_DIM,
     Candidate,
     build_image_payloads,
+    sample_candidate_frames,
     select_ai_candidates,
 )
-from app.ai.prompts import PROMPT_VERSION, build_mode_a_prompt, build_mode_b_prompt
+from app.ai.prompts import (
+    PROMPT_VERSION,
+    build_mode_a_prompt,
+    build_mode_b_prompt,
+    get_prompt_metadata,
+    system_prompt_for_mode,
+)
 from app.ai.provider import (
     AIProviderConfig,
     BudgetExceededError,
@@ -180,14 +187,15 @@ def _truncate_to_limits(
     """Deterministic enforcement of configured selection maxima. Keeps
     ranked order (hero first); records every truncation."""
     warnings: list[str] = []
-    # Hero candidates are selected assets too: they must respect the image cap.
-    if len(response.hero_selection) > max_images:
-        dropped = [h.asset_id for h in response.hero_selection[max_images:]]
-        response.hero_selection = response.hero_selection[:max_images]
+    # Hero candidates are selected assets too: enforce both HERO_MAX (3) and max_images.
+    hero_cap = min(HERO_MAX, max_images)
+    if len(response.hero_selection) > hero_cap:
+        dropped = [h.asset_id for h in response.hero_selection[hero_cap:]]
+        response.hero_selection = response.hero_selection[:hero_cap]
         for new_rank, hero in enumerate(response.hero_selection, start=1):
             hero.rank = new_rank
         warnings.append(
-            f"hero_selection truncated to max_selected_images={max_images}; dropped: {dropped}"
+            f"hero_selection truncated to max={hero_cap}; dropped: {dropped}"
         )
     image_groups = [
         [h.asset_id for h in response.hero_selection],
@@ -243,15 +251,44 @@ def run_started_curation(job_dir, job_id, *, processing_consent, start_etag, on_
             return result
 
 
+def _pack_image_batches(
+    candidates: list[Candidate],
+    *,
+    max_candidates: int,
+    max_images: int,
+) -> list[list[Candidate]]:
+    """Pack candidates into batches bounded by BOTH candidate count and total image/frame count."""
+    cand_cap = max(1, int(max_candidates))
+    img_cap = max(1, int(max_images))
+    batches: list[list[Candidate]] = []
+    current: list[Candidate] = []
+    current_imgs = 0
+    for raw_cand in candidates:
+        cand = sample_candidate_frames(raw_cand, img_cap)
+        cost = max(1, len(cand.payload_files))
+        if current and (len(current) >= cand_cap or current_imgs + cost > img_cap):
+            batches.append(current)
+            current = []
+            current_imgs = 0
+        current.append(cand)
+        current_imgs += cost
+    if current:
+        batches.append(current)
+    return batches
+
+
 def run_ai_curation(
     job_dir: str | Path,
     job_id: str,
     *,
     business_context: dict[str, Any] | None = None,
+    user_selection_notes: str | None = None,
+    include_undated_website: bool = False,
     max_images: int = 30,
     max_videos: int = 10,
     max_assets: int = 40,
     batch_size: int = 6,
+    max_images_per_request: int | None = None,
     config: AIProviderConfig | None = None,
     provider: VisionProvider | None = None,
     tracker: UsageTracker | None = None,
@@ -275,9 +312,15 @@ def run_ai_curation(
     cfg = config or AIProviderConfig.from_env()
     max_image_dim = max_image_dim if max_image_dim is not None else cfg.max_image_dim
     max_image_bytes = max_image_bytes if max_image_bytes is not None else cfg.max_image_bytes
+    img_cap_per_req = (
+        max_images_per_request
+        if max_images_per_request is not None
+        else cfg.max_images_per_request
+    )
     if cfg.bounded_acceptance:
         max_image_dim = min(max_image_dim, cfg.max_image_dim)
         max_image_bytes = min(max_image_bytes, cfg.max_image_bytes)
+        img_cap_per_req = 1
         if (job_dir / "curation.json").exists():
             result.errors.append("Bounded acceptance requires a fresh job directory")
             return result
@@ -301,10 +344,23 @@ def run_ai_curation(
     manifest_ids = {
         a["asset_id"]: a
         for a in manifest.get("assets", [])
-        if a.get("extraction_status") in ("downloaded", "duplicate") and date_eligibility(a, bounds) == "in_window"
+        if a.get("extraction_status") in ("downloaded", "duplicate")
+        and (
+            date_eligibility(a, bounds) == "in_window"
+            or (
+                include_undated_website
+                and a.get("platform") == "website"
+                and date_eligibility(a, bounds) == "unknown_date"
+            )
+        )
     }
 
-    selection = select_ai_candidates(manifest, job_dir, max_assets=max_assets)
+    selection = select_ai_candidates(
+        manifest,
+        job_dir,
+        max_assets=max_assets,
+        include_undated_website=include_undated_website,
+    )
     allowed = {c.asset["asset_id"] for c in selection.candidates} | set(selection.inherited)
     ai_execution.check_inputs(raw_manifest, allowed)
     manifest_ids = {aid: asset for aid, asset in manifest_ids.items() if aid in allowed}
@@ -335,15 +391,27 @@ def run_ai_curation(
         result.errors.append("Checkpoint analysis does not match the authorized manifest asset")
         return result
 
+    use_system_prompt = isinstance(provider, OpenAICompatibleProvider) and not cfg.bounded_acceptance
+    prompt_meta = get_prompt_metadata()
+
     # --- MODE A batches ---------------------------------------------------
     mode_a_items = [item.model_dump() for item in validated_mode_a.items] if validated_mode_a else []
     injection_hits: list[str] = []
     batch_failures = 0
-    total_batches = (len(candidates) + batch_size - 1) // max(1, batch_size)
-    for start in range(0, 0 if cfg.mode_b_only else len(candidates), max(1, batch_size)):
-        batch = candidates[start : start + max(1, batch_size)]
+    packed_batches = (
+        []
+        if cfg.mode_b_only
+        else _pack_image_batches(candidates, max_candidates=batch_size, max_images=img_cap_per_req)
+    )
+    total_batches = len(packed_batches)
+    for batch in packed_batches:
         batch_dicts = [{"asset": c.asset, "kind": c.kind, "frame_timestamps": c.frame_timestamps} for c in batch]
-        prompt, hits = build_mode_a_prompt(job_id, batch_dicts)
+        prompt, hits = build_mode_a_prompt(
+            job_id,
+            batch_dicts,
+            user_selection_notes=user_selection_notes,
+            include_directive=not use_system_prompt,
+        )
         injection_hits.extend(hits)
         payloads: list[ImagePayload] = []
         for cand in batch:
@@ -368,6 +436,12 @@ def run_ai_curation(
                     "selection_reason": "pixels could not be supplied to the model",
                 }
             )
+        # Never call the provider for a MODE A batch with zero image payloads
+        # (an empty image list would masquerade as text-only MODE B).
+        if not payloads:
+            batch_failures += 1
+            result.warnings.append("MODE A batch skipped: zero valid image payloads prepared")
+            continue
 
         parsed: ModeAResponse | None = None
         attempt_errors: list[str] = []
@@ -377,8 +451,19 @@ def run_ai_curation(
         for attempt in range(ai_execution.retry_limit(cfg.max_retries) + 1):
             try:
                 with (nullcontext() if isinstance(provider, OpenAICompatibleProvider)
-                      else ai_execution.attempt("A", supplied_ids)):
-                    completion = provider.complete(prompt, payloads, tracker)
+                      else ai_execution.attempt("A", supplied_ids, attempt_index=attempt)):
+                    if use_system_prompt:
+                        completion = provider.complete(
+                            prompt,
+                            payloads,
+                            tracker,
+                            system_prompt=system_prompt_for_mode("A"),
+                            attempt_offset=attempt,
+                        )
+                    elif isinstance(provider, OpenAICompatibleProvider):
+                        completion = provider.complete(prompt, payloads, tracker, attempt_offset=attempt)
+                    else:
+                        completion = provider.complete(prompt, payloads, tracker)
             except ai_execution.InferenceHeld as exc:
                 result.errors.append(str(exc))
                 return result
@@ -390,8 +475,10 @@ def run_ai_curation(
                 break
             except Exception as exc:  # noqa: BLE001 — provider failure honesty
                 attempt_errors.append(scrub_secrets(str(exc))[:160])
+                if not ai_execution.can_retry_http(0):
+                    break
                 continue
-            parsed, problems, score_warnings = _parse_mode_a(completion.text, batch_ids)
+            parsed, problems, score_warnings = _parse_mode_a(completion.text, supplied_ids)
             result.warnings.extend(score_warnings)
             if parsed is not None:
                 if cfg.bounded_acceptance and not result.mock:
@@ -401,7 +488,7 @@ def run_ai_curation(
         if parsed is None:
             batch_failures += 1
             result.warnings.append(
-                f"MODE A batch failed after {cfg.max_retries + 1} attempt(s): "
+                f"MODE A batch failed after {ai_execution.retry_limit(cfg.max_retries) + 1} attempt(s): "
                 + "; ".join(attempt_errors[:3])
             )
             for cand in batch:
@@ -414,8 +501,19 @@ def run_ai_curation(
                         }
                     )
             continue
+        returned_ids: set[str] = set()
         for item in parsed.items:
+            returned_ids.add(item.asset_id)
             mode_a_items.append(item.model_dump())
+        for omitted_id in sorted(supplied_ids - returned_ids):
+            result.warnings.append(f"MODE A omitted asset {omitted_id}; marked unavailable")
+            mode_a_items.append(
+                {
+                    "asset_id": omitted_id,
+                    "visual_analysis_status": "unavailable",
+                    "selection_reason": "model omitted asset from batch analysis",
+                }
+            )
 
     analyzed = [i for i in mode_a_items if i.get("visual_analysis_status") == "analyzed"]
     if injection_hits:
@@ -463,13 +561,32 @@ def run_ai_curation(
         max_videos=max_videos,
         asset_metadata=manifest_ids,
         compact_output=cfg.bounded_acceptance and cfg.mode_b_max_output_tokens <= 900,
+        user_selection_notes=user_selection_notes,
+        include_directive=not use_system_prompt,
     )
+    analyzed_valid_ids = {
+        i["asset_id"]
+        for i in mode_a_items
+        if i.get("visual_analysis_status") == "analyzed" and i["asset_id"] in manifest_ids
+    }
     mode_b: ModeBResponse | None = None
     mode_b_errors: list[str] = []
     for attempt in range(ai_execution.retry_limit(cfg.max_retries) + 1):
         try:
-            with (nullcontext() if isinstance(provider, OpenAICompatibleProvider) else ai_execution.attempt("B", [])):
-                completion = provider.complete(mode_b_prompt, [], tracker)
+            with (nullcontext() if isinstance(provider, OpenAICompatibleProvider)
+                  else ai_execution.attempt("B", [], attempt_index=attempt)):
+                if use_system_prompt:
+                    completion = provider.complete(
+                        mode_b_prompt,
+                        [],
+                        tracker,
+                        system_prompt=system_prompt_for_mode("B"),
+                        attempt_offset=attempt,
+                    )
+                elif isinstance(provider, OpenAICompatibleProvider):
+                    completion = provider.complete(mode_b_prompt, [], tracker, attempt_offset=attempt)
+                else:
+                    completion = provider.complete(mode_b_prompt, [], tracker)
         except ai_execution.InferenceHeld as exc:
             result.errors.append(str(exc))
             return result
@@ -478,6 +595,8 @@ def run_ai_curation(
             break
         except Exception as exc:  # noqa: BLE001
             mode_b_errors.append(scrub_secrets(str(exc))[:160])
+            if not ai_execution.can_retry_http(0):
+                break
             continue
         try:
             data = json.loads(extract_json_text(completion.text))
@@ -502,37 +621,42 @@ def run_ai_curation(
         except Exception as exc:  # noqa: BLE001
             mode_b_errors.append(f"MODE B validation: {str(exc)[:200]}")
             continue
-        # Cross-manifest validation: every selected id must exist
-        valid_ids = set(by_id) | {i["asset_id"] for i in mode_a_items}
+        # Cross-manifest and analyzed-only validation
+        if candidate_response.job_id != job_id:
+            mode_b_errors.append(f"MODE B job_id mismatch: {candidate_response.job_id!r} != {job_id!r}")
+            continue
+        unearned_video = [
+            v.asset_id for v in candidate_response.video_recommendations
+            if v.video_review_status == "full_video_reviewed"
+        ]
+        if unearned_video:
+            mode_b_errors.append(f"MODE B unearned full_video_reviewed: {unearned_video[:5]}")
+            continue
+        unknown_rejected = {r.asset_id for r in candidate_response.rejected_assets} - set(manifest_ids)
+        if unknown_rejected:
+            mode_b_errors.append(f"MODE B rejected unknown asset ids: {sorted(unknown_rejected)[:5]}")
+            continue
         selected = set(candidate_response.selected_asset_ids)
-        hallucinated = selected - set(manifest_ids)
+        hallucinated = selected - analyzed_valid_ids
         if hallucinated:
             mode_b_errors.append(
-                f"MODE B selected unknown asset ids: {sorted(hallucinated)[:5]}"
+                f"MODE B selected unknown asset ids (or unanalyzed): {sorted(hallucinated)[:5]}"
             )
             continue
-        referenced = (
-            {h.asset_id for h in candidate_response.hero_selection}
-            | {i.asset_id for i in candidate_response.salon_images}
-            | {i.asset_id for i in candidate_response.founder_and_team_images}
-            | {i.asset_id for i in candidate_response.service_images}
-            | {i.asset_id for i in candidate_response.grooming_transformations}
-            | {i.asset_id for i in candidate_response.gallery_images}
-            | {v.asset_id for v in candidate_response.video_recommendations}
-        )
-        unknown_refs = referenced - set(manifest_ids)
+        referenced = _category_refs(candidate_response)
+        unknown_refs = referenced - analyzed_valid_ids
         if unknown_refs:
             mode_b_errors.append(
-                f"MODE B referenced unknown asset ids: {sorted(unknown_refs)[:5]}"
+                f"MODE B referenced unknown asset ids (or unanalyzed): {sorted(unknown_refs)[:5]}"
             )
             continue
         pair_refs = set()
         for pair in candidate_response.before_after_pairs:
             pair_refs.update({pair.before_asset_id, pair.after_asset_id})
-        unknown_pairs = pair_refs - set(manifest_ids)
+        unknown_pairs = pair_refs - analyzed_valid_ids
         if unknown_pairs:
             mode_b_errors.append(
-                f"MODE B pair references unknown ids: {sorted(unknown_pairs)[:5]}"
+                f"MODE B pair references unknown asset ids (or unanalyzed): {sorted(unknown_pairs)[:5]}"
             )
             continue
         candidate_response, cut_warnings = _truncate_to_limits(
@@ -588,8 +712,11 @@ def run_ai_curation(
         "curation": curation,
         "ai_envelope": {
             "generated_at": datetime.now(UTC).isoformat(),
-            "prompt_version": PROMPT_VERSION,
+            "prompt_version": prompt_meta["prompt_version"],
+            "prompt_sha256": prompt_meta["prompt_sha256"],
+            "prompt_source": prompt_meta["prompt_source"],
             "schema_version": SCHEMA_VERSION,
+            "include_undated_website": bool(include_undated_website),
             "provider": result.provider,
             "model": result.model,
             "mock": result.mock,

@@ -136,12 +136,18 @@ def _build_fake_groq_transport(calls: list[dict], *, fail_http_500: bool = False
             }).encode("utf-8")
             raise requests.HTTPError("500 Server Error", response=resp)
 
-        content = req["body"]["messages"][0]["content"]
+        messages = req["body"]["messages"]
+        assert messages[0]["role"] == "system"
+        assert messages[-1]["role"] == "user"
+        content = messages[-1]["content"]
         prompt_text = content[0]["text"]
-        image_parts = content[1:]
+        image_parts = [p for p in content[1:] if p.get("type") == "image_url"]
+        label_parts = [p for p in content[1:] if p.get("type") == "text"]
         mode = "B" if not image_parts else "A"
         if mode == "A":
-            # Verify every image payload sent to fake Groq is a valid base64 JPEG.
+            # Verify every image payload sent to fake Groq has an explicit [IMAGE asset_id=...] label and valid base64 JPEG.
+            assert len(label_parts) == len(image_parts)
+            assert all(p["text"].startswith("[IMAGE asset_id=") for p in label_parts)
             for part in image_parts:
                 url = part["image_url"]["url"]
                 assert url.startswith("data:image/jpeg;base64,")
@@ -603,9 +609,14 @@ def test_full_offline_m4_real_checkpoint_to_fake_groq_rights_ledger_and_fake_pri
     assert st == 200, exec_out
     assert exec_out["status"] == "completed" and exec_out["mock"] is False
     assert exec_out["provider"] == "openai_compatible"
-    assert [c["mode"] for c in groq_calls] == ["A", "B"]
-    assert set(groq_calls[0]["asset_ids"]) == {web_hero["asset_id"], web_clip["asset_id"], fb_photo["asset_id"]}
-    assert web_undated["asset_id"] not in groq_calls[0]["asset_ids"]
+    mode_a_calls = [c for c in groq_calls if c["mode"] == "A"]
+    mode_b_calls = [c for c in groq_calls if c["mode"] == "B"]
+    assert len(mode_a_calls) >= 1 and len(mode_b_calls) == 1
+    assert groq_calls[-1]["mode"] == "B"
+    assert all(c["image_parts"] <= 5 for c in mode_a_calls)
+    all_mode_a_ids = {aid for c in mode_a_calls for aid in c["asset_ids"]}
+    assert all_mode_a_ids == {web_hero["asset_id"], web_clip["asset_id"], fb_photo["asset_id"]}
+    assert web_undated["asset_id"] not in all_mode_a_ids
     assert (job_dir / "curation.json").is_file()
     curation_raw = (job_dir / "curation.json").read_text(encoding="utf-8")
     assert FAKE_GROQ_KEY not in curation_raw
@@ -615,10 +626,11 @@ def test_full_offline_m4_real_checkpoint_to_fake_groq_rights_ledger_and_fake_pri
     assert worker.fetch(job_id)["ai_curation"]["status"] == "completed"
 
     # Duplicate execution is blocked (409) and never re-calls Groq.
+    calls_before_dup = len(groq_calls)
     assert invoke("collection-execute", {
         "job_id": job_id, "if_match": started["etag"], "processing_consent": consent,
     }, session_b)[0] == 409
-    assert len(groq_calls) == 2
+    assert len(groq_calls) == calls_before_dup
 
     # 7. Delivery BEFORE rights verification is blocked (blocked_rights_review / 409).
     st, _, plan_raw = request(worker.app, f"/jobs/{job_id}/delivery-plan", "GET", "test-admin")
