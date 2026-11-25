@@ -78,9 +78,14 @@ class ClosingConnection(sqlite3.Connection):
 
 def connect() -> sqlite3.Connection:
     con = sqlite3.connect(DB, timeout=10, factory=ClosingConnection)
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
     con.execute("PRAGMA busy_timeout=5000;")
+    mode_row = con.execute("PRAGMA journal_mode;").fetchone()
+    if not mode_row or str(mode_row[0]).lower() != "wal":
+        with lock:
+            mode_row = con.execute("PRAGMA journal_mode;").fetchone()
+            if not mode_row or str(mode_row[0]).lower() != "wal":
+                con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
     con.execute(
         "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
     )
@@ -140,8 +145,12 @@ with connect() as _db:
 
 
 class CreateJobRequest(BaseModel):
-    website_url: str = Field(min_length=1, max_length=2048, description="Required pet grooming business website URL")
-    instagram_url: str = Field(min_length=1, max_length=2048, description="Required public Instagram URL")
+    website_url: str = Field(min_length=1, max_length=2048, description="Required business website URL")
+    instagram_url: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="Optional public Instagram URL (parked by default in V2.1)",
+    )
     facebook_url: str = Field(min_length=1, max_length=2048, description="Required public Facebook URL")
     lookback_days: int = Field(default=365, ge=1, le=366)
     max_selected_images: int = Field(default=30, ge=1, le=200)
@@ -182,12 +191,13 @@ class CreateJobRequest(BaseModel):
 
     @field_validator("website_url", "instagram_url", "facebook_url")
     @classmethod
-    def validate_url(cls, value: str, info) -> str:
+    def validate_url(cls, value: str | None, info) -> str | None:
         from app.orchestration import _check_url
 
+        is_required = info.field_name != "instagram_url"
         errors: list[str] = []
-        normalized = _check_url(value, info.field_name, errors, required=True)
-        if normalized is None:
+        normalized = _check_url(value, info.field_name, errors, required=is_required)
+        if errors:
             raise ValueError(errors[0])
         return normalized
 
@@ -519,7 +529,10 @@ def register_job(req: CreateJobRequest) -> dict[str, Any]:
     }
     if os.environ.get("RECORDED_EXTRACTOR_HANDOFF") == "1":
         payload["collection_mode"] = "recorded_extractor"
-    elif os.environ.get("PUBLIC_COLLECTION_CHECKPOINTS") == "1":
+    elif (
+        os.environ.get("PUBLIC_COLLECTION_CHECKPOINTS") == "1"
+        or os.environ.get("COLLECTION_ENGINE", "").strip().lower() == "historical"
+    ):
         payload["collection_mode"] = "public_checkpoint"
     try:
         if named:
@@ -584,20 +597,35 @@ def _process_job(job_id: str, payload: dict[str, Any]) -> None:
 
         mode = payload.get("collection_mode")
         if mode in ("public_checkpoint", "recorded_extractor"):
-            from app.public_collection import COLLECTION_HOLD, collect_public_job
+            from app.public_collection import (
+                COLLECTION_HOLD,
+                build_multitenant_collection_config,
+                collect_public_job,
+            )
 
             if mode == "recorded_extractor":
                 from app.recorded_collection import collect_recorded_job
 
-                flag, config_key, collect = "RECORDED_EXTRACTOR_HANDOFF", "RECORDED_EXTRACTOR_CONFIG", collect_recorded_job
+                if os.environ.get("RECORDED_EXTRACTOR_HANDOFF") != "1":
+                    raise ValueError("Checkpoint collection mode is disabled")
+                config_path = os.environ.get("RECORDED_EXTRACTOR_CONFIG")
+                if not config_path:
+                    raise ValueError("Checkpoint collection requires an explicit source configuration")
+                source_cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+                manifest = collect_recorded_job(job_dir, payload, source_cfg)
             else:
-                flag, config_key, collect = "PUBLIC_COLLECTION_CHECKPOINTS", "PUBLIC_COLLECTION_CONFIG", collect_public_job
-            if os.environ.get(flag) != "1":
-                raise ValueError("Checkpoint collection mode is disabled")
-            config_path = os.environ.get(config_key)
-            if not config_path:
-                raise ValueError("Checkpoint collection requires an explicit source configuration")
-            manifest = collect(job_dir, payload, json.loads(Path(config_path).read_text(encoding="utf-8")))
+                checkpoint_enabled = (
+                    os.environ.get("PUBLIC_COLLECTION_CHECKPOINTS") == "1"
+                    or os.environ.get("COLLECTION_ENGINE", "").strip().lower() == "historical"
+                )
+                if not checkpoint_enabled:
+                    raise ValueError("Checkpoint collection mode is disabled")
+                config_path = os.environ.get("PUBLIC_COLLECTION_CONFIG")
+                if config_path:
+                    source_cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+                else:
+                    source_cfg = build_multitenant_collection_config(payload)
+                manifest = collect_public_job(job_dir, payload, source_cfg)
             store({
                 **payload, "status": "partial_success", "sources": manifest["sources"],
                 "collection_gate": COLLECTION_HOLD, "ai_curation": {"status": COLLECTION_HOLD},
@@ -974,6 +1002,40 @@ def post_orchestration(job_id: str, body: dict[str, Any]) -> dict[str, Any]:
     store(rec)
     return {"ok": True, "job_id": job_id, "stage": stage}
 
+@app.post("/jobs/{job_id}/resume-collection", status_code=202)
+def resume_collection(job_id: str) -> dict[str, Any]:
+    """Resume an existing public_checkpoint job from its persisted CollectionCheckpoint cursor."""
+    with submission_lock:
+        rec = fetch(job_id)
+        if rec is None:
+            raise HTTPException(404, "Unknown job")
+        if rec.get("collection_mode") != "public_checkpoint":
+            raise HTTPException(409, "Only checkpoint-backed jobs can resume collection")
+        if rec.get("status") in ("queued", "running"):
+            raise HTTPException(409, "Job is already running")
+        checkpoint_enabled = (
+            os.environ.get("PUBLIC_COLLECTION_CHECKPOINTS") == "1"
+            or os.environ.get("COLLECTION_ENGINE", "").strip().lower() == "historical"
+        )
+        if not checkpoint_enabled:
+            raise HTTPException(503, "Checkpoint collection mode is disabled")
+        if not slots.acquire(blocking=False):
+            raise HTTPException(429, "Worker busy; retry later")
+        resumed = {
+            **rec,
+            "status": "queued",
+            "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        }
+        try:
+            store(resumed)
+            executor.submit(_process_job, job_id, resumed)
+        except Exception:
+            slots.release()
+            store(rec)
+            raise
+        return {"job_id": job_id, "status": "queued", "resumed": True}
+
+
 @app.get("/jobs/{job_id}/delivery-plan")
 def get_delivery_plan(job_id: str, business_name: str = "") -> dict[str, Any]:
     rec = fetch(job_id)
@@ -984,12 +1046,13 @@ def get_delivery_plan(job_id: str, business_name: str = "") -> dict[str, Any]:
     is_checkpoint = rec.get("collection_mode") in ("public_checkpoint", "recorded_extractor")
     if is_checkpoint and not m4_approval_enabled():
         return {"status": "blocked_unverified_collection", "job_id": job_id, "assets": []}
+    use_m4_db = is_checkpoint or m4_approval_enabled()
     return build_delivery_plan(
         Path(DATA_DIR) / job_id,
         job_id,
         business_name,
-        db_path=DB if is_checkpoint else None,
-        projects_root=DATA_DIR if is_checkpoint else None,
+        db_path=DB if use_m4_db else None,
+        projects_root=DATA_DIR if use_m4_db else None,
     )
 
 
@@ -1005,13 +1068,14 @@ def post_delivery_result(job_id: str, payload: dict[str, Any]) -> dict[str, Any]
     is_checkpoint = rec.get("collection_mode") in ("public_checkpoint", "recorded_extractor")
     if is_checkpoint and not m4_approval_enabled():
         raise HTTPException(409, "blocked_unverified_collection")
+    use_m4_db = is_checkpoint or m4_approval_enabled()
     job_dir = Path(DATA_DIR) / job_id
     plan = build_delivery_plan(
         job_dir,
         job_id,
         str(payload.get("business_name") or ""),
-        db_path=DB if is_checkpoint else None,
-        projects_root=DATA_DIR if is_checkpoint else None,
+        db_path=DB if use_m4_db else None,
+        projects_root=DATA_DIR if use_m4_db else None,
     )
     if plan["status"] != "ready":
         raise HTTPException(409, plan["status"])

@@ -39,16 +39,18 @@ export default function NewCollection() {
     setSubmitting(true);
     setServerError(null);
     try {
+      const instagramTrimmed = form.instagram_url.trim();
       const payload = {
           website_url: form.website_url.trim(),
-          instagram_url: form.instagram_url.trim(),
+          ...(instagramTrimmed ? { instagram_url: instagramTrimmed } : {}),
           facebook_url: form.facebook_url.trim(),
           business_name: form.business_name.trim() || undefined,
           max_selected_images: Number(form.max_selected_images),
           max_selected_videos: Number(form.max_selected_videos),
           run_ai_curation: form.run_ai_curation,
           social_permission_confirmed: form.social_permission_confirmed,
-          business_context: form.visual_preferences ? { visual_preferences: form.visual_preferences } : undefined,
+          user_selection_notes: form.visual_preferences.trim() || undefined,
+          business_context: form.visual_preferences.trim() ? { visual_preferences: form.visual_preferences.trim() } : undefined,
       };
       const fingerprint = JSON.stringify(payload);
       if (previousSubmission.current?.payload !== fingerprint) {
@@ -82,11 +84,14 @@ export default function NewCollection() {
   return (
     <div className="max-w-2xl space-y-6">
       <h1 className="text-2xl font-semibold">New Media Collection</h1>
+      <p className="text-sm text-slate-600">
+        Collects available preceding-365-day media from the business Website and Facebook Page. Instagram is optional (parked in V2.1 due to strict anonymous rate limits).
+      </p>
       <form onSubmit={onSubmit} className="space-y-4 rounded-lg border border-slate-200 bg-white p-6">
         {field("business_name", "Business name")}
         {field("website_url", "Business website URL *", { required: true, placeholder: "https://example.com" })}
-        {field("instagram_url", "Instagram URL *", { required: true, placeholder: "https://www.instagram.com/..." })}
-        {field("facebook_url", "Facebook URL *", { required: true, placeholder: "https://www.facebook.com/..." })}
+        {field("facebook_url", "Facebook Page URL *", { required: true, placeholder: "https://www.facebook.com/..." })}
+        {field("instagram_url", "Instagram URL (optional — parked in V2.1)", { placeholder: "https://www.instagram.com/..." })}
         <div className="grid grid-cols-2 gap-4">
           {field("max_selected_images", "Max images")}
           {field("max_selected_videos", "Max videos")}

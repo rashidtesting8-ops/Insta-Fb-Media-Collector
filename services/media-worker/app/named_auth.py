@@ -79,7 +79,12 @@ def password_bytes(password):
 def _connect(db):
     con = sqlite3.connect(db, timeout=10)
     con.execute("PRAGMA busy_timeout=5000;")
-    con.execute("PRAGMA journal_mode=WAL;")
+    mode_row = con.execute("PRAGMA journal_mode;").fetchone()
+    if not mode_row or str(mode_row[0]).lower() != "wal":
+        with _SCHEMA_LOCK:
+            mode_row = con.execute("PRAGMA journal_mode;").fetchone()
+            if not mode_row or str(mode_row[0]).lower() != "wal":
+                con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
     return con
 

@@ -147,7 +147,7 @@ def safe_url(url: str, *, allow_private: bool = False) -> str:
     p = urlparse(url)
     if p.scheme not in ("http", "https") or not p.hostname:
         raise ValueError("Only absolute HTTP(S) URLs are allowed")
-    if p.username or p.password:
+    if p.username is not None or p.password is not None:
         raise ValueError("Embedded credentials are not permitted")
     try:
         port = p.port
