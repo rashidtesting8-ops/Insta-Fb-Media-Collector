@@ -24,8 +24,23 @@ services:
       AI_PROVIDER: ${AI_PROVIDER:-}
       AI_MODEL: ${AI_MODEL:-}
       AI_ENDPOINT: ${AI_ENDPOINT:-}
+      AI_ALLOWED_ENDPOINTS: ${AI_ALLOWED_ENDPOINTS:-https://api.groq.com/openai/v1/chat/completions}
       AI_API_KEY: ${AI_API_KEY:-}
-      AI_MAX_IMAGES_PER_REQUEST: ${AI_MAX_IMAGES_PER_REQUEST:-5}
+      AI_TIMEOUT_S: ${AI_TIMEOUT_S:-120}
+      AI_MAX_RETRIES: ${AI_MAX_RETRIES:-3}
+      AI_BOUNDED_ACCEPTANCE: ${AI_BOUNDED_ACCEPTANCE:-0}
+      AI_MODE_A_MAX_OUTPUT_TOKENS: ${AI_MODE_A_MAX_OUTPUT_TOKENS:-850}
+      AI_MODE_B_MAX_OUTPUT_TOKENS: ${AI_MODE_B_MAX_OUTPUT_TOKENS:-950}
+      AI_BATCH_SIZE: ${AI_BATCH_SIZE:-1}
+      AI_MAX_IMAGES_PER_REQUEST: ${AI_MAX_IMAGES_PER_REQUEST:-1}
+      AI_MAX_IMAGE_DIM: ${AI_MAX_IMAGE_DIM:-512}
+      AI_MAX_IMAGE_BYTES: ${AI_MAX_IMAGE_BYTES:-300000}
+      AI_MAX_REQUEST_BYTES: ${AI_MAX_REQUEST_BYTES:-1000000}
+      AI_MIN_REQUEST_SPACING_S: ${AI_MIN_REQUEST_SPACING_S:-5}
+      AI_MAX_REQUESTS_PER_JOB: ${AI_MAX_REQUESTS_PER_JOB:-25}
+      AI_MAX_COST_USD_PER_JOB: ${AI_MAX_COST_USD_PER_JOB:-0.25}
+      AI_PRICE_IN_PER_1K: ${AI_PRICE_IN_PER_1K:-0.0008}
+      AI_PRICE_OUT_PER_1K: ${AI_PRICE_OUT_PER_1K:-0.004}
     volumes:
       - ${STAGING_MEDIA_DIR:?select a fresh staging-only directory}:/data/projects:rw
       - ../docs/AI_VISUAL_DIRECTOR_V2.md:/srv/docs/AI_VISUAL_DIRECTOR_V2.md:ro
@@ -56,6 +71,9 @@ services:
       - n8n_state:/home/node/.n8n
       - ${STAGING_MEDIA_DIR:?select a fresh staging-only directory}:/data/media:ro
       - ../n8n-media:/opt/media-workflows:ro
+    depends_on:
+      collector:
+        condition: service_healthy
     networks: [worker]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz/readiness || exit 1"]
@@ -79,6 +97,11 @@ services:
       GOOGLE_DRIVE_READY: ${GOOGLE_DRIVE_READY:-0}
       WORKER_URL: http://collector:8787
       N8N_URL: http://n8n:5678
+    depends_on:
+      collector:
+        condition: service_healthy
+      n8n:
+        condition: service_healthy
     networks: [edge, worker]
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
@@ -91,11 +114,15 @@ services:
     image: ${CADDY_IMAGE:?set a pinned Caddy image}
     environment:
       STAGING_HOST: ${STAGING_HOST:?set the staging hostname without a port}
+      ACME_EMAIL: ${ACME_EMAIL:-}
     ports:
       - "127.0.0.1:${STAGING_HTTPS_PORT:-8443}:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${CADDYFILE_PATH:-./Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_state:/data
+    depends_on:
+      dashboard:
+        condition: service_healthy
     networks: [edge]
 
 networks:

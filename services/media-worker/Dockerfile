@@ -23,6 +23,8 @@ COPY pyproject.toml ./pyproject.toml
 COPY app ./app
 COPY tests ./tests
 COPY scripts/named_bootstrap.py ./scripts/named_bootstrap.py
+COPY scripts/sqlite_backup.py ./scripts/sqlite_backup.py
+COPY scripts/readiness_probe.py ./scripts/readiness_probe.py
 RUN chown -R appuser:appuser /srv /data/projects
 USER appuser
 

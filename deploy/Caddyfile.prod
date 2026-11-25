@@ -1,0 +1,36 @@
+# Pet Grooming Media Intelligence — Production HTTPS Reverse Proxy (Caddy 2)
+#
+# Usage:
+#   Set STAGING_HOST=app.yourdomain.com, ACME_EMAIL=ops@yourdomain.com,
+#   DASHBOARD_ORIGIN=https://app.yourdomain.com, and CADDYFILE_PATH=./Caddyfile.prod
+#   with ports 80 and 443 published on the production host.
+#   Automatic HTTPS provisions and renews Let's Encrypt TLS certificates and
+#   redirects HTTP -> HTTPS.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$STAGING_HOST} {
+	encode zstd gzip
+
+	# Defense-in-depth: block localhost bootstrap routes at the edge in addition
+	# to application-level DASHBOARD_ORIGIN=https:// enforcement.
+	@bootstrap path /setup-admin /setup-admin/* /api/auth/setup-admin /api/auth/setup-admin/*
+	respond @bootstrap 404
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	request_body {
+		max_size 64KB
+	}
+
+	reverse_proxy dashboard:3000
+}
