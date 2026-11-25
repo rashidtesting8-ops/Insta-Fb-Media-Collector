@@ -26,7 +26,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from app.collection_checkpoint import InventoryPage, SourceItem, SourceStop
-from app.legacy_social_collect import _execute_subprocess, check_social_url, classify_social_failure
+from app.legacy_social_collect import _execute_subprocess, check_social_url, classify_social_failure, scrub_sensitive_text
 from app.publication import aware_timestamp
 from app.social_normalizers import (
     build_source_item,
@@ -66,10 +66,66 @@ _FB_PAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_CHALLENGE_PATTERNS = ("checkpoint", "challenge", "captcha", "cf-mitigated", "verify your identity")
-_AUTH_ERROR_PATTERNS = ("authenticationerror", "authenticationrequired", "authorizationerror", "loginrequiredexception")
+_CHALLENGE_PATTERNS = (
+    "checkpoint",
+    "challenge",
+    "challengeerror",
+    "captcha",
+    "cf-mitigated",
+    "verify your identity",
+)
+_AUTH_ERROR_PATTERNS = (
+    "authenticationerror",
+    "authenticationrequired",
+    "authorizationerror",
+    "authrequired",
+    "loginrequiredexception",
+    "privateprofilenotfollowedexception",
+    "queryreturnedforbiddenexception",
+    "private but not followed",
+    "you must be logged in",
+    "must be logged in",
+    "http redirect to login page",
+    "redirected to login page",
+    "account credentials required",
+    "posts are private",
+)
+_LOGIN_REDIRECT_URL_RE = re.compile(
+    r"http redirect from\s+\S+\s+to\s+https?://(?:www\.|i\.|m\.)?(?:instagram|facebook)\.com/(?:accounts/login|login)"
+)
+_HOME_REDIRECT_AUTH_RE = re.compile(
+    r"(?:"
+    r"http redirect to home page\s*\(\s*https?://(?:www\.|m\.|mobile\.|web\.)?(?:instagram|facebook)\.com/?\s*\)"
+    r"|http redirect to home page[^\n]{0,160}\b(?:instagram|facebook|login|auth|account|cookie|session|sign\s*in|private|restricted)\b"
+    r"|\b(?:instagram|facebook|login|auth|account|cookie|session|sign\s*in|private|restricted)\b[^\n]{0,160}http redirect to home page"
+    r")"
+)
+_HTTP_RESTRICTED_RE = re.compile(
+    r"(?:"
+    r"\b(?:401\s*unauthorized|403\s*forbidden)\b"
+    r"|(?:http(?:error|\s+error|\s+status)?|status(?:_code)?|response(?:\s+code)?|code)\s*[:=\[\('\"\\\s]{1,6}(?:401|403)\b"
+    r"|responded\s+with\s+['\"]?(?:401|403)(?:\b|\s|['\"])"
+    r"|\"error\"\s*:\s*\"httperror\"\s*,\s*\"message\"\s*:\s*\"'?(?:401|403)(?:\b|\s|')"
+    r"|'(?:401|403)\s*[^']*'\s+for\s+'"
+    r"|\b(?:401|403)\s+client\s+error\b"
+    r"|\(\s*(?:401|403)\s*\)"
+    r")"
+)
 _EXTRACTOR_RUNTIME_ERRORS = ("unboundlocalerror", "indexerror", "valueerror", "runtimeerror", "parseerror")
-_RATE_LIMIT_RE = re.compile(r"(?:\b429\b|too many requests|rate[_ ]?limit|ratelimit|please wait a few minutes)")
+_RATE_LIMIT_RE = re.compile(
+    r"(?:"
+    r"\b429\b"
+    r"|too many requests"
+    r"|toomanyrequestsexception"
+    r"|too many queries in the last time"
+    r"|feedback_required"
+    r"|rate[_ ]?limit"
+    r"|ratelimit"
+    r"|please wait a few minutes"
+    r"|temporarily blocked(?: from viewing images)?"
+    r")"
+)
+_URL_QUERY_STRIP_RE = re.compile(r"(https?://[^\s'\"<>?]+)\?[^\s'\"<>]+")
 _NOT_FOUND_RE = re.compile(r"(?:\b404\b|not found|unsupported url)")
 _GDL_USER_NOT_FOUND_RE = re.compile(r"notfounderror.{0,120}(?:requested user could not be found|user)|requested user could not be found")
 _INSTALOADER_NOT_EXISTS_RE = re.compile(r"profilenotexistsexception|profile\s+\S+\s+does not exist|does not exist\.")
@@ -202,6 +258,17 @@ def _extract_diagnostic_text(tool: str, output: str, gallery_records: list[Any] 
                     pass
             non_json.append(raw)
         return "\n".join(non_json)
+    if tool == "instaloader":
+        cleaned_lines: list[str] = []
+        for line in text.splitlines():
+            raw = line.strip()
+            if not raw:
+                continue
+            sanitized = scrub_sensitive_text(_URL_QUERY_STRIP_RE.sub(r"\1", raw))
+            cleaned_lines.append(sanitized[:240])
+            if len(cleaned_lines) >= 20:
+                break
+        return "\n".join(cleaned_lines)
     return text
 
 
@@ -220,7 +287,13 @@ def classify_cli_outcome(
         return None
     if _RATE_LIMIT_RE.search(low):
         return "rate_limited"
-    if any(token in low for token in _CHALLENGE_PATTERNS) or any(token in low for token in _AUTH_ERROR_PATTERNS):
+    if (
+        any(token in low for token in _CHALLENGE_PATTERNS)
+        or any(token in low for token in _AUTH_ERROR_PATTERNS)
+        or _LOGIN_REDIRECT_URL_RE.search(low)
+        or _HOME_REDIRECT_AUTH_RE.search(low)
+        or _HTTP_RESTRICTED_RE.search(low)
+    ):
         return "restricted"
     base = classify_social_failure(exit_code, diag)
     if base == "rate_limited":
@@ -436,10 +509,13 @@ def build_instaloader_historical_cmd(
     use_resume: bool = False,
     executable: str = "instaloader",
 ) -> list[str]:
-    """Bounded metadata-only Instaloader command with optional --reels and native resume prefix."""
+    """Bounded metadata-only Instaloader command with optional --reels and native resume prefix.
+
+    Intentionally omits --quiet so HTTP 401/403/429 and login-redirect diagnostics are not
+    suppressed behind generic failure summaries (subprocess runs with stdin=DEVNULL and no login).
+    """
     cmd = [
         executable,
-        "--quiet",
         "--resume-prefix" if use_resume else "--no-resume",
     ]
     if use_resume:
@@ -531,6 +607,7 @@ class OpenSourceSocialInventory:
         include_albums: bool = False,
         album_limit: int = 5,
         resume_dir: Path | None = None,
+        min_batch_seconds: float | None = None,
     ) -> None:
         self.platform = platform
         self.profile_url = profile_url
@@ -549,11 +626,15 @@ class OpenSourceSocialInventory:
             raise ValueError("cutoff_consecutive_older must be a positive integer")
         if type(album_limit) is not int or album_limit < 1:
             raise ValueError("album_limit must be a positive integer")
+        if min_batch_seconds is not None and (isinstance(min_batch_seconds, bool) or min_batch_seconds < 0):
+            raise ValueError("min_batch_seconds must be a non-negative number")
         self.cutoff_consecutive_older = cutoff_consecutive_older
         self.include_reels = bool(include_reels)
         self.include_albums = bool(include_albums)
         self.album_limit = album_limit
         self.resume_dir = resume_dir
+        self.min_batch_seconds = float(min_batch_seconds) if min_batch_seconds is not None else None
+        self._observed_batch_seconds: list[float] = []
         self.budget = DiscoveryBudget(
             request_budget=request_budget,
             item_limit=item_limit,
@@ -723,7 +804,8 @@ class OpenSourceSocialInventory:
         items, paired, count = self._normalize_posts(
             "instaloader", raw_posts, issues, max_attachments=max_attachments, visited_ids=visited_ids,
         )
-        reason = classify_cli_outcome("instaloader", code, output)
+        diag = _extract_diagnostic_text("instaloader", output)
+        reason = classify_cli_outcome("instaloader", code, output, diagnostic_text=diag)
         self.tools_executed.append({
             "tool": "instaloader",
             "outcome": reason or f"discovered_{len(items)}",
@@ -794,15 +876,78 @@ class OpenSourceSocialInventory:
             return reason
         return "source_stopped"
 
+    @staticmethod
+    def validate_historical_cursor(platform: str, cursor: str) -> dict[str, Any]:
+        """Validate a persisted historical cursor JSON strictly before resuming."""
+        try:
+            loaded = json.loads(cursor)
+        except json.JSONDecodeError as exc:
+            raise SourceStop("invalid_continuation") from exc
+        if not isinstance(loaded, dict) or loaded.get("v") != 1 or loaded.get("platform") != platform:
+            raise SourceStop("invalid_continuation")
+        for list_key in ("visited_ids",):
+            val = loaded.get(list_key)
+            if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+                raise SourceStop("invalid_continuation")
+        for int_key in ("consecutive_older", "total_discovered"):
+            val = loaded.get(int_key)
+            if type(val) is not int or val < 0:
+                raise SourceStop("invalid_continuation")
+        if platform == "facebook":
+            phase = loaded.get("phase")
+            if phase not in ("photos", "albums", "album_set"):
+                raise SourceStop("invalid_continuation")
+            visited_sets = loaded.get("visited_sets")
+            if not isinstance(visited_sets, list) or not all(isinstance(x, str) for x in visited_sets):
+                raise SourceStop("invalid_continuation")
+            next_url = loaded.get("next_url")
+            if phase in ("photos", "album_set"):
+                if not isinstance(next_url, str) or not next_url:
+                    raise SourceStop("invalid_continuation")
+                try:
+                    check_social_url("facebook", next_url)
+                except ValueError as exc:
+                    raise SourceStop("invalid_continuation") from exc
+                low_path = (urlsplit(next_url).path or "/").lower().rstrip("/")
+                if any(low_path == bad or low_path.startswith(bad + "/") for bad in _FB_UNSUPPORTED_PATHS):
+                    raise SourceStop("invalid_continuation")
+            pending_albums = loaded.get("pending_albums")
+            if not isinstance(pending_albums, list):
+                raise SourceStop("invalid_continuation")
+            for alb in pending_albums:
+                if not isinstance(alb, dict) or not isinstance(alb.get("url"), str):
+                    raise SourceStop("invalid_continuation")
+                try:
+                    check_social_url("facebook", alb["url"])
+                except ValueError as exc:
+                    raise SourceStop("invalid_continuation") from exc
+                low_path = (urlsplit(alb["url"]).path or "/").lower().rstrip("/")
+                if any(low_path == bad or low_path.startswith(bad + "/") for bad in _FB_UNSUPPORTED_PATHS):
+                    raise SourceStop("invalid_continuation")
+        elif platform == "instagram":
+            queue = loaded.get("queue")
+            if not isinstance(queue, list):
+                raise SourceStop("invalid_continuation")
+            for task in queue:
+                if not isinstance(task, dict) or task.get("section") not in ("posts", "reels", "single"):
+                    raise SourceStop("invalid_continuation")
+                t_url = task.get("url")
+                if not isinstance(t_url, str):
+                    raise SourceStop("invalid_continuation")
+                try:
+                    check_social_url("instagram", t_url)
+                except ValueError as exc:
+                    raise SourceStop("invalid_continuation") from exc
+                t_cur = task.get("cursor")
+                if t_cur is not None and (not isinstance(t_cur, str) or not _SAFE_CURSOR_RE.fullmatch(t_cur)):
+                    raise SourceStop("invalid_continuation")
+        else:
+            raise SourceStop("invalid_continuation")
+        return loaded
+
     def _load_historical_state(self, cursor: str | None, url_kind: str, target_hint: str | None) -> dict[str, Any]:
         if cursor is not None:
-            try:
-                loaded = json.loads(cursor)
-            except json.JSONDecodeError as exc:
-                raise SourceStop("invalid_continuation") from exc
-            if not isinstance(loaded, dict) or loaded.get("v") != 1 or loaded.get("platform") != self.platform:
-                raise SourceStop("invalid_continuation")
-            return loaded
+            return self.validate_historical_cursor(self.platform, cursor)
         if self.platform == "facebook":
             can_albums = self.include_albums and url_kind in ("people_profile", "profile_id", "page") and bool(target_hint)
             return {
@@ -838,6 +983,23 @@ class OpenSourceSocialInventory:
             "unsupported_sections": [],
         }
 
+    def _check_pre_batch_time_guard(self, batch_limit: int) -> None:
+        """Stop cleanly before spawning a batch that cannot finish within remaining wall-clock budget."""
+        remaining = self.budget.remaining_seconds()
+        if remaining <= 0:
+            raise SourceStop("time_budget")
+        if self.min_batch_seconds is not None:
+            if remaining < self.min_batch_seconds:
+                raise SourceStop("time_budget")
+            return
+        min_polite = max(0.0, (batch_limit - 1) * self.sleep_request) if batch_limit > 1 and self.sleep_request > 0 else 0.0
+        if self._observed_batch_seconds:
+            required = max(min_polite, min(self._observed_batch_seconds) * 0.85)
+            if remaining < required:
+                raise SourceStop("time_budget")
+        elif min_polite > 0 and remaining < min_polite:
+            raise SourceStop("time_budget")
+
     def _run_gallery_historical(
         self,
         *,
@@ -850,6 +1012,7 @@ class OpenSourceSocialInventory:
         disable_loop: bool = False,
         visited_ids: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], list[SourceItem], list[tuple[dict[str, Any], SourceItem]], int, list[Any], str | None, str | None]:
+        self._check_pre_batch_time_guard(batch_limit if resolve else 1)
         cmd = build_gallery_dl_historical_cmd(
             platform=self.platform,
             url=url,
@@ -860,7 +1023,9 @@ class OpenSourceSocialInventory:
             resolve=resolve,
             disable_loop=disable_loop,
         )
+        t0 = self.budget.clock()
         code, output = self._run_tool("gallery-dl", cmd, stage, allow_repeat=True)
+        elapsed = max(0.0, self.budget.clock() - t0)
         if code == 127 and output == "tool_unavailable":
             self.tools_executed.append({"tool": "gallery-dl", "outcome": "tool_unavailable", "url": url})
             return [], [], [], 0, [], None, "tool_unavailable"
@@ -872,6 +1037,8 @@ class OpenSourceSocialInventory:
             if resolve
             else ([], [], 0)
         )
+        if resolve and code == 0 and items and elapsed > 0:
+            self._observed_batch_seconds.append(elapsed)
         real_cursor = extract_gallery_dl_cursor(output, records)
         diag = _extract_diagnostic_text("gallery-dl", output, records)
         reason = classify_cli_outcome("gallery-dl", code, output, error_codes, diagnostic_text=diag)

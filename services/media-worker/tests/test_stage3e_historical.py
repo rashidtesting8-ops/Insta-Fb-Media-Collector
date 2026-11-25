@@ -1053,3 +1053,634 @@ def test_consolidated_historical_mode_through_m4_approval_start_ai_rights_ledger
     assert st == 200 and plan["status"] == "ready" and plan["visibility"] == "private" and plan["public_sharing"] is False
     assert [a["asset_id"] for a in plan["assets"]] == [fb_ok["asset_id"]]
     assert plan["assets"][0]["filename"].endswith(".jpg")
+
+
+@pytest.mark.parametrize(
+    ("label", "code", "output", "expected_class", "expected_stop", "expected_term"),
+    [
+        (
+            "ig_login_redirect_with_code6",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "AbortExtraction", "message": "HTTP redirect to login page (https://www.instagram.com/accounts/login/)"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "ig_home_redirect_auth_with_code6",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "AbortExtraction", "message": "HTTP redirect to home page (https://www.instagram.com/)"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "ig_home_redirect_stderr_context",
+            1,
+            "[instagram][error] AbortExtraction: HTTP redirect to home page",
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "ig_challenge_redirect_with_code6",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "AbortExtraction", "message": "HTTP redirect to challenge page (https://www.instagram.com/challenge/)"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "ig_challenge_error_envelope",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "ChallengeError", "message": "Cloudflare challenge (403 Forbidden) for 'https://www.instagram.com/'"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "fb_auth_required_must_be_logged_in_with_code6",
+            0,
+            json.dumps([
+                [6, FB, {}],
+                [-1, {"error": "AuthRequired", "message": "You must be logged in to continue viewing images.\nYou can use this URL..."}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "fb_auth_required_profile_cookies",
+            0,
+            json.dumps([
+                [-1, {"error": "AuthRequired", "message": "authenticated cookies needed to access this profile ('This content isn't available right now')"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "plain_you_must_be_logged_in",
+            1,
+            "You must be logged in to continue viewing images.",
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "fb_temporarily_blocked_comet_with_code6",
+            0,
+            json.dumps([
+                [6, FB, {}],
+                [-1, {"error": "AbortExtraction", "message": "You've been temporarily blocked from viewing images.\nPlease try using a different account, using a VPN or waiting before you retry."}],
+            ]),
+            "rate_limited",
+            "rate_limited",
+            "rate_limited",
+        ),
+        (
+            "http_401_empty_reason_with_code6",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "HttpError", "message": "'401 ' for 'https://www.instagram.com/api/v1/users/web_profile_info/'"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "http_403_empty_reason_with_code6",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "HttpError", "message": "'403 ' for 'https://www.instagram.com/api/v1/users/web_profile_info/'"}],
+            ]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "http_429_empty_reason_with_code6",
+            0,
+            json.dumps([
+                [6, IG, {}],
+                [-1, {"error": "HttpError", "message": "'429 ' for 'https://www.instagram.com/api/v1/users/web_profile_info/'"}],
+            ]),
+            "rate_limited",
+            "rate_limited",
+            "rate_limited",
+        ),
+        (
+            "ig_posts_are_private_warning",
+            0,
+            "[instagram][warning] lilysclubuk's posts are private\n[]",
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+        (
+            "ig_checkpoint_required_with_code6",
+            0,
+            json.dumps([[6, IG, {"message": "checkpoint_required"}]]),
+            "restricted",
+            "restricted",
+            "access_blocked",
+        ),
+    ],
+)
+def test_stage3g1_gallery_dl_13220_restrictions_never_trigger_instaloader_fallback(
+    tmp_path, label, code, output, expected_class, expected_stop, expected_term,
+):
+    """Stage 3G.1 Task 1: All real gallery-dl 1.32.20 access restrictions and temporary blocks
+    must hard-stop without ever triggering Instaloader fallback, even alongside gallery-dl code 6."""
+    from app.social_discovery import _extract_diagnostic_text, classify_cli_outcome
+    from app.social_normalizers import gallery_error_codes, parse_gallery_json
+
+    records = parse_gallery_json(output)
+    diag = _extract_diagnostic_text("gallery-dl", output, records)
+    classified = classify_cli_outcome("gallery-dl", code, output, gallery_error_codes(records), diagnostic_text=diag)
+    assert classified == expected_class, (label, classified, diag)
+
+    for mode_idx, historical_mode in enumerate((True, False)):
+        calls: list[str] = []
+
+        def runner(cmd: list[str], _stage: Path) -> tuple[int, str]:
+            calls.append(cmd[0])
+            return code, output
+
+        job_dir = tmp_path / f"{abs(hash((label, mode_idx))) % 10**32:032x}"
+        job_dir.mkdir(exist_ok=True)
+        cp = CollectionCheckpoint(job_dir, {"job_id": job_dir.name, **WINDOW})
+        inv = OpenSourceSocialInventory(
+            "instagram",
+            IG,
+            permission_confirmed=True,
+            window_start_utc=WINDOW["window_start_utc"],
+            item_limit=10,
+            request_budget=4,
+            time_budget_seconds=30,
+            allow_fallbacks=True,
+            runner=runner,
+            historical_mode=historical_mode,
+            batch_size=5,
+            include_reels=historical_mode,
+        )
+        rep = cp.run_source("instagram", IG, inv, lambda *_: None, page_budget=3, transfer_budget=0, byte_limit=1024)
+        assert calls == ["gallery-dl"], (label, historical_mode, calls)
+        assert rep["stop_reason"] == expected_stop, (label, historical_mode, rep["stop_reason"])
+        assert rep["termination_reason"] == expected_term, (label, historical_mode, rep["termination_reason"])
+        assert rep["coverage"] == "incomplete" and rep["coverage_percentage"] is None
+
+
+def test_stage3g1_non_restriction_fallbacks_preserved_and_non_auth_redirects_or_500_not_misclassified(tmp_path):
+    """Stage 3G.1 Task 1 & 2:
+    1. Non-auth generic home redirect and HTTP 500 with '/403/' in URL are NOT misclassified as restricted.
+    2. Ambiguous non-restriction gallery-dl failures (user_lookup_not_found, plain code 6, extractor_broken)
+       still trigger single bounded Instaloader fallback.
+    3. Both Facebook and Instagram Historical Mode generated commands omit --date-after while preserving
+       frozen 365-day UTC publication-evidence filtering and honest incomplete coverage."""
+    from app.social_discovery import _extract_diagnostic_text, classify_cli_outcome
+    from app.social_normalizers import gallery_error_codes, parse_gallery_json
+
+    # Non-auth generic home redirect must NOT be misclassified as restricted.
+    generic_home = json.dumps([
+        [-1, {"error": "AbortExtraction", "message": "HTTP redirect to home page (https://example.org/)"}],
+    ])
+    recs_gh = parse_gallery_json(generic_home)
+    assert classify_cli_outcome(
+        "gallery-dl", 0, generic_home, gallery_error_codes(recs_gh),
+        diagnostic_text=_extract_diagnostic_text("gallery-dl", generic_home, recs_gh),
+    ) == "source_stopped"
+
+    # HTTP 500 whose URL path happens to contain '/403/' must NOT false-positive as 403 restricted.
+    http_500 = json.dumps([
+        [-1, {"error": "HttpError", "message": "'500 Internal Server Error' for 'https://www.instagram.com/p/403/'"}],
+    ])
+    recs_500 = parse_gallery_json(http_500)
+    assert classify_cli_outcome(
+        "gallery-dl", 0, http_500, gallery_error_codes(recs_500),
+        diagnostic_text=_extract_diagnostic_text("gallery-dl", http_500, recs_500),
+    ) == "source_stopped"
+
+    # Ambiguous non-restriction failures STILL trigger Instaloader fallback in Historical Mode.
+    for idx, (gdl_code, gdl_out, expected_gdl_outcome) in enumerate((
+        (0, json.dumps([[-1, {"error": "NotFoundError", "message": "Requested user could not be found"}]]), "user_lookup_not_found"),
+        (0, json.dumps([[6, IG, {"message": "Instagram feed endpoint gated"}]]), "gallery_dl_error_6"),
+        (0, json.dumps([[-1, {"error": "UnboundLocalError", "message": "cannot access local variable"}]]), "extractor_broken"),
+    )):
+        tools_seen: list[str] = []
+        gdl_cmds: list[list[str]] = []
+
+        def ok_fallback_runner(cmd: list[str], stage: Path, c=gdl_code, o=gdl_out, i=idx) -> tuple[int, str]:
+            tools_seen.append(cmd[0])
+            if cmd[0] == "gallery-dl":
+                gdl_cmds.append(cmd)
+                return c, o
+            sidecar = {
+                "instaloader": {"version": "4.16", "node_type": "Post"},
+                "node": {
+                    "id": f"ig-ambig-{i}",
+                    "shortcode": f"IgAmbig{i}",
+                    "is_video": False,
+                    "display_url": f"{APPROVED_CDN}/ig-ambig-{i}.jpg",
+                    "taken_at_timestamp": int(datetime(2026, 11, 10, 12, 0, tzinfo=UTC).timestamp()),
+                },
+            }
+            (stage / f"2026-11-10_12-00-0{i}_UTC.json").write_text(json.dumps(sidecar), encoding="utf-8")
+            return 0, ""
+
+        jd = tmp_path / f"{(idx + 10):032x}"
+        jd.mkdir()
+        cp = CollectionCheckpoint(jd, {"job_id": jd.name, **WINDOW})
+        inv = OpenSourceSocialInventory(
+            "instagram", IG, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+            item_limit=10, request_budget=4, time_budget_seconds=30, allow_fallbacks=True,
+            runner=ok_fallback_runner, historical_mode=True, batch_size=5, include_reels=False,
+        )
+        rep = cp.run_source("instagram", IG, inv, lambda *_: None, page_budget=2, transfer_budget=0, byte_limit=1024)
+        assert tools_seen == ["gallery-dl", "instaloader"]
+        assert inv.tools_executed[0]["outcome"] == expected_gdl_outcome
+        assert len(gdl_cmds) == 1 and "--date-after" not in gdl_cmds[0]
+        assert len(rep["assets"]) == 1 and rep["assets"][0]["date_eligibility"] == "in_window"
+
+    # Explicit Task 2 verification: Facebook Historical Mode commands NEVER pass --date-after
+    # (even when photos_albums and &setextract continuation execute), and cutoff_reached keeps coverage incomplete.
+    fb_cmds: list[list[str]] = []
+
+    def fb_cmd_check(cmd: list[str], _stage: Path) -> tuple[int, str]:
+        fb_cmds.append(cmd)
+        assert "--date-after" not in cmd
+        return 0, json.dumps([
+            [3, f"{APPROVED_CDN}/fb-cut-1.jpg", {"category": "facebook", "subcategory": "photos", "id": "95000001", "set_id": "pb.c", "date": "2024-01-01 10:00:00", "extension": "jpg", "next_photo_id": "95000002"}],
+            [3, f"{APPROVED_CDN}/fb-cut-2.jpg", {"category": "facebook", "subcategory": "photos", "id": "95000002", "set_id": "pb.c", "date": "2024-01-02 10:00:00", "extension": "jpg", "next_photo_id": "95000003"}],
+            [3, f"{APPROVED_CDN}/fb-cut-3.jpg", {"category": "facebook", "subcategory": "photos", "id": "95000003", "set_id": "pb.c", "date": "2024-01-03 10:00:00", "extension": "jpg", "next_photo_id": "95000004"}],
+        ])
+
+    jd_fb = tmp_path / ("f" * 30 + "99")
+    jd_fb.mkdir()
+    cp_fb = CollectionCheckpoint(jd_fb, {"job_id": jd_fb.name, **WINDOW})
+    inv_fb = OpenSourceSocialInventory(
+        "facebook", FB, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+        item_limit=10, request_budget=4, time_budget_seconds=30, runner=fb_cmd_check,
+        historical_mode=True, batch_size=5, cutoff_consecutive_older=3, include_albums=False,
+    )
+    rep_fb = cp_fb.run_source("facebook", FB, inv_fb, lambda *_: None, page_budget=3, transfer_budget=0, byte_limit=1024)
+    assert len(fb_cmds) == 1 and "--date-after" not in fb_cmds[0]
+    assert rep_fb["stop_reason"] == "cutoff_reached"
+    assert rep_fb["termination_reason"] == "cutoff_reached_with_evidence"
+    assert rep_fb["coverage"] == "incomplete" and rep_fb["coverage_percentage"] is None
+    assert all(a["date_eligibility"] == "out_of_window" for a in rep_fb["assets"])
+
+
+def test_stage3h_website_wordpress_thumbnail_grouping_cross_page_dedupe_provenance_and_entry_budget(tmp_path):
+    """Stage 3H Task 1: Sanitized real Website pilot fixture replay proving:
+    1. WordPress -WxH responsive thumbnails collapse into canonical master with alternate_urls preserved.
+    2. Real full-size (`photo.jpg`) vs `-scaled` (`photo-scaled.jpg`) remain distinct when both appear.
+    3. Cross-page duplicates do NOT create duplicate asset rows or consume per-page entry_limit,
+       while merging all source_pages and alternate_urls without losing attribution.
+    4. WordPress /wp-content/uploads/YYYY/MM/ directory paths NEVER fabricate publication dates."""
+    site = "https://www.lilys-fixture.test"
+    # Mirror real Lily's Club Run A patterns: -WxH pairs, -scaled + -WxH pairs, multiple -WxH only,
+    # explicit full-size + -scaled coexistence, shared logo across pages, and /services vs /services2!
+    pages = {
+        f"{site}/": (
+            f"<html><body>"
+            f'<a href="/services">Services</a><a href="/services2">Services 2</a><a href="/about-us">About</a>'
+            f'<img src="{site}/wp-content/uploads/2025/09/Logo-1024x278.png" '
+            f'srcset="{site}/wp-content/uploads/2025/09/Logo-1024x278.png 1024w, {site}/wp-content/uploads/2025/09/Logo.png 2000w">'
+            f'<video src="{site}/wp-content/uploads/2025/10/Bath-Video.mp4"></video>'
+            f"</body></html>"
+        ),
+        f"{site}/services": (
+            f"<html><body>"
+            f'<img src="{site}/wp-content/uploads/2025/09/Logo.png">'
+            f'<img src="{site}/wp-content/uploads/2025/09/Blueberry-Facial-768x1024.jpg" '
+            f'srcset="{site}/wp-content/uploads/2025/09/Blueberry-Facial-768x1024.jpg 768w, {site}/wp-content/uploads/2025/09/Blueberry-Facial-scaled.jpg 1920w">'
+            f'<img src="{site}/wp-content/uploads/2025/09/Teeth-Brushing-1024x576.jpg" '
+            f'srcset="{site}/wp-content/uploads/2025/09/Teeth-Brushing-1024x576.jpg 1024w, {site}/wp-content/uploads/2025/09/Teeth-Brushing.jpg 1600w">'
+            f'<img src="{site}/wp-content/uploads/2025/09/Both-Exist.jpg">'
+            f'<img src="{site}/wp-content/uploads/2025/09/Both-Exist-scaled.jpg">'
+            f'<img src="{site}/wp-content/uploads/2025/09/Both-Exist-768x1024.jpg">'
+            f"</body></html>"
+        ),
+        f"{site}/services2": (
+            f"<html><body>"
+            # Repeats Logo, Blueberry-Facial, Teeth-Brushing + adds 2 genuinely new photos; with entry_limit=4,
+            # cross-page duplicates & -WxH thumbs MUST NOT exhaust entry_limit or trigger attachment_cap!
+            f'<img src="{site}/wp-content/uploads/2025/09/Logo-1024x278.png">'
+            f'<img src="{site}/wp-content/uploads/2025/09/Blueberry-Facial-768x1024.jpg">'
+            f'<img src="{site}/wp-content/uploads/2025/09/Teeth-Brushing-1024x576.jpg">'
+            f'<img src="{site}/wp-content/uploads/2025/10/Fresh-Groom-1-768x1024.jpeg" '
+            f'srcset="{site}/wp-content/uploads/2025/10/Fresh-Groom-1-768x1024.jpeg 768w, {site}/wp-content/uploads/2025/10/Fresh-Groom-1.jpeg 1500w">'
+            f'<img src="{site}/wp-content/uploads/2025/10/Fresh-Groom-2-768x1024.jpeg" '
+            f'srcset="{site}/wp-content/uploads/2025/10/Fresh-Groom-2-768x1024.jpeg 768w, {site}/wp-content/uploads/2025/10/Fresh-Groom-2.jpeg 1500w">'
+            f"</body></html>"
+        ),
+        f"{site}/about-us": (
+            f"<html><body>"
+            # Multiple -WxH only (no unscaled original): selects largest area 2048x1536, keeps 1024x768 as alternate!
+            f'<img src="{site}/wp-content/uploads/2024/09/Pup-1024x768.jpeg" '
+            f'srcset="{site}/wp-content/uploads/2024/09/Pup-1024x768.jpeg 1024w, {site}/wp-content/uploads/2024/09/Pup-2048x1536.jpeg 2048w">'
+            f"</body></html>"
+        ),
+    }
+    sitemap = (
+        "<urlset>"
+        f"<url><loc>{site}/services</loc></url>"
+        f"<url><loc>{site}/services2</loc></url>"
+        f"<url><loc>{site}/about-us</loc></url>"
+        "</urlset>"
+    )
+
+    def fake_fetch(url: str) -> tuple[str, bytes]:
+        if url.endswith("/sitemap.xml"):
+            return url, sitemap.encode("utf-8")
+        return url, pages[url].encode("utf-8")
+
+    # 1. Compare raw non-deduped count (Pilot Mode) vs Stage 3H Historical Mode deduped count
+    jd_hist = tmp_path / ("a1" * 16)
+    jd_hist.mkdir()
+    cp = CollectionCheckpoint(jd_hist, {"job_id": jd_hist.name, **WINDOW})
+    inv = WebsiteInventory(
+        f"{site}/",
+        sitemaps=[],
+        robots_sitemaps=[f"{site}/sitemap.xml"],
+        fetch=fake_fetch,
+        permitted=lambda u: u.startswith(site),
+        media_permitted=lambda u: u.startswith(site),
+        document_limit=65536,
+        entry_limit=4,  # Tight limit: would trigger attachment_cap without Stage 3H dedupe!
+        historical_mode=True,
+    )
+    rep = cp.run_source("website", f"{site}/", inv, lambda *_: None, page_budget=10, transfer_budget=0, byte_limit=1024)
+    assert "attachment_cap" not in rep["issues"], rep["issues"]
+    by_url = {a["url"]: a for a in rep["assets"]}
+
+    # Expected 9 canonical unique assets (down from 19 raw URL occurrences across pages!):
+    # Logo.png, Bath-Video.mp4, Blueberry-Facial-scaled.jpg, Teeth-Brushing.jpg,
+    # Both-Exist.jpg, Both-Exist-scaled.jpg (both preserved!), Fresh-Groom-1.jpeg, Fresh-Groom-2.jpeg, Pup-2048x1536.jpeg
+    expected_urls = {
+        f"{site}/wp-content/uploads/2025/09/Logo.png",
+        f"{site}/wp-content/uploads/2025/10/Bath-Video.mp4",
+        f"{site}/wp-content/uploads/2025/09/Blueberry-Facial-scaled.jpg",
+        f"{site}/wp-content/uploads/2025/09/Teeth-Brushing.jpg",
+        f"{site}/wp-content/uploads/2025/09/Both-Exist.jpg",
+        f"{site}/wp-content/uploads/2025/09/Both-Exist-scaled.jpg",
+        f"{site}/wp-content/uploads/2025/10/Fresh-Groom-1.jpeg",
+        f"{site}/wp-content/uploads/2025/10/Fresh-Groom-2.jpeg",
+        f"{site}/wp-content/uploads/2024/09/Pup-2048x1536.jpeg",
+    }
+    assert set(by_url) == expected_urls
+    assert len(rep["assets"]) == len(expected_urls)
+
+    # Alternate thumbnail URLs and cross-page source_pages provenance preserved!
+    logo = by_url[f"{site}/wp-content/uploads/2025/09/Logo.png"]
+    assert logo["alternate_urls"] == [f"{site}/wp-content/uploads/2025/09/Logo-1024x278.png"]
+    assert set(logo["source_pages"]) == {f"{site}/", f"{site}/services", f"{site}/services2"}
+
+    bb = by_url[f"{site}/wp-content/uploads/2025/09/Blueberry-Facial-scaled.jpg"]
+    assert bb["alternate_urls"] == [f"{site}/wp-content/uploads/2025/09/Blueberry-Facial-768x1024.jpg"]
+    assert set(bb["source_pages"]) == {f"{site}/services", f"{site}/services2"}
+
+    pup = by_url[f"{site}/wp-content/uploads/2024/09/Pup-2048x1536.jpeg"]
+    assert pup["alternate_urls"] == [f"{site}/wp-content/uploads/2024/09/Pup-1024x768.jpeg"]
+
+    # WordPress upload directory names (/2025/09/, /2025/10/, /2024/09/) NEVER fabricate publication dates!
+    assert all(a["post_date"] is None and a["date_status"] == "unknown_date" and a["date_eligibility"] == "unknown_date" for a in rep["assets"])
+    assert len(rep["unknown_date_review"]) == len(expected_urls)
+    assert rep["coverage_percentage"] is None
+
+
+def test_stage3h_facebook_four_batch_time_guard_cursor_validation_and_checkpoint_resume(tmp_path):
+    """Stage 3H Task 2: Reproduces actual Stage 3G Run B (4 completed batches -> pre-batch time guard
+    prevents doomed 5th subprocess -> checkpoint resume continues at batch 5 without repeating 1-4,
+    preserves frozen UTC window, rejects tampered cursors, and reaches album/cutoff cleanly)."""
+    set_main = "pb.61564648418385.-2207520000"
+    now = [0.0]
+    calls_run1: list[str] = []
+
+    def batch_payload(start_idx: int, count: int, dates: list[str], next_pid: str) -> str:
+        rows = []
+        for k in range(count):
+            pid = f"12221000000{start_idx + k:02d}"
+            nxt = f"12221000000{start_idx + k + 1:02d}" if k + 1 < count else next_pid
+            rows.append([3, f"{APPROVED_CDN}/fb-{pid}.jpg", {
+                "category": "facebook", "subcategory": "set" if start_idx > 1 else "photos",
+                "id": pid, "set_id": set_main, "date": dates[k], "extension": "jpg", "next_photo_id": nxt,
+            }])
+        return json.dumps(rows)
+
+    def runner_run1(cmd: list[str], _stage: Path) -> tuple[int, str]:
+        assert "--date-after" not in cmd
+        calls_run1.append(cmd[-1])
+        now[0] += 25.0  # Simulate actual Run B ~25s per 10-photo batch!
+        b = len(calls_run1)
+        if b == 1:
+            return 0, batch_payload(1, 2, ["2026-10-21 08:35:34", "2026-09-10 12:00:00"], "1222100000003")
+        if b == 2:
+            return 0, batch_payload(3, 2, ["2026-07-27 16:52:07", "2026-07-20 12:00:00"], "1222100000005")
+        if b == 3:
+            return 0, batch_payload(5, 2, ["2026-07-14 15:27:02", "2026-07-01 12:00:00"], "1222100000007")
+        if b == 4:
+            return 0, batch_payload(7, 2, ["2026-06-16 15:37:44", "2026-06-08 17:58:42"], "1222100000009")
+        raise AssertionError("Pre-batch remaining-time guard should have stopped BEFORE spawning batch 5!")
+
+    jd = tmp_path / ("b2" * 16)
+    jd.mkdir()
+    frozen_job = {"job_id": jd.name, **WINDOW}
+    cp1 = CollectionCheckpoint(jd, frozen_job)
+    inv1 = OpenSourceSocialInventory(
+        "facebook", FB, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+        item_limit=20, request_budget=8, time_budget_seconds=120, runner=runner_run1,
+        clock=lambda: now[0], sleep_request=1.5, historical_mode=True, batch_size=2,
+        cutoff_consecutive_older=2, include_albums=True, album_limit=2,
+    )
+    rep1 = cp1.run_source("facebook", FB, inv1, lambda *_: None, page_budget=6, transfer_budget=0, byte_limit=1024)
+    # 4 batches * 25s = 100s elapsed -> remaining 20s < 25s * 0.85 (21.25s) -> pre-batch guard stops BEFORE batch 5!
+    assert len(calls_run1) == 4
+    assert rep1["stop_reason"] == "time_budget"
+    assert rep1["termination_reason"] == "budget_reached"
+    assert rep1["listing_exhausted"] is False
+    assert rep1["coverage"] == "incomplete" and rep1["coverage_percentage"] is None
+    assert len(rep1["assets"]) == 8
+    assert rep1["cursor"] is not None and "fbid=1222100000009" in rep1["cursor"]
+
+    # Tampered cursor URL pointing to an untrusted host or login page MUST fail validation!
+    tampered = json.loads(rep1["cursor"])
+    tampered["next_url"] = "https://www.facebook.com/login.php"
+    with pytest.raises(SourceStop, match="invalid_continuation"):
+        OpenSourceSocialInventory.validate_historical_cursor("facebook", json.dumps(tampered))
+    tampered["next_url"] = "https://evil.example.test/photo"
+    with pytest.raises(SourceStop, match="invalid_continuation"):
+        OpenSourceSocialInventory.validate_historical_cursor("facebook", json.dumps(tampered))
+
+    # Mismatched frozen window on resume MUST be rejected by CollectionCheckpoint!
+    bad_window = frozen_window(datetime(2026, 12, 1, 0, 0, tzinfo=UTC))
+    with pytest.raises(ValueError, match="frozen window|original job window"):
+        CollectionCheckpoint(jd, {"job_id": jd.name, **bad_window})
+
+    # Run 2: Resume from persisted checkpoint with original frozen window -> picks up at batch 5 (fbid=...09),
+    # NEVER repeats batches 1-4, avoids duplicates, and traverses /photos_albums cleanly!
+    calls_run2: list[str] = []
+    now2 = [0.0]
+
+    def runner_run2(cmd: list[str], _stage: Path) -> tuple[int, str]:
+        assert "--date-after" not in cmd
+        target = cmd[-1]
+        calls_run2.append(target)
+        now2[0] += 10.0
+        if "fbid=1222100000009" in target:
+            # Batch 5: 2 consecutive pre-cutoff photos -> triggers timeline cutoff!
+            return 0, batch_payload(9, 2, ["2025-11-10 10:00:00", "2025-10-01 10:00:00"], "1222100000011")
+        if target.endswith("/photos_albums"):
+            return 0, json.dumps([[6, "https://www.facebook.com/media/set/?set=a.album99", {"set_id": "a.album99"}]])
+        if "set=a.album99" in target:
+            # Includes duplicate 1222100000001 (from batch 1!) + 1 genuinely new album photo
+            return 0, json.dumps([
+                [3, f"{APPROVED_CDN}/dup1.jpg", {"category": "facebook", "subcategory": "set", "id": "1222100000001", "set_id": "a.album99", "date": "2026-10-21 08:35:34", "extension": "jpg", "next_photo_id": "1222100000099"}],
+                [3, f"{APPROVED_CDN}/alb99.jpg", {"category": "facebook", "subcategory": "set", "id": "1222100000099", "set_id": "a.album99", "date": "2026-04-01 12:00:00", "extension": "jpg", "next_photo_id": ""}],
+            ])
+        raise AssertionError(f"Unexpected resumed Facebook target: {target}")
+
+    cp2 = CollectionCheckpoint(jd, frozen_job)
+    inv2 = OpenSourceSocialInventory(
+        "facebook", FB, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+        item_limit=20, request_budget=8, time_budget_seconds=120, runner=runner_run2,
+        clock=lambda: now2[0], sleep_request=1.5, historical_mode=True, batch_size=2,
+        cutoff_consecutive_older=2, include_albums=True, album_limit=2,
+    )
+    rep2 = cp2.run_source("facebook", FB, inv2, lambda *_: None, page_budget=5, transfer_budget=0, byte_limit=1024)
+    assert calls_run2[0].startswith("https://www.facebook.com/photo/?fbid=1222100000009")
+    assert not any(c == FB for c in calls_run2)  # Batch 1 NEVER repeated!
+    assert any(c.endswith("/photos_albums") for c in calls_run2)
+    assert rep2["stop_reason"] == "cutoff_reached"
+    assert rep2["termination_reason"] == "cutoff_reached_with_evidence"
+    assert rep2["listing_exhausted"] is False and rep2["coverage_percentage"] is None
+    assert len(rep2["assets"]) == 11  # 8 from Run 1 + 2 cutoff photos + 1 new album photo (duplicate skipped!)
+    assert len({a["native_id"] for a in rep2["assets"]}) == 11
+
+
+def test_stage3h_instagram_quiet_removed_explicit_restriction_short_circuit_and_ambiguous_reels_allowed(tmp_path):
+    """Stage 3H Task 3: Based on actual Stage 3G Run C Instagram diagnostic evidence:
+    1. Historical Instaloader command omits --quiet to surface real HTTP 401/403/429/login errors.
+    2. Explicit Instaloader restriction/rate-limit on /posts/ (429, 401, 403, Redirected to login page,
+       PrivateProfileNotFollowedException) HARD-STOPS immediately and NEVER pokes /reels/.
+    3. Ambiguous posts-only non-restriction failure (Run C Call 1 NotFoundError + opaque Call 2 failure)
+       still permits independent /reels/ attempt within shared budget, and stops immediately when /reels/
+       hits explicit 429, keeping coverage incomplete/unknown."""
+    gdl_not_found = json.dumps([[-1, {"error": "NotFoundError", "message": "Requested user could not be found"}]])
+
+    # 1. Verify Historical Instaloader command omits --quiet while retaining all no-download & abort-on flags!
+    hist_cmd = build_instaloader_historical_cmd(
+        url_kind="profile", target_hint="lilysclubuk", stage=tmp_path, cutoff=date(2025, 11, 25),
+        include_reels=False, reels_only=False, use_resume=True,
+    )
+    _assert_no_bypass_flags(hist_cmd)
+    assert "--quiet" not in hist_cmd
+    assert "--no-pictures" in hist_cmd and "--no-videos" in hist_cmd and "--abort-on=429,403,401" in hist_cmd
+
+    # 2. Explicit Instaloader restriction/rate-limit on /posts/ MUST hard-stop BEFORE /reels/!
+    for idx, (il_code, il_out, expected_stop, expected_term) in enumerate((
+        (4, 'Download aborted: Query to https://www.instagram.com/api/v1/users/web_profile_info/?username=lilysclubuk responded with "429 Too Many Requests".', "rate_limited", "rate_limited"),
+        (4, 'Download aborted: Query to https://www.instagram.com/api/v1/users/web_profile_info/ responded with "401 Unauthorized".', "restricted", "access_blocked"),
+        (4, 'Download aborted: Query to https://www.instagram.com/api/v1/users/web_profile_info/ responded with "403 Forbidden".', "restricted", "access_blocked"),
+        (1, "HTTP redirect from https://www.instagram.com/lilysclubuk/ to https://www.instagram.com/accounts/login/?next=%2Flilysclubuk%2F\nRedirected to login page. Use --login or --load-cookies.", "restricted", "access_blocked"),
+        (1, "PrivateProfileNotFollowedException: Profile lilysclubuk: private but not followed.", "restricted", "access_blocked"),
+        (1, "TooManyRequestsException: Too many queries in the last time. Need to wait 10 minutes.", "rate_limited", "rate_limited"),
+    )):
+        calls: list[tuple[str, str]] = []
+
+        def restricted_posts_runner(cmd: list[str], _stage: Path, c=il_code, o=il_out) -> tuple[int, str]:
+            calls.append((cmd[0], cmd[-1]))
+            if cmd[0] == "gallery-dl":
+                return 0, gdl_not_found
+            assert "--quiet" not in cmd
+            return c, o
+
+        jd = tmp_path / f"c{idx:031x}"
+        jd.mkdir()
+        cp = CollectionCheckpoint(jd, {"job_id": jd.name, **WINDOW})
+        inv = OpenSourceSocialInventory(
+            "instagram", IG, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+            item_limit=20, request_budget=4, time_budget_seconds=60, allow_fallbacks=True,
+            runner=restricted_posts_runner, historical_mode=True, batch_size=12, include_reels=True,
+        )
+        rep = cp.run_source("instagram", IG, inv, lambda *_: None, page_budget=3, transfer_budget=0, byte_limit=1024)
+        # ONLY /posts/ gallery-dl + /posts/ instaloader ran; /reels/ NEVER probed!
+        assert [t for t, _ in calls] == ["gallery-dl", "instaloader"], (idx, calls)
+        assert not any("/reels/" in target for _, target in calls)
+        assert rep["stop_reason"] == expected_stop
+        assert rep["termination_reason"] == expected_term
+        assert rep["coverage"] == "incomplete" and rep["coverage_percentage"] is None
+
+    # 3. Ambiguous non-restriction /posts/ failure (no 401/403/429/login) allows independent /reels/ attempt,
+    #    and succeeds if /reels/ returns a valid Reel (or stops cleanly if /reels/ hits 429)!
+    reels_calls: list[tuple[str, str]] = []
+
+    def ambiguous_posts_then_reels_ok(cmd: list[str], stage: Path) -> tuple[int, str]:
+        reels_calls.append((cmd[0], cmd[-1]))
+        if cmd[0] == "gallery-dl":
+            return 0, gdl_not_found
+        if "--reels" not in cmd:
+            return 1, "lilysclubuk: Fetching Post metadata failed."  # Ambiguous non-restriction error
+        sidecar = {
+            "instaloader": {"version": "4.16", "node_type": "Post"},
+            "node": {
+                "id": "ig-reel-3h", "shortcode": "Reel3H", "product_type": "clips", "is_video": True,
+                "video_url": f"{APPROVED_CDN}/reel-3h.mp4", "display_url": f"{APPROVED_CDN}/reel-3h.jpg",
+                "taken_at_timestamp": int(datetime(2026, 11, 15, 12, 0, tzinfo=UTC).timestamp()),
+            },
+        }
+        (stage / "2026-11-15_12-00-00_UTC.json").write_text(json.dumps(sidecar), encoding="utf-8")
+        return 0, ""
+
+    jd_amb = tmp_path / ("d" * 31 + "1")
+    jd_amb.mkdir()
+    cp_amb = CollectionCheckpoint(jd_amb, {"job_id": jd_amb.name, **WINDOW})
+    inv_amb = OpenSourceSocialInventory(
+        "instagram", IG, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+        item_limit=20, request_budget=4, time_budget_seconds=60, allow_fallbacks=True,
+        runner=ambiguous_posts_then_reels_ok, historical_mode=True, batch_size=12, include_reels=True,
+    )
+    rep_amb = cp_amb.run_source("instagram", IG, inv_amb, lambda *_: None, page_budget=3, transfer_budget=0, byte_limit=1024)
+    assert any("/reels/" in target for _, target in reels_calls)
+    assert len(rep_amb["assets"]) == 2  # Reel video + thumbnail
+    assert any(a["native_id"] == "ig-reel-3h" and a["date_eligibility"] == "in_window" for a in rep_amb["assets"])
+    assert rep_amb["coverage_percentage"] is None
+
+    # 4. Exact Run C replay: ambiguous /posts/ -> /reels/ hits 429 -> stops as rate_limited, 0 items, unknown/incomplete coverage!
+    run_c_calls: list[str] = []
+
+    def exact_run_c_replay(cmd: list[str], _stage: Path) -> tuple[int, str]:
+        run_c_calls.append(cmd[0])
+        if cmd[0] == "gallery-dl":
+            return 0, gdl_not_found
+        if "--reels" not in cmd:
+            return 1, "lilysclubuk: Fetching Post metadata failed."
+        return 4, 'Download aborted: Query to https://www.instagram.com/api/v1/users/web_profile_info/ responded with "429 Too Many Requests".'
+
+    jd_rc = tmp_path / ("d" * 31 + "2")
+    jd_rc.mkdir()
+    cp_rc = CollectionCheckpoint(jd_rc, {"job_id": jd_rc.name, **WINDOW})
+    inv_rc = OpenSourceSocialInventory(
+        "instagram", IG, permission_confirmed=True, window_start_utc=WINDOW["window_start_utc"],
+        item_limit=20, request_budget=4, time_budget_seconds=60, allow_fallbacks=True,
+        runner=exact_run_c_replay, historical_mode=True, batch_size=12, include_reels=True,
+    )
+    rep_rc = cp_rc.run_source("instagram", IG, inv_rc, lambda *_: None, page_budget=3, transfer_budget=0, byte_limit=1024)
+    assert run_c_calls == ["gallery-dl", "instaloader", "gallery-dl", "instaloader"]
+    assert rep_rc["stop_reason"] == "rate_limited" and rep_rc["termination_reason"] == "rate_limited"
+    assert rep_rc["assets"] == [] and rep_rc["coverage"] == "incomplete" and rep_rc["coverage_percentage"] is None

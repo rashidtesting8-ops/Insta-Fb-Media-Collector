@@ -27,6 +27,8 @@ class Attachment:
     publication_evidence: dict | None = None
     identity_status: str = "derived"
     raw_date_evidence: dict | None = None
+    alternate_urls: tuple[str, ...] = ()
+    source_pages: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,7 @@ class InventoryPage:
     next_cursor: str | None = None
     issues: tuple[str, ...] = ()
     stop_reason: str | None = None
+    provenance_updates: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
 
 
 class Inventory(Protocol):
@@ -357,6 +360,28 @@ class CollectionCheckpoint:
                         db.execute("""INSERT OR IGNORE INTO media (key,source,item,native_id,status)
                             VALUES (?,?,?,?,?)""", (_key(source, item.id, missing), source, item.id,
                                                       missing, "missing_attachment"))
+                for native_id, page_url, alt_urls in page.provenance_updates:
+                    existing_rows = db.execute(
+                        "SELECT key, metadata FROM media WHERE source=? AND native_id=?",
+                        (source, native_id),
+                    ).fetchall()
+                    for existing_row in existing_rows:
+                        meta = json.loads(existing_row["metadata"] or "{}")
+                        pages_list = list(meta.get("source_pages") or ())
+                        if page_url and page_url not in pages_list:
+                            pages_list.append(page_url)
+                        alts_list = list(meta.get("alternate_urls") or ())
+                        primary_url = meta.get("url")
+                        for alt in alt_urls:
+                            if alt and alt != primary_url and alt not in alts_list:
+                                alts_list.append(alt)
+                        meta["source_pages"] = sorted(dict.fromkeys(pages_list))
+                        if alts_list:
+                            meta["alternate_urls"] = sorted(dict.fromkeys(alts_list))
+                        db.execute(
+                            "UPDATE media SET metadata=? WHERE key=?",
+                            (json.dumps(meta), existing_row["key"]),
+                        )
                 if global_budget is not None:
                     global_budget.record_page(newly_added_media)
                 issues = list(dict.fromkeys(json.loads(state["issues"]) + list(page.issues)))
@@ -611,6 +636,10 @@ class CollectionCheckpoint:
             metadata = json.loads(row.pop("metadata") or "{}")
             if metadata.get("raw_date_evidence") is None:
                 metadata.pop("raw_date_evidence", None)
+            if not metadata.get("alternate_urls"):
+                metadata.pop("alternate_urls", None)
+            if not metadata.get("source_pages"):
+                metadata.pop("source_pages", None)
             evidence = metadata.get("publication_evidence")
             asset = {**row, "identity_status": "unknown", **metadata, "asset_id": row["key"],
                      "local_path": "collection/" + row["key"] + ".media" if row["status"] == "verified" else None,
