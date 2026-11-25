@@ -478,8 +478,13 @@ def execute_started_curation(
 
 @app.post("/named/{action}")
 async def named_action(action: str, request: Request):
-    from app.named_auth import dispatch, verify_admin_action
+    from app.named_auth import dispatch, is_local_bootstrap_peer, verify_admin_action
     from starlette.concurrency import run_in_threadpool
+
+    if action in ("bootstrap", "bootstrap-status"):
+        client_host = request.client.host if request.client else ""
+        if not is_local_bootstrap_peer(client_host, request.headers):
+            raise HTTPException(403, "Browser bootstrap requires local loopback access")
 
     enabled = m4_approval_enabled()
     if action == "collection-resume":
