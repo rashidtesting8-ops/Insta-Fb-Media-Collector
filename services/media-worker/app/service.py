@@ -1144,6 +1144,8 @@ def post_delivery_result(job_id: str, payload: dict[str, Any]) -> dict[str, Any]
         drive_folder_link=payload.get("drive_folder_link"),
         public_sharing=False,
         visibility="private",
+        report_uploads=list(payload.get("report_uploads") or []) if isinstance(payload.get("report_uploads"), list) else None,
+        subfolders=payload.get("subfolders") if isinstance(payload.get("subfolders"), dict) else None,
     )
 
 

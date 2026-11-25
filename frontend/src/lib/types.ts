@@ -155,10 +155,13 @@ export interface RightsReview {
 
 export interface Delivery {
   status?: string;
+  reports_status?: string;
   folder_name?: string;
   drive_folder_id?: string | null;
   drive_folder_link?: string | null;
-  uploaded?: Array<{ asset_id: string; filename?: string; status: string; drive_file_id?: string; drive_link?: string; error?: string }>;
+  subfolders?: Record<string, string>;
+  uploaded?: Array<{ asset_id: string; filename?: string; target_subfolder?: string; status: string; drive_file_id?: string; drive_link?: string; error?: string }>;
+  reports_uploaded?: Array<{ report_id?: string; filename?: string; target_subfolder?: string; status: string; drive_file_id?: string; drive_link?: string; error?: string }>;
   pending_rights_ids?: string[];
   errors?: string[];
 }

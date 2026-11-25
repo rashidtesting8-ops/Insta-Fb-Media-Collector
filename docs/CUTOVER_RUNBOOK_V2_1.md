@@ -91,7 +91,7 @@ Open `http://127.0.0.1:5679` and import (or update) from `/opt/media-workflows` 
    - Confirm `curation.json` completes with real Groq Vision scores, hero ranks, and crop guidance.
    - Verify commercial rights per selected asset (`evidence_ref` + `reason` -> **Verify**).
    - Check commercial release confirmation and click **Deliver Approved Media to Google Drive**.
-   - Open the returned private Google Drive folder link and confirm original binaries uploaded with private visibility.
+   - Open the returned private Google Drive folder link and confirm original binaries uploaded into `Best Images/` and `Best Videos/`, and sanitized reports (`ai-curation-report.json`, `media-inventory-summary.json`) uploaded into `Reports/` with private visibility.
 
 ---
 

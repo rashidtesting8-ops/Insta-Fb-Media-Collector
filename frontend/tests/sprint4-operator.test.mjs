@@ -207,7 +207,15 @@ test("JobDetailClient renders video player, filters raw frames, shows counts+cov
       });
     }
     if (u === `/api/jobs/${ID}/delivery` && (!opts || opts.method !== "POST")) {
-      return jsonResponse({ status: "not_started" });
+      return jsonResponse({
+        status: "completed",
+        reports_status: "completed",
+        drive_folder_id: "fld_12345678",
+        drive_folder_link: "https://drive.google.com/drive/folders/fld_12345678",
+        subfolders: { "Best Images": "sub_img_1", Reports: "sub_rep_1" },
+        uploaded: [{ asset_id: "web_001", filename: "web_001.jpg", target_subfolder: "Best Images", status: "uploaded", drive_file_id: "drv_1" }],
+        reports_uploaded: [{ report_id: "ai_curation_report", filename: "ai-curation-report.json", target_subfolder: "Reports", status: "uploaded", drive_file_id: "drv_rep_1" }],
+      });
     }
     if (u === `/api/jobs/${ID}/delivery` && opts?.method === "POST") {
       return jsonResponse({
@@ -264,6 +272,8 @@ test("JobDetailClient renders video player, filters raw frames, shows counts+cov
   assert.ok(container.textContent.includes("Hero #1"));
   assert.ok(container.textContent.includes('"coverage"'));
   assert.ok(container.textContent.includes('"counts"'));
+  assert.ok(container.textContent.includes("Best Images/"));
+  assert.ok(container.textContent.includes("Reports/ai-curation-report.json"));
 
   // Per-asset rights verification
   await act(async () => {

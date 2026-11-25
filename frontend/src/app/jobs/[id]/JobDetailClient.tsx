@@ -610,24 +610,67 @@ export default function JobDetailClient({ id }: { id: string }) {
                 Open Google Drive folder →
               </a>
             )}
-            {delivery.uploaded && delivery.uploaded.length > 0 && (
-              <ul className="mt-2 space-y-1">
-                {delivery.uploaded.map((u) => (
-                  <li key={u.asset_id} className="font-mono text-xs">
-                    {u.filename || u.asset_id}: <strong>{u.status}</strong>{" "}
-                    {u.drive_link ? (
-                      <a href={u.drive_link} target="_blank" rel="noreferrer" className="text-blue-600 underline">
-                        ({u.drive_file_id})
-                      </a>
-                    ) : u.drive_file_id ? (
-                      `(${u.drive_file_id})`
-                    ) : (
-                      ""
-                    )}{" "}
-                    {u.error ? `— ${u.error}` : ""}
-                  </li>
+            {delivery.subfolders && Object.keys(delivery.subfolders).length > 0 && (
+              <div className="flex flex-wrap gap-1.5 text-xs">
+                {Object.entries(delivery.subfolders).map(([subName, subId]) => (
+                  <a
+                    key={subName}
+                    href={`https://drive.google.com/drive/folders/${encodeURIComponent(subId)}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="rounded border border-slate-200 bg-slate-50 px-2 py-0.5 font-medium text-blue-700 hover:bg-slate-100"
+                  >
+                    {subName}/
+                  </a>
                 ))}
-              </ul>
+              </div>
+            )}
+            {delivery.uploaded && delivery.uploaded.length > 0 && (
+              <div>
+                <div className="mt-2 text-xs font-medium text-slate-700">Media files uploaded</div>
+                <ul className="mt-1 space-y-1">
+                  {delivery.uploaded.map((u) => (
+                    <li key={u.asset_id} className="font-mono text-xs">
+                      {u.target_subfolder ? `${u.target_subfolder}/` : ""}
+                      {u.filename || u.asset_id}: <strong>{u.status}</strong>{" "}
+                      {u.drive_link ? (
+                        <a href={u.drive_link} target="_blank" rel="noreferrer" className="text-blue-600 underline">
+                          ({u.drive_file_id})
+                        </a>
+                      ) : u.drive_file_id ? (
+                        `(${u.drive_file_id})`
+                      ) : (
+                        ""
+                      )}{" "}
+                      {u.error ? `— ${u.error}` : ""}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {delivery.reports_uploaded && delivery.reports_uploaded.length > 0 && (
+              <div>
+                <div className="mt-2 text-xs font-medium text-slate-700">
+                  Client AI & Inventory reports ({delivery.reports_status || "recorded"})
+                </div>
+                <ul className="mt-1 space-y-1">
+                  {delivery.reports_uploaded.map((r) => (
+                    <li key={r.report_id || r.filename} className="font-mono text-xs">
+                      {r.target_subfolder || "Reports"}/{r.filename || r.report_id}: <strong>{r.status}</strong>{" "}
+                      {r.drive_link ? (
+                        <a href={r.drive_link} target="_blank" rel="noreferrer" className="text-blue-600 underline">
+                          ({r.drive_file_id})
+                        </a>
+                      ) : r.drive_file_id ? (
+                        `(${r.drive_file_id})`
+                      ) : (
+                        ""
+                      )}{" "}
+                      {r.error ? `— ${r.error}` : ""}
+                    </li>
+                  ))}
+                </ul>
+              </div>
             )}
             {delivery.pending_rights_ids && delivery.pending_rights_ids.length > 0 && (
               <div className="text-amber-700">Pending rights approval: {delivery.pending_rights_ids.join(", ")}</div>
@@ -662,8 +705,9 @@ export default function JobDetailClient({ id }: { id: string }) {
                 className="mt-0.5"
               />
               <span>
-                I confirm commercial release rights are verified for the approved assets and authorize private upload to
-                Google Drive (no public sharing).
+                I confirm commercial release rights are verified for the approved assets and authorize private upload of
+                approved images (<code>Best Images/</code>), videos (<code>Best Videos/</code>), and sanitized AI &amp;
+                inventory reports (<code>Reports/</code>) to Google Drive (no public sharing).
               </span>
             </label>
             {deliveryMessage && (

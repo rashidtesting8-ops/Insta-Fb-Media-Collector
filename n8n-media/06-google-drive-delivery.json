@@ -113,7 +113,7 @@
           "conditions": [
             {
               "id": "has-pending",
-              "leftValue": "={{ Array.isArray($json.pending_uploads) && $json.pending_uploads.length > 0 }}",
+              "leftValue": "={{ (Array.isArray($json.pending_uploads) && $json.pending_uploads.length > 0) || (Array.isArray($json.pending_reports) && $json.pending_reports.length > 0) }}",
               "rightValue": true,
               "operator": {"type": "boolean", "operation": "equals"}
             }
@@ -131,7 +131,7 @@
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ status: 'completed', job_id: $json.job_id, drive_folder_id: $json.drive_folder_id || null, drive_folder_link: $json.drive_folder_link || null, uploaded_keys: $json.uploaded_keys || [], note: 'All approved assets were already uploaded.' }) }}",
+        "responseBody": "={{ JSON.stringify({ status: 'completed', job_id: $json.job_id, drive_folder_id: $json.drive_folder_id || null, drive_folder_link: $json.drive_folder_link || null, subfolders: $json.subfolders || {}, uploaded_keys: $json.uploaded_keys || [], uploaded_report_keys: $json.uploaded_report_keys || [], note: 'All approved media and reports were already uploaded.' }) }}",
         "options": {"responseCode": 200}
       },
       "id": "a6000000-0000-4000-8000-000000000014",
@@ -217,13 +217,64 @@
     },
     {
       "parameters": {
-        "jsCode": "const plan = $('Validated Delivery Plan (worker)').first().json;\nconst created = $input.first().json || {};\nconst folderId = plan.drive_folder_id || created.id || null;\nconst folderLink = plan.drive_folder_link || created.webViewLink || (folderId ? 'https://drive.google.com/drive/folders/' + folderId : null);\nreturn (plan.pending_uploads || []).map((asset) => ({ json: { ...asset, drive_folder_id: folderId, drive_folder_link: folderLink }, pairedItem: { item: 0 } }));"
+        "jsCode": "const plan = $('Validated Delivery Plan (worker)').first().json;\nconst created = $input.first().json || {};\nconst rootFolderId = plan.drive_folder_id || created.id || null;\nconst rootFolderLink = plan.drive_folder_link || created.webViewLink || (rootFolderId ? 'https://drive.google.com/drive/folders/' + rootFolderId : null);\nconst existingSubfolders = (plan.subfolders && typeof plan.subfolders === 'object') ? plan.subfolders : {};\nconst needed = new Set();\nfor (const item of (plan.pending_uploads || [])) needed.add(item.target_subfolder || (String(item.mime || '').startsWith('video/') ? 'Best Videos' : 'Best Images'));\nfor (const rep of (plan.pending_reports || [])) needed.add(rep.target_subfolder || 'Reports');\nconst toCreate = [...needed].filter((name) => !existingSubfolders[name]);\nif (toCreate.length === 0) {\n  return [{ json: { skip: true, root_folder_id: rootFolderId, root_folder_link: rootFolderLink, existing_subfolders: existingSubfolders }, pairedItem: { item: 0 } }];\n}\nreturn toCreate.map((name) => ({ json: { skip: false, name, parent_folder_id: rootFolderId, root_folder_id: rootFolderId, root_folder_link: rootFolderLink, existing_subfolders: existingSubfolders }, pairedItem: { item: 0 } }));"
+      },
+      "id": "a6000000-0000-4000-8000-000000000020",
+      "name": "Plan Subfolders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2180, 140]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+          "conditions": [
+            {
+              "id": "need-subfolders",
+              "leftValue": "={{ $json.skip !== true }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000021",
+      "name": "Need Subfolders?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2380, 140]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "resource": "folder",
+        "operation": "create",
+        "name": "={{ $json.name }}",
+        "driveId": {"__rl": true, "mode": "list", "value": "My Drive"},
+        "folderId": {"__rl": true, "mode": "id", "value": "={{ $json.parent_folder_id }}"},
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000022",
+      "name": "Create Drive Subfolder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "credentials": {"googleDriveOAuth2Api": {"id": "GOOGLE_DRIVE_CREDENTIAL_ID", "name": "Google Drive account"}},
+      "position": [2580, 80],
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const plan = $('Validated Delivery Plan (worker)').first().json;\nconst plannedFirst = $('Plan Subfolders').first().json;\nconst rootFolderId = plannedFirst.root_folder_id || plan.drive_folder_id || null;\nconst rootFolderLink = plannedFirst.root_folder_link || plan.drive_folder_link || (rootFolderId ? 'https://drive.google.com/drive/folders/' + rootFolderId : null);\nconst subfolders = { ...(plannedFirst.existing_subfolders || {}) };\nif (plannedFirst.skip !== true) {\n  const plannedAll = $('Plan Subfolders').all();\n  const createdAll = $input.all();\n  createdAll.forEach(({ json }, i) => {\n    const name = json.name || (plannedAll[i] && plannedAll[i].json && plannedAll[i].json.name);\n    if (name && typeof json.id === 'string' && json.id.length > 0) {\n      subfolders[name] = json.id;\n    }\n  });\n}\nconst items = [];\nfor (const asset of (plan.pending_uploads || [])) {\n  const sub = asset.target_subfolder || (String(asset.mime || '').startsWith('video/') ? 'Best Videos' : 'Best Images');\n  items.push({\n    json: { ...asset, kind: 'media', target_subfolder: sub, target_folder_id: subfolders[sub] || rootFolderId, drive_folder_id: rootFolderId, drive_folder_link: rootFolderLink, subfolders },\n    pairedItem: { item: 0 },\n  });\n}\nfor (const report of (plan.pending_reports || [])) {\n  const sub = report.target_subfolder || 'Reports';\n  items.push({\n    json: { ...report, kind: 'report', target_subfolder: sub, target_folder_id: subfolders[sub] || rootFolderId, drive_folder_id: rootFolderId, drive_folder_link: rootFolderLink, subfolders },\n    pairedItem: { item: 0 },\n  });\n}\nreturn items;"
       },
       "id": "a6000000-0000-4000-8000-000000000018",
       "name": "Split Pending Assets",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2180, 140]
+      "position": [2800, 140]
     },
     {
       "parameters": {
@@ -235,7 +286,7 @@
       "name": "Read Selected Original (binary)",
       "type": "n8n-nodes-base.readWriteFile",
       "typeVersion": 1,
-      "position": [2400, 140],
+      "position": [3020, 140],
       "onError": "continueRegularOutput"
     },
     {
@@ -245,7 +296,7 @@
         "operation": "upload",
         "name": "={{ $('Split Pending Assets').item.json.filename }}",
         "driveId": {"__rl": true, "mode": "list", "value": "My Drive"},
-        "folderId": {"__rl": true, "mode": "id", "value": "={{ $('Split Pending Assets').item.json.drive_folder_id }}"},
+        "folderId": {"__rl": true, "mode": "id", "value": "={{ $('Split Pending Assets').item.json.target_folder_id }}"},
         "inputDataFieldName": "data",
         "options": {}
       },
@@ -254,19 +305,19 @@
       "type": "n8n-nodes-base.googleDrive",
       "typeVersion": 3,
       "credentials": {"googleDriveOAuth2Api": {"id": "GOOGLE_DRIVE_CREDENTIAL_ID", "name": "Google Drive account"}},
-      "position": [2620, 140],
+      "position": [3240, 140],
       "retryOnFail": false,
       "onError": "continueRegularOutput"
     },
     {
       "parameters": {
-        "jsCode": "const inputs = $input.all();\nconst uploads = inputs.map(({ json }, i) => {\n  const asset = $('Split Pending Assets').itemMatching(i).json;\n  const ok = typeof json.id === 'string' && json.id.length > 0;\n  return {\n    upload_key: asset.upload_key,\n    drive_file_id: ok ? json.id : null,\n    drive_link: ok ? (json.webViewLink || 'https://drive.google.com/file/d/' + json.id + '/view') : null,\n    status: ok ? 'uploaded' : 'failed',\n    error: ok ? null : String((json.error && json.error.message) || json.error || 'upload_failed'),\n  };\n});\nconst firstAsset = $('Split Pending Assets').first().json;\nreturn [{ json: {\n  authorization_confirmed: $('Validate Delivery Request').first().json.authorization_confirmed === true,\n  business_name: $('Validate Delivery Request').first().json.business_name || '',\n  drive_folder_id: firstAsset.drive_folder_id || null,\n  drive_folder_link: firstAsset.drive_folder_link || null,\n  visibility: 'private',\n  public_sharing: false,\n  uploads,\n}, pairedItem: { item: 0 } }];"
+        "jsCode": "const inputs = $input.all();\nconst uploads = [];\nconst reportUploads = [];\ninputs.forEach(({ json }, i) => {\n  const item = $('Split Pending Assets').itemMatching(i).json;\n  const ok = typeof json.id === 'string' && json.id.length > 0;\n  const receipt = {\n    upload_key: item.upload_key,\n    drive_file_id: ok ? json.id : null,\n    drive_link: ok ? (json.webViewLink || 'https://drive.google.com/file/d/' + json.id + '/view') : null,\n    status: ok ? 'uploaded' : 'failed',\n    error: ok ? null : String((json.error && json.error.message) || json.error || 'upload_failed'),\n  };\n  if (item.kind === 'report') reportUploads.push(receipt);\n  else uploads.push(receipt);\n});\nconst firstItem = $('Split Pending Assets').first().json;\nreturn [{ json: {\n  authorization_confirmed: $('Validate Delivery Request').first().json.authorization_confirmed === true,\n  business_name: $('Validate Delivery Request').first().json.business_name || '',\n  drive_folder_id: firstItem.drive_folder_id || null,\n  drive_folder_link: firstItem.drive_folder_link || null,\n  subfolders: firstItem.subfolders || {},\n  visibility: 'private',\n  public_sharing: false,\n  uploads,\n  report_uploads: reportUploads,\n}, pairedItem: { item: 0 } }];"
       },
       "id": "a6000000-0000-4000-8000-000000000019",
       "name": "Collect Delivery Receipts",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2840, 140]
+      "position": [3460, 140]
     },
     {
       "parameters": {
@@ -284,7 +335,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "credentials": {"httpHeaderAuth": {"name": "Media Worker API Token"}},
       "typeVersion": 4.2,
-      "position": [3060, 140],
+      "position": [3680, 140],
       "onError": "continueRegularOutput"
     },
     {
@@ -297,7 +348,7 @@
       "name": "Respond With Delivery Result",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
-      "position": [3280, 140]
+      "position": [3900, 140]
     },
     {
       "parameters": {
@@ -336,17 +387,25 @@
     },
     "Existing Drive Folder?": {
       "main": [
-        [{"node": "Split Pending Assets", "type": "main", "index": 0}],
+        [{"node": "Plan Subfolders", "type": "main", "index": 0}],
         [{"node": "Create Business Drive Folder", "type": "main", "index": 0}]
       ]
     },
     "Create Business Drive Folder": {"main": [[{"node": "Folder Created?", "type": "main", "index": 0}]]},
     "Folder Created?": {
       "main": [
-        [{"node": "Split Pending Assets", "type": "main", "index": 0}],
+        [{"node": "Plan Subfolders", "type": "main", "index": 0}],
         [{"node": "Respond Folder Error", "type": "main", "index": 0}]
       ]
     },
+    "Plan Subfolders": {"main": [[{"node": "Need Subfolders?", "type": "main", "index": 0}]]},
+    "Need Subfolders?": {
+      "main": [
+        [{"node": "Create Drive Subfolder", "type": "main", "index": 0}],
+        [{"node": "Split Pending Assets", "type": "main", "index": 0}]
+      ]
+    },
+    "Create Drive Subfolder": {"main": [[{"node": "Split Pending Assets", "type": "main", "index": 0}]]},
     "Split Pending Assets": {"main": [[{"node": "Read Selected Original (binary)", "type": "main", "index": 0}]]},
     "Read Selected Original (binary)": {"main": [[{"node": "Upload Original to Drive", "type": "main", "index": 0}]]},
     "Upload Original to Drive": {"main": [[{"node": "Collect Delivery Receipts", "type": "main", "index": 0}]]},

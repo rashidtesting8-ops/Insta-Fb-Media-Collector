@@ -27,20 +27,24 @@ test("05-ai-curation-probe validates 32-hex job_id before calling collector", as
   assert.equal(wf.connections["Valid Job ID?"].main[1][0].node, "Respond Invalid Job ID");
 });
 
-test("06-google-drive-delivery uses valid Drive v3 params and handles multi-asset uploads", async () => {
+test("06-google-drive-delivery uses valid Drive v3 params, creates subfolders, and separates media + report receipts", async () => {
   const wf = await loadWorkflow("06-google-drive-delivery.json");
   assert.equal(wf.active, false);
   const byName = Object.fromEntries(wf.nodes.map((n) => [n.name, n]));
 
   // Drive v3 schema assertions (no deprecated v2 parents/fileName/binaryPropertyName)
   const folder = byName["Create Business Drive Folder"];
+  const subFolder = byName["Create Drive Subfolder"];
   const upload = byName["Upload Original to Drive"];
   assert.equal(folder.parameters.driveId.value, "My Drive");
   assert.equal(folder.parameters.folderId.value, "root");
   assert.equal(folder.parameters.parents, undefined);
   assert.equal(folder.retryOnFail, false);
+  assert.equal(subFolder.parameters.driveId.value, "My Drive");
+  assert.match(subFolder.parameters.folderId.value, /parent_folder_id/);
+  assert.equal(subFolder.retryOnFail, false);
   assert.equal(upload.parameters.driveId.value, "My Drive");
-  assert.match(upload.parameters.folderId.value, /drive_folder_id/);
+  assert.match(upload.parameters.folderId.value, /target_folder_id/);
   assert.equal(upload.parameters.inputDataFieldName, "data");
   assert.match(upload.parameters.name, /filename/);
   assert.equal(upload.parameters.fileName, undefined);
@@ -49,25 +53,52 @@ test("06-google-drive-delivery uses valid Drive v3 params and handles multi-asse
   assert.equal(upload.retryOnFail, false);
   assert.equal(byName["Read Selected Original (binary)"].onError, "continueRegularOutput");
 
-  // Simulate multi-asset Split Pending Assets + Collect Delivery Receipts
+  // Simulate Plan Subfolders -> Split Pending Assets -> Collect Delivery Receipts
   const plan = {
     job_id: "a".repeat(32),
     drive_folder_id: null,
     drive_folder_link: null,
+    subfolders: { "Best Images": "existing_img_sub" },
     pending_uploads: [
-      { asset_id: "img1", filename: "img1.jpg", n8n_path: "/data/media/a/img1.jpg", upload_key: "img1:sha1" },
-      { asset_id: "img2", filename: "img2.jpg", n8n_path: "/data/media/a/img2.jpg", upload_key: "img2:sha2" },
+      { asset_id: "img1", filename: "img1.jpg", mime: "image/jpeg", target_subfolder: "Best Images", n8n_path: "/data/media/a/img1.jpg", upload_key: "img1:sha1" },
+      { asset_id: "vid1", filename: "vid1.mp4", mime: "video/mp4", target_subfolder: "Best Videos", n8n_path: "/data/media/a/vid1.mp4", upload_key: "vid1:sha2" },
+    ],
+    pending_reports: [
+      { report_id: "ai_curation_report", filename: "ai-curation-report.json", mime: "application/json", target_subfolder: "Reports", n8n_path: "/data/media/a/delivery_reports/ai-curation-report.json", upload_key: "report:ai_curation_report:sha3" },
     ],
   };
-  const splitOut = vm.runInNewContext(
-    "(function(){" + byName["Split Pending Assets"].parameters.jsCode + "})()",
+
+  const plannedSubs = vm.runInNewContext(
+    "(function(){" + byName["Plan Subfolders"].parameters.jsCode + "})()",
     {
       $: () => ({ first: () => ({ json: plan }) }),
       $input: { first: () => ({ json: { id: "folder_12345678", webViewLink: "https://drive.google.com/drive/folders/folder_12345678" } }) },
     },
   );
-  assert.equal(splitOut.length, 2);
-  assert.equal(splitOut[0].json.drive_folder_id, "folder_12345678");
+  // Only Best Videos & Reports need creation (Best Images reused!)
+  assert.equal(plannedSubs.length, 2);
+  assert.deepEqual(Array.from(plannedSubs, (s) => s.json.name), ["Best Videos", "Reports"]);
+
+  const splitOut = vm.runInNewContext(
+    "(function(){" + byName["Split Pending Assets"].parameters.jsCode + "})()",
+    {
+      $: (name) => {
+        if (name === "Plan Subfolders") return { first: () => plannedSubs[0], all: () => plannedSubs };
+        return { first: () => ({ json: plan }) };
+      },
+      $input: {
+        all: () => [
+          { json: { id: "new_vid_sub", name: "Best Videos" } },
+          { json: { id: "new_rep_sub", name: "Reports" } },
+        ],
+      },
+    },
+  );
+  assert.equal(splitOut.length, 3);
+  assert.equal(splitOut[0].json.target_folder_id, "existing_img_sub");
+  assert.equal(splitOut[1].json.target_folder_id, "new_vid_sub");
+  assert.equal(splitOut[2].json.target_folder_id, "new_rep_sub");
+  assert.equal(splitOut[2].json.kind, "report");
   assert.equal(splitOut[1].pairedItem?.item, 0);
 
   const collectOut = vm.runInNewContext(
@@ -86,6 +117,7 @@ test("06-google-drive-delivery uses valid Drive v3 params and handles multi-asse
         all: () => [
           { json: { id: "file_aaa11111", webViewLink: "https://drive.google.com/file/d/file_aaa11111/view" } },
           { json: { error: { message: "quota exceeded" } } },
+          { json: { id: "file_rep99999", webViewLink: "https://drive.google.com/file/d/file_rep99999/view" } },
         ],
       },
     },
@@ -96,13 +128,15 @@ test("06-google-drive-delivery uses valid Drive v3 params and handles multi-asse
   assert.equal(ledger.visibility, "private");
   assert.equal(ledger.public_sharing, false);
   assert.equal(ledger.drive_folder_id, "folder_12345678");
-  assert.equal(ledger.drive_folder_link, "https://drive.google.com/drive/folders/folder_12345678");
+  assert.equal(ledger.subfolders["Best Images"], "existing_img_sub");
+  assert.equal(ledger.subfolders["Best Videos"], "new_vid_sub");
+  assert.equal(ledger.subfolders["Reports"], "new_rep_sub");
   assert.equal(ledger.uploads.length, 2);
-  assert.equal(ledger.uploads[0].upload_key, "img1:sha1");
   assert.equal(ledger.uploads[0].status, "uploaded");
-  assert.equal(ledger.uploads[1].upload_key, "img2:sha2");
   assert.equal(ledger.uploads[1].status, "failed");
-  assert.match(ledger.uploads[1].error, /quota exceeded/);
+  assert.equal(ledger.report_uploads.length, 1);
+  assert.equal(ledger.report_uploads[0].upload_key, "report:ai_curation_report:sha3");
+  assert.equal(ledger.report_uploads[0].status, "uploaded");
 });
 
 test("07-pipeline-orchestration fixes Drive v3, pairedItem, post-ack safety, folder failure & status job_id validation", async () => {
