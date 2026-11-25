@@ -40,7 +40,7 @@ export async function approvalRoute(req: Request, ctx: Context, op: Operation) {
         data.reason = body.reason.trim();
       } else if (Object.keys(body).length) return response({ error: "Unexpected Start AI fields" }, 400);
     }
-    const upstream = await namedCall("collection-" + action, data, session, op === "website-policy" ? 15000 : 5000);
+    const upstream = await namedCall("collection-" + action, data, session, 20000);
     if (!upstream.ok) return response({ error: upstream.status === 412 ? "Review changed. Refresh before deciding." :
       "Collection review unavailable for this job or session." }, upstream.status);
     if (op !== "panel") return response({ ok: true }, 200);

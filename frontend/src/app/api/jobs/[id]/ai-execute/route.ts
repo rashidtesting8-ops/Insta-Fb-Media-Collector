@@ -21,7 +21,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     if (body.confirm_processing_consent !== true) {
       return json({ error: "Explicit AI processing consent confirmation required" }, 400);
     }
-    const panelRes = await namedCall("collection-panel", { job_id: id }, session);
+    const panelRes = await namedCall("collection-panel", { job_id: id }, session, 20000);
     if (!panelRes.ok) {
       return json({ error: "Collection review unavailable for this job or session." }, panelRes.status);
     }
