@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
+import { BrandMark, ShieldCheckIcon } from "@/components/Icons";
 import { MIN_SETUP_PASSWORD_LENGTH, SETUP_CSRF_HEADER, SETUP_CSRF_VALUE } from "@/lib/setup-admin";
 
 type SetupState = "loading" | "available" | "unavailable" | "completed";
@@ -112,156 +113,168 @@ export default function SetupAdminPage() {
   const passwordTooShort = password.length > 0 && password.length < MIN_SETUP_PASSWORD_LENGTH;
 
   return (
-    <div className="mx-auto mt-16 max-w-md rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
-      <h1 className="text-xl font-semibold text-slate-900">One-Time Named Admin Setup</h1>
-      <p className="mt-1 text-xs text-slate-600">
-        Loopback-only initial setup. Requires a single-use local setup token and permanently locks after creating Admin #1.
-      </p>
-
-      {state === "loading" && (
-        <p className="mt-6 text-sm text-slate-600">Checking setup availability…</p>
-      )}
-
-      {state === "unavailable" && (
-        <div className="mt-6 space-y-4">
-          <div className="rounded border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
-            {error || "Initial administrator setup is locked, already completed, or requires issuing a single-use local setup token."}
-          </div>
-          <Link
-            href="/login"
-            className="inline-block w-full rounded bg-blue-600 px-4 py-2 text-center text-sm font-medium text-white hover:bg-blue-700"
-          >
-            Go to Sign in
-          </Link>
+    <div className="flex min-h-screen flex-col items-center justify-center bg-[#FAF8F5] px-4 py-12">
+      <div className="mb-7 flex items-center gap-3">
+        <BrandMark className="h-10 w-10 shadow-md" />
+        <div>
+          <div className="text-base font-semibold tracking-tight text-[#181614]">Atelier Media</div>
+          <div className="text-[11px] font-medium tracking-[0.14em] text-[#9A6B37]">INITIAL STUDIO SETUP</div>
         </div>
-      )}
+      </div>
 
-      {state === "completed" && (
-        <div className="mt-6 space-y-4">
-          <div className="rounded border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
-            Admin #1 created and bootstrap permanently locked. Redirecting to Sign in…
+      <div className="studio-card w-full max-w-md p-7 sm:p-8">
+        <div className="flex items-start gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-teal-50 text-[#0F766E]">
+            <ShieldCheckIcon className="h-5 w-5" />
           </div>
-          <Link
-            href="/login"
-            className="inline-block w-full rounded bg-blue-600 px-4 py-2 text-center text-sm font-medium text-white hover:bg-blue-700"
-          >
-            Continue to Sign in
-          </Link>
+          <div>
+            <h1 className="text-xl font-semibold tracking-tight text-[#181614]">One-Time Named Admin Setup</h1>
+            <p className="mt-1 text-xs leading-relaxed text-[#6B635B]">
+              Localhost-only initial onboarding. Requires a single-use local setup token and permanently locks after creating Admin #1.
+            </p>
+          </div>
         </div>
-      )}
 
-      {state === "available" && (
-        <form onSubmit={onSubmit} className="mt-5 space-y-4" autoComplete="off">
-          <div>
-            <div className="flex items-center justify-between">
-              <label htmlFor="setup-token" className="block text-sm font-medium text-slate-800">
-                One-time setup token
+        {state === "loading" && (
+          <div className="mt-6 flex items-center gap-2 text-sm text-[#6B635B]">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-[#0F766E]" />
+            Checking setup availability…
+          </div>
+        )}
+
+        {state === "unavailable" && (
+          <div className="mt-6 space-y-4">
+            <div className="rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-sm leading-relaxed text-amber-950">
+              {error || "Initial administrator setup is locked, already completed, or requires issuing a single-use local setup token."}
+            </div>
+            <Link href="/login" className="studio-btn-primary w-full py-2.5 text-center">
+              Go to Sign in
+            </Link>
+          </div>
+        )}
+
+        {state === "completed" && (
+          <div className="mt-6 space-y-4">
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3.5 text-sm text-emerald-900">
+              Admin #1 created and bootstrap permanently locked. Redirecting to Sign in…
+            </div>
+            <Link href="/login" className="studio-btn-primary w-full py-2.5 text-center">
+              Continue to Sign in
+            </Link>
+          </div>
+        )}
+
+        {state === "available" && (
+          <form onSubmit={onSubmit} className="mt-6 space-y-4" autoComplete="off">
+            <div>
+              <div className="mb-1 flex items-center justify-between">
+                <label htmlFor="setup-token" className="block text-sm font-medium text-[#2C2824]">
+                  One-time setup token
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setShowToken((v) => !v)}
+                  className="text-xs font-medium text-[#0F766E] hover:underline"
+                >
+                  {showToken ? "Hide" : "Show"}
+                </button>
+              </div>
+              <input
+                id="setup-token"
+                type={showToken ? "text" : "password"}
+                required
+                autoComplete="off"
+                spellCheck={false}
+                value={setupToken}
+                onChange={(e) => setSetupToken(e.target.value)}
+                placeholder="Paste single-use token from local CLI"
+                className="studio-input"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="admin-name" className="mb-1 block text-sm font-medium text-[#2C2824]">
+                Account name
               </label>
-              <button
-                type="button"
-                onClick={() => setShowToken((v) => !v)}
-                className="text-xs text-blue-600 hover:underline"
-              >
-                {showToken ? "Hide" : "Show"}
-              </button>
+              <input
+                id="admin-name"
+                type="text"
+                required
+                autoComplete="username"
+                spellCheck={false}
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="e.g. ahsan-rashid"
+                className="studio-input"
+              />
+              <p className="mt-1 text-xs text-[#7D746B]">Allowed: letters, numbers, dot, underscore, @, hyphen.</p>
             </div>
-            <input
-              id="setup-token"
-              type={showToken ? "text" : "password"}
-              required
-              autoComplete="off"
-              spellCheck={false}
-              value={setupToken}
-              onChange={(e) => setSetupToken(e.target.value)}
-              placeholder="Paste single-use token from local CLI"
-              className="mt-1 block w-full rounded border border-slate-300 px-3 py-2 text-sm"
-            />
-          </div>
 
-          <div>
-            <label htmlFor="admin-name" className="block text-sm font-medium text-slate-800">
-              Account name
-            </label>
-            <input
-              id="admin-name"
-              type="text"
-              required
-              autoComplete="username"
-              spellCheck={false}
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. ahsan-rashid"
-              className="mt-1 block w-full rounded border border-slate-300 px-3 py-2 text-sm"
-            />
-            <p className="mt-1 text-xs text-slate-500">Allowed characters: letters, numbers, dot, underscore, @, hyphen.</p>
-          </div>
+            <div>
+              <div className="mb-1 flex items-center justify-between">
+                <label htmlFor="new-password" className="block text-sm font-medium text-[#2C2824]">
+                  New password
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setShowPasswords((v) => !v)}
+                  className="text-xs font-medium text-[#0F766E] hover:underline"
+                >
+                  {showPasswords ? "Hide passwords" : "Show passwords"}
+                </button>
+              </div>
+              <input
+                id="new-password"
+                type={showPasswords ? "text" : "password"}
+                required
+                minLength={MIN_SETUP_PASSWORD_LENGTH}
+                autoComplete="new-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder={`Minimum ${MIN_SETUP_PASSWORD_LENGTH} characters`}
+                className="studio-input"
+              />
+              {passwordTooShort && (
+                <p className="mt-1 text-xs text-amber-700">
+                  Password must be at least {MIN_SETUP_PASSWORD_LENGTH} characters ({password.length}/{MIN_SETUP_PASSWORD_LENGTH}).
+                </p>
+              )}
+            </div>
 
-          <div>
-            <div className="flex items-center justify-between">
-              <label htmlFor="new-password" className="block text-sm font-medium text-slate-800">
-                New password
+            <div>
+              <label htmlFor="confirm-password" className="mb-1 block text-sm font-medium text-[#2C2824]">
+                Confirm password
               </label>
-              <button
-                type="button"
-                onClick={() => setShowPasswords((v) => !v)}
-                className="text-xs text-blue-600 hover:underline"
-              >
-                {showPasswords ? "Hide passwords" : "Show passwords"}
-              </button>
+              <input
+                id="confirm-password"
+                type={showPasswords ? "text" : "password"}
+                required
+                minLength={MIN_SETUP_PASSWORD_LENGTH}
+                autoComplete="new-password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                placeholder="Re-enter password"
+                className="studio-input"
+              />
+              {passwordsMismatch && <p className="mt-1 text-xs text-rose-600">Passwords do not match.</p>}
             </div>
-            <input
-              id="new-password"
-              type={showPasswords ? "text" : "password"}
-              required
-              minLength={MIN_SETUP_PASSWORD_LENGTH}
-              autoComplete="new-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder={`Minimum ${MIN_SETUP_PASSWORD_LENGTH} characters`}
-              className="mt-1 block w-full rounded border border-slate-300 px-3 py-2 text-sm"
-            />
-            {passwordTooShort && (
-              <p className="mt-1 text-xs text-amber-700">
-                Password must be at least {MIN_SETUP_PASSWORD_LENGTH} characters ({password.length}/{MIN_SETUP_PASSWORD_LENGTH}).
-              </p>
+
+            {error && (
+              <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800">
+                {error}
+              </div>
             )}
-          </div>
 
-          <div>
-            <label htmlFor="confirm-password" className="block text-sm font-medium text-slate-800">
-              Confirm password
-            </label>
-            <input
-              id="confirm-password"
-              type={showPasswords ? "text" : "password"}
-              required
-              minLength={MIN_SETUP_PASSWORD_LENGTH}
-              autoComplete="new-password"
-              value={confirmPassword}
-              onChange={(e) => setConfirmPassword(e.target.value)}
-              placeholder="Re-enter password"
-              className="mt-1 block w-full rounded border border-slate-300 px-3 py-2 text-sm"
-            />
-            {passwordsMismatch && (
-              <p className="mt-1 text-xs text-red-600">Passwords do not match.</p>
-            )}
-          </div>
-
-          {error && (
-            <div role="alert" className="rounded border border-red-200 bg-red-50 p-2.5 text-sm text-red-700">
-              {error}
-            </div>
-          )}
-
-          <button
-            type="submit"
-            disabled={submitting || passwordTooShort || passwordsMismatch}
-            className="w-full rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-          >
-            {submitting ? "Creating account…" : "Create account"}
-          </button>
-        </form>
-      )}
+            <button
+              type="submit"
+              disabled={submitting || passwordTooShort || passwordsMismatch}
+              className="studio-btn-primary w-full py-2.5"
+            >
+              {submitting ? "Creating account…" : "Create account"}
+            </button>
+          </form>
+        )}
+      </div>
     </div>
   );
 }
