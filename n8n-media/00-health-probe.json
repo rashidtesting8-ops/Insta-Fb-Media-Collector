@@ -3,6 +3,7 @@
   "nodes": [
     {
       "parameters": {
+        "authentication": "headerAuth",
         "httpMethod": "GET",
         "path": "phase1-probe",
         "responseMode": "responseNode",
@@ -11,6 +12,11 @@
       "id": "a1000000-0000-4000-8000-000000000001",
       "name": "Phase 1 Probe Webhook",
       "type": "n8n-nodes-base.webhook",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Media Admin Webhook Token"
+        }
+      },
       "typeVersion": 2.1,
       "position": [240, 300],
       "webhookId": "b1100000-0000-4000-8000-000000000001"

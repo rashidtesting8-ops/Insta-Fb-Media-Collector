@@ -13,7 +13,8 @@ export function makeCanonicalQa(canonical) {
   const worker = "http://pgm-qa-worker:8787";
   const adapter = "http://pgm-qa-adapter:8799/deliver";
   const remove = new Set(["Authorization Confirmed?", "Respond Awaiting Rights", "Mark Delivering",
-    "Existing Drive Folder?", "Folder Created?", "Split Assets", "Read Selected Original", "Collect Upload Results"]);
+    "Mark Delivery Failed", "Existing Drive Folder?", "Folder Created?", "Split Assets", "Read Selected Original",
+    "Collect Upload Results"]);
   copy.nodes = copy.nodes.filter(({ name }) => !remove.has(name));
   for (const [name, edges] of Object.entries(copy.connections)) {
     if (remove.has(name)) delete copy.connections[name];

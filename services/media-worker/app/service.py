@@ -221,13 +221,32 @@ def ready() -> JSONResponse:
 
 @app.get("/status")
 def status() -> object:
-    """Authenticated worker status used by the n8n health probe."""
+    """Authenticated worker status used by the n8n health probe and dashboard settings."""
+    provider = (os.environ.get("AI_PROVIDER") or "").strip().lower()
+    ai_configured = bool(
+        provider
+        and provider != "disabled"
+        and (provider == "mock" or (os.environ.get("AI_API_KEY") or "").strip())
+    )
+    collection_engine = (
+        "historical"
+        if (
+            os.environ.get("PUBLIC_COLLECTION_CHECKPOINTS") == "1"
+            or os.environ.get("COLLECTION_ENGINE", "").strip().lower() == "historical"
+        )
+        else "legacy"
+    )
     return {
         "ok": True,
         "service": "media-worker",
         "phase": 9,
         "auth": "verified",
         "token_configured": True,
+        "ai_configured": ai_configured,
+        "ai_provider": provider or None,
+        "ai_model": (os.environ.get("AI_MODEL") or "").strip() or None,
+        "m4_approval_enabled": m4_approval_enabled(),
+        "collection_engine": collection_engine,
     }
 
 

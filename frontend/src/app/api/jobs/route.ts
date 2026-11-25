@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
-import { namedCall, namedCookie } from "@/lib/named";
+import { namedCall, namedCookieName } from "@/lib/named";
 import { dashboardDenied, n8nUrl, workerUrl, workerHeaders } from "@/lib/server";
 import { admitRequest, BodyError, readObject } from "@/lib/security";
 import { submitIntake } from "@/lib/intake";
@@ -27,7 +27,7 @@ export async function POST(req: Request) {
   if (!token) return NextResponse.json({ error: "Pipeline intake unavailable" }, { status: 503 });
   try {
     const body = await readObject(req);
-    const named = (await cookies()).get(namedCookie)?.value;
+    const named = (await cookies()).get(namedCookieName())?.value;
     if (named) {
       const reservation = await namedCall("intake", body, named);
       if (!reservation.ok) return NextResponse.json({ error: "Named intake rejected" }, { status: reservation.status });

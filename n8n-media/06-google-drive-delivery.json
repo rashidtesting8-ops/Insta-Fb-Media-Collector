@@ -3,7 +3,8 @@
   "nodes": [
     {
       "parameters": {
-        "authentication": "headerAuth", "httpMethod": "POST",
+        "authentication": "headerAuth",
+        "httpMethod": "POST",
         "path": "drive-delivery",
         "responseMode": "responseNode",
         "options": {}
@@ -11,7 +12,7 @@
       "id": "a6000000-0000-4000-8000-000000000001",
       "name": "Delivery Webhook",
       "type": "n8n-nodes-base.webhook",
-      "credentials": {"httpHeaderAuth":{"name":"Media Admin Webhook Token"}},
+      "credentials": {"httpHeaderAuth": {"name": "Media Admin Webhook Token"}},
       "typeVersion": 2.1,
       "position": [220, 300],
       "webhookId": "b6600000-0000-4000-8000-000000000001"
@@ -35,23 +36,65 @@
     },
     {
       "parameters": {
-        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "GET",
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+          "conditions": [
+            {
+              "id": "valid-job-id",
+              "leftValue": "={{ /^[a-f0-9]{32}$/.test($json.job_id) }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000011",
+      "name": "Valid Delivery Job ID?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [640, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'invalid_request', error: 'Invalid job_id (expected 32 lowercase hex characters)' }) }}",
+        "options": {"responseCode": 400}
+      },
+      "id": "a6000000-0000-4000-8000-000000000012",
+      "name": "Respond Invalid Job ID",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [860, 520]
+    },
+    {
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "method": "GET",
         "url": "={{ 'http://collector:8787/jobs/' + $json.job_id + '/delivery-plan?business_name=' + encodeURIComponent($json.business_name) }}",
         "options": {}
       },
       "id": "a6000000-0000-4000-8000-000000000003",
       "name": "Validated Delivery Plan (worker)",
       "type": "n8n-nodes-base.httpRequest",
-      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
+      "credentials": {"httpHeaderAuth": {"name": "Media Worker API Token"}},
       "typeVersion": 4.2,
-      "position": [660, 300]
+      "position": [860, 280],
+      "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "conditions": {
           "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
           "conditions": [
-            {"id": "ready", "leftValue": "={{ $json.status === 'ready' && $('Validate Delivery Request').item.json.authorization_confirmed === true }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}
+            {
+              "id": "ready",
+              "leftValue": "={{ $json.status === 'ready' && $('Validate Delivery Request').first().json.authorization_confirmed === true }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "equals"}
+            }
           ],
           "combinator": "and"
         },
@@ -61,15 +104,72 @@
       "name": "Plan Ready Gate",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
-      "position": [880, 300]
+      "position": [1080, 280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+          "conditions": [
+            {
+              "id": "has-pending",
+              "leftValue": "={{ Array.isArray($json.pending_uploads) && $json.pending_uploads.length > 0 }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000013",
+      "name": "Pending Uploads?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1300, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'completed', job_id: $json.job_id, drive_folder_id: $json.drive_folder_id || null, drive_folder_link: $json.drive_folder_link || null, uploaded_keys: $json.uploaded_keys || [], note: 'All approved assets were already uploaded.' }) }}",
+        "options": {"responseCode": 200}
+      },
+      "id": "a6000000-0000-4000-8000-000000000014",
+      "name": "Respond Already Delivered",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [1520, 360]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+          "conditions": [
+            {
+              "id": "reuse-folder",
+              "leftValue": "={{ !!$('Validated Delivery Plan (worker)').first().json.drive_folder_id }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000015",
+      "name": "Existing Drive Folder?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1520, 140]
     },
     {
       "parameters": {
         "authentication": "oAuth2",
         "resource": "folder",
         "operation": "create",
-        "name": "={{ $('Validated Delivery Plan (worker)').item.json.folder_name }}",
-        "parents": {"parentId": {"__rl": true, "value": "root", "mode": "id"}},
+        "name": "={{ $('Validated Delivery Plan (worker)').first().json.folder_name }}",
+        "driveId": {"__rl": true, "mode": "list", "value": "My Drive"},
+        "folderId": {"__rl": true, "mode": "id", "value": "root"},
         "options": {}
       },
       "id": "a6000000-0000-4000-8000-000000000005",
@@ -77,28 +177,76 @@
       "type": "n8n-nodes-base.googleDrive",
       "typeVersion": 3,
       "credentials": {"googleDriveOAuth2Api": {"id": "GOOGLE_DRIVE_CREDENTIAL_ID", "name": "Google Drive account"}},
-      "position": [1100, 240]
+      "position": [1740, 220],
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+          "conditions": [
+            {
+              "id": "folder-ok",
+              "leftValue": "={{ !!$json.id }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a6000000-0000-4000-8000-000000000016",
+      "name": "Folder Created?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1960, 220]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'failed', job_id: $('Validate Delivery Request').first().json.job_id, error: 'Google Drive folder creation failed' }) }}",
+        "options": {"responseCode": 502}
+      },
+      "id": "a6000000-0000-4000-8000-000000000017",
+      "name": "Respond Folder Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [2180, 360]
+    },
+    {
+      "parameters": {
+        "jsCode": "const plan = $('Validated Delivery Plan (worker)').first().json;\nconst created = $input.first().json || {};\nconst folderId = plan.drive_folder_id || created.id || null;\nconst folderLink = plan.drive_folder_link || created.webViewLink || (folderId ? 'https://drive.google.com/drive/folders/' + folderId : null);\nreturn (plan.pending_uploads || []).map((asset) => ({ json: { ...asset, drive_folder_id: folderId, drive_folder_link: folderLink }, pairedItem: { item: 0 } }));"
+      },
+      "id": "a6000000-0000-4000-8000-000000000018",
+      "name": "Split Pending Assets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2180, 140]
     },
     {
       "parameters": {
         "operation": "read",
-        "fileSelector": "={{ '/data/media/' + $('Validate Delivery Request').item.json.job_id + '/' + $json.local_path }}",
+        "fileSelector": "={{ $json.n8n_path }}",
         "options": {"dataPropertyName": "data"}
       },
       "id": "a6000000-0000-4000-8000-000000000006",
       "name": "Read Selected Original (binary)",
       "type": "n8n-nodes-base.readWriteFile",
       "typeVersion": 1,
-      "position": [1300, 240]
+      "position": [2400, 140],
+      "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "authentication": "oAuth2",
         "resource": "file",
         "operation": "upload",
-        "fileName": "={{ $json.fileName || $binary.data.fileName }}",
-        "parents": {"parentId": {"__rl": true, "value": "={{ $('Create Business Drive Folder').item.json.id }}", "mode": "id"}},
-        "binaryPropertyName": "data",
+        "name": "={{ $('Split Pending Assets').item.json.filename }}",
+        "driveId": {"__rl": true, "mode": "list", "value": "My Drive"},
+        "folderId": {"__rl": true, "mode": "id", "value": "={{ $('Split Pending Assets').item.json.drive_folder_id }}"},
+        "inputDataFieldName": "data",
         "options": {}
       },
       "id": "a6000000-0000-4000-8000-000000000007",
@@ -106,23 +254,38 @@
       "type": "n8n-nodes-base.googleDrive",
       "typeVersion": 3,
       "credentials": {"googleDriveOAuth2Api": {"id": "GOOGLE_DRIVE_CREDENTIAL_ID", "name": "Google Drive account"}},
-      "position": [1500, 240]
+      "position": [2620, 140],
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
     },
     {
       "parameters": {
-        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "POST",
-        "url": "={{ 'http://collector:8787/jobs/' + $('Validate Delivery Request').item.json.job_id + '/delivery-result' }}",
+        "jsCode": "const inputs = $input.all();\nconst uploads = inputs.map(({ json }, i) => {\n  const asset = $('Split Pending Assets').itemMatching(i).json;\n  const ok = typeof json.id === 'string' && json.id.length > 0;\n  return {\n    upload_key: asset.upload_key,\n    drive_file_id: ok ? json.id : null,\n    drive_link: ok ? (json.webViewLink || 'https://drive.google.com/file/d/' + json.id + '/view') : null,\n    status: ok ? 'uploaded' : 'failed',\n    error: ok ? null : String((json.error && json.error.message) || json.error || 'upload_failed'),\n  };\n});\nconst firstAsset = $('Split Pending Assets').first().json;\nreturn [{ json: {\n  authorization_confirmed: $('Validate Delivery Request').first().json.authorization_confirmed === true,\n  business_name: $('Validate Delivery Request').first().json.business_name || '',\n  drive_folder_id: firstAsset.drive_folder_id || null,\n  drive_folder_link: firstAsset.drive_folder_link || null,\n  visibility: 'private',\n  public_sharing: false,\n  uploads,\n}, pairedItem: { item: 0 } }];"
+      },
+      "id": "a6000000-0000-4000-8000-000000000019",
+      "name": "Collect Delivery Receipts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2840, 140]
+    },
+    {
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "method": "POST",
+        "url": "={{ 'http://collector:8787/jobs/' + $('Validate Delivery Request').first().json.job_id + '/delivery-result' }}",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ authorization_confirmed: $('Validate Delivery Request').item.json.authorization_confirmed, drive_folder_id: $('Create Business Drive Folder').item.json.id, uploads: [{ upload_key: $('Validated Delivery Plan (worker)').item.json.assets[0].upload_key, drive_file_id: $json.id, drive_link: $json.webViewLink, status: 'uploaded' }] }) }}",
+        "jsonBody": "={{ JSON.stringify($json) }}",
         "options": {}
       },
       "id": "a6000000-0000-4000-8000-000000000008",
       "name": "Persist Delivery Ledger",
       "type": "n8n-nodes-base.httpRequest",
-      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
+      "credentials": {"httpHeaderAuth": {"name": "Media Worker API Token"}},
       "typeVersion": 4.2,
-      "position": [1700, 240]
+      "position": [3060, 140],
+      "onError": "continueRegularOutput"
     },
     {
       "parameters": {
@@ -134,32 +297,60 @@
       "name": "Respond With Delivery Result",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
-      "position": [1900, 240]
+      "position": [3280, 140]
     },
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ status: 'blocked', reason: 'delivery plan not ready or rights/mock gate blocked' }) }}",
+        "responseBody": "={{ JSON.stringify({ status: $json.status || 'blocked', reason: $json.reason || 'delivery plan not ready or rights/mock gate blocked', pending_rights_ids: $json.pending_rights_ids || [], errors: $json.errors || [] }) }}",
         "options": {"responseCode": 200}
       },
       "id": "a6000000-0000-4000-8000-000000000010",
       "name": "Return Blocked Status",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
-      "position": [1100, 480]
+      "position": [1300, 480]
     }
   ],
   "connections": {
     "Delivery Webhook": {"main": [[{"node": "Validate Delivery Request", "type": "main", "index": 0}]]},
-    "Validate Delivery Request": {"main": [[{"node": "Validated Delivery Plan (worker)", "type": "main", "index": 0}]]},
+    "Validate Delivery Request": {"main": [[{"node": "Valid Delivery Job ID?", "type": "main", "index": 0}]]},
+    "Valid Delivery Job ID?": {
+      "main": [
+        [{"node": "Validated Delivery Plan (worker)", "type": "main", "index": 0}],
+        [{"node": "Respond Invalid Job ID", "type": "main", "index": 0}]
+      ]
+    },
     "Validated Delivery Plan (worker)": {"main": [[{"node": "Plan Ready Gate", "type": "main", "index": 0}]]},
-    "Plan Ready Gate": {"main": [
-      [{"node": "Create Business Drive Folder", "type": "main", "index": 0}],
-      [{"node": "Return Blocked Status", "type": "main", "index": 0}]
-    ]},
-    "Create Business Drive Folder": {"main": [[{"node": "Read Selected Original (binary)", "type": "main", "index": 0}]]},
+    "Plan Ready Gate": {
+      "main": [
+        [{"node": "Pending Uploads?", "type": "main", "index": 0}],
+        [{"node": "Return Blocked Status", "type": "main", "index": 0}]
+      ]
+    },
+    "Pending Uploads?": {
+      "main": [
+        [{"node": "Existing Drive Folder?", "type": "main", "index": 0}],
+        [{"node": "Respond Already Delivered", "type": "main", "index": 0}]
+      ]
+    },
+    "Existing Drive Folder?": {
+      "main": [
+        [{"node": "Split Pending Assets", "type": "main", "index": 0}],
+        [{"node": "Create Business Drive Folder", "type": "main", "index": 0}]
+      ]
+    },
+    "Create Business Drive Folder": {"main": [[{"node": "Folder Created?", "type": "main", "index": 0}]]},
+    "Folder Created?": {
+      "main": [
+        [{"node": "Split Pending Assets", "type": "main", "index": 0}],
+        [{"node": "Respond Folder Error", "type": "main", "index": 0}]
+      ]
+    },
+    "Split Pending Assets": {"main": [[{"node": "Read Selected Original (binary)", "type": "main", "index": 0}]]},
     "Read Selected Original (binary)": {"main": [[{"node": "Upload Original to Drive", "type": "main", "index": 0}]]},
-    "Upload Original to Drive": {"main": [[{"node": "Persist Delivery Ledger", "type": "main", "index": 0}]]},
+    "Upload Original to Drive": {"main": [[{"node": "Collect Delivery Receipts", "type": "main", "index": 0}]]},
+    "Collect Delivery Receipts": {"main": [[{"node": "Persist Delivery Ledger", "type": "main", "index": 0}]]},
     "Persist Delivery Ledger": {"main": [[{"node": "Respond With Delivery Result", "type": "main", "index": 0}]]}
   },
   "settings": {"executionOrder": "v1"},

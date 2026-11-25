@@ -1,9 +1,9 @@
 import { cookies } from "next/headers";
-import { namedCall, namedCookie } from "./named";
+import { namedCall, namedCookieName } from "./named";
 import { BodyError, dashboardOrigin, readObject } from "./security";
 
 type Context = { params: Promise<{ id: string }> };
-type Operation = "panel" | "decision" | "start";
+type Operation = "panel" | "decision" | "start" | "website-policy";
 const response = (data: unknown, status: number) => Response.json(data, {
   status, headers: { "Cache-Control": "private, no-store" },
 });
@@ -13,11 +13,11 @@ export async function approvalRoute(req: Request, ctx: Context, op: Operation) {
   if (!/^[a-f0-9]{32}$/.test(id)) return response({ error: "Invalid job ID" }, 400);
   if (op !== "panel" && (!dashboardOrigin() || req.headers.get("origin") !== dashboardOrigin()))
     return response({ error: "Origin denied" }, 403);
-  const session = (await cookies()).get(namedCookie)?.value;
+  const session = (await cookies()).get(namedCookieName())?.value;
   if (!session) return response({ error: "Named Admin sign-in required" }, 401);
   try {
     let action: string = op;
-    const data: Record<string, string> = { job_id: id };
+    const data: Record<string, unknown> = { job_id: id };
     if (op !== "panel") {
       const body = await readObject(req, 4096);
       const match = req.headers.get("if-match")?.match(/^"([a-f0-9]{64})"$/);
@@ -32,9 +32,15 @@ export async function approvalRoute(req: Request, ctx: Context, op: Operation) {
           return response({ error: "Decision and reason required" }, 400);
         action = body.action;
         data.reason = body.reason.trim();
+      } else if (op === "website-policy") {
+        if (Object.keys(body).length !== 2 || typeof body.include_undated_website !== "boolean" ||
+            typeof body.reason !== "string" || !body.reason.trim())
+          return response({ error: "Website policy flag and reason required" }, 400);
+        data.include_undated_website = body.include_undated_website;
+        data.reason = body.reason.trim();
       } else if (Object.keys(body).length) return response({ error: "Unexpected Start AI fields" }, 400);
     }
-    const upstream = await namedCall("collection-" + action, data, session);
+    const upstream = await namedCall("collection-" + action, data, session, op === "website-policy" ? 15000 : 5000);
     if (!upstream.ok) return response({ error: upstream.status === 412 ? "Review changed. Refresh before deciding." :
       "Collection review unavailable for this job or session." }, upstream.status);
     if (op !== "panel") return response({ ok: true }, 200);
