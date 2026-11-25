@@ -17,5 +17,5 @@ def isolated_provider_unit(monkeypatch):
     monkeypatch.setattr(ai_execution, "check_inputs", lambda *_: None)
     monkeypatch.setattr(ai_execution, "checkpoint_analysis", lambda *_: None)
     monkeypatch.setattr(ai_execution, "require_transport", lambda: None)
-    monkeypatch.setattr(ai_execution, "attempt", lambda mode, ids, reserve=None: nullcontext(reserve() if reserve else None))
+    monkeypatch.setattr(ai_execution, "attempt", lambda mode, ids, reserve=None, **_kw: nullcontext(reserve() if reserve else None))
     monkeypatch.setattr(ai_execution, "publication", nullcontext)

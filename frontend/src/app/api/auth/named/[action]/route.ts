@@ -1,6 +1,6 @@
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
-import { namedCall, namedCookie, namedCookieOptions } from "@/lib/named";
+import { namedCall, namedCookieName, namedCookieOptionsFor } from "@/lib/named";
 import { admitRequest, BodyError, dashboardOrigin, readObject } from "@/lib/security";
 
 export async function POST(req: Request, ctx: { params: Promise<{ action: string }> }) {
@@ -11,7 +11,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ action: string
     return NextResponse.json({ error: "Origin denied" }, { status: 403 });
   if (action === "login" && !admitRequest("login"))
     return NextResponse.json({ error: "Login limit reached" }, { status: 429 });
-  const session = (await cookies()).get(namedCookie)?.value;
+  const cookieName = namedCookieName();
+  const session = (await cookies()).get(cookieName)?.value;
   if (action !== "login" && !session)
     return NextResponse.json({ error: "Named login required" }, { status: 401 });
   try {
@@ -21,9 +22,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ action: string
     const result = NextResponse.json(action === "login" ? { ok: true } : data);
     if (action === "login") {
       if (typeof data.session !== "string" || !/^[\w-]{43}$/.test(data.session)) throw new Error();
-      result.cookies.set(namedCookie, data.session, namedCookieOptions);
+      result.cookies.set(cookieName, data.session, namedCookieOptionsFor());
     }
-    if (action === "logout") result.cookies.set(namedCookie, "", { ...namedCookieOptions, maxAge: 0 });
+    if (action === "logout") result.cookies.set(cookieName, "", namedCookieOptionsFor(0));
     return result;
   } catch (err) {
     return NextResponse.json({ error: "Named request unavailable" },

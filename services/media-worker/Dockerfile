@@ -1,13 +1,14 @@
-# Phase 1 media worker skeleton.
-# Non-root user, healthcheck and port conventions adapted from the legacy
-# builder Dockerfile (reference/legacy-extracted/pet-gromming-agent-factory-main/Dockerfile).
-# Chromium/Playwright is deliberately deferred to Phase 2 to keep this skeleton light.
+# Pet Grooming Media Worker (V2.1)
+# Non-root runtime, ffmpeg + libsodium23 (Argon2id named auth), and reproducible pytest.
 FROM python:3.12-slim
 
 WORKDIR /srv
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/srv
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/srv \
+    TMPDIR=/tmp
 
-# ffmpeg for Phase 2 frame extraction; ca-certificates for outbound HTTPS.
+# ffmpeg for video frame extraction; ca-certificates for HTTPS; libsodium23 for Argon2id named auth.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg ca-certificates libsodium23 \
  && rm -rf /var/lib/apt/lists/*
@@ -15,15 +16,18 @@ RUN apt-get update \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN useradd --create-home --shell /bin/bash appuser
+RUN useradd --create-home --shell /bin/bash appuser \
+ && mkdir -p /data/projects /srv/docs
+
+COPY pyproject.toml ./pyproject.toml
 COPY app ./app
 COPY tests ./tests
 COPY scripts/named_bootstrap.py ./scripts/named_bootstrap.py
-RUN chown -R appuser:appuser /srv
+RUN chown -R appuser:appuser /srv /data/projects
 USER appuser
 
 EXPOSE 8787
-HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3)"
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/ready', timeout=3)"
 
 CMD ["uvicorn", "app.service:app", "--host", "0.0.0.0", "--port", "8787", "--no-access-log", "--no-proxy-headers"]

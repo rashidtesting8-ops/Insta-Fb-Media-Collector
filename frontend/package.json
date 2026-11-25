@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --test tests/security.test.mjs",
+    "test": "node --test tests/security.test.mjs && node --import tsx --test tests/collection-review.behavior.test.mjs tests/sprint4-operator.test.mjs",
     "test:integration": "node --test tests/dashboard.integration.mjs"
   },
   "dependencies": {

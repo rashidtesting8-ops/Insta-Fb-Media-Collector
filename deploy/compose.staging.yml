@@ -17,8 +17,18 @@ services:
       PROJECTS_DIR: /data/projects
       MEDIA_WORKER_TOKEN: ${MEDIA_WORKER_TOKEN:?set the staging worker token}
       MEDIA_WORKER_DASHBOARD_TOKEN: ${MEDIA_WORKER_DASHBOARD_TOKEN:?set a separate staging dashboard token}
+      COLLECTION_ENGINE: ${COLLECTION_ENGINE:-historical}
+      PUBLIC_COLLECTION_CHECKPOINTS: ${PUBLIC_COLLECTION_CHECKPOINTS:-1}
+      M4_COLLECTION_APPROVAL_ENABLED: ${M4_COLLECTION_APPROVAL_ENABLED:-1}
+      NAMED_ASSERTION_SECRET: ${NAMED_ASSERTION_SECRET:-}
+      AI_PROVIDER: ${AI_PROVIDER:-}
+      AI_MODEL: ${AI_MODEL:-}
+      AI_ENDPOINT: ${AI_ENDPOINT:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MAX_IMAGES_PER_REQUEST: ${AI_MAX_IMAGES_PER_REQUEST:-5}
     volumes:
       - ${STAGING_MEDIA_DIR:?select a fresh staging-only directory}:/data/projects:rw
+      - ../docs/AI_VISUAL_DIRECTOR_V2.md:/srv/docs/AI_VISUAL_DIRECTOR_V2.md:ro
     networks: [worker]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/ready', timeout=3)"]
@@ -62,7 +72,11 @@ services:
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set the staging operator password}
       DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:?set an independent random signing secret}
       MEDIA_WORKER_DASHBOARD_TOKEN: ${MEDIA_WORKER_DASHBOARD_TOKEN:?set a separate staging dashboard token}
+      NAMED_ASSERTION_SECRET: ${NAMED_ASSERTION_SECRET:-}
       N8N_PIPELINE_TOKEN: ${N8N_PIPELINE_TOKEN:?set the staging pipeline webhook token}
+      N8N_ADMIN_WEBHOOK_TOKEN: ${N8N_ADMIN_WEBHOOK_TOKEN:-}
+      N8N_ADMIN_WEBHOOK_HEADER: ${N8N_ADMIN_WEBHOOK_HEADER:-X-Admin-Key}
+      GOOGLE_DRIVE_READY: ${GOOGLE_DRIVE_READY:-0}
       WORKER_URL: http://collector:8787
       N8N_URL: http://n8n:5678
     networks: [edge, worker]

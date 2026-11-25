@@ -120,8 +120,9 @@ class AIProviderConfig:
     timeout_s: int = 120
     max_retries: int = 2
     # Conservative vision batch size: several real vision models (including
-    # Groq's qwen/qwen3.8-27b) accept at most 3 images per request.
+    # Groq's qwen/qwen3.8-27b) accept at most 3-5 images per request.
     batch_size: int = 3
+    max_images_per_request: int = 5
     max_requests_per_job: int = 40
     max_cost_usd_per_job: float = 2.0
     max_image_dim: int = 512          # conservative multimodal payload
@@ -157,6 +158,7 @@ class AIProviderConfig:
         self.max_image_dim = min(self.max_image_dim, 256)
         self.max_image_bytes = min(self.max_image_bytes, 100_000)
         self.batch_size = 1
+        self.max_images_per_request = 1
         self.mode_a_max_output_tokens = min(self.mode_a_max_output_tokens, 1200)
         self.mode_b_max_output_tokens = min(self.mode_b_max_output_tokens, 900 if self.mode_b_only else 1800)
         if self.mode_b_only:
@@ -173,6 +175,7 @@ class AIProviderConfig:
             timeout_s=int(e.get("AI_TIMEOUT_S") or 120),
             max_retries=int(e.get("AI_MAX_RETRIES") or 2),
             batch_size=int(e.get("AI_BATCH_SIZE") or 3),
+            max_images_per_request=max(1, int(e.get("AI_MAX_IMAGES_PER_REQUEST") or 5)),
             max_requests_per_job=int(e.get("AI_MAX_REQUESTS_PER_JOB") or 40),
             max_cost_usd_per_job=float(e.get("AI_MAX_COST_USD_PER_JOB") or 2.0),
             max_image_dim=int(e.get("AI_MAX_IMAGE_DIM") or 512),
@@ -549,6 +552,9 @@ class OpenAICompatibleProvider(VisionProvider):
         prompt: str,
         images: list[ImagePayload],
         tracker: UsageTracker,
+        *,
+        system_prompt: str | None = None,
+        attempt_offset: int = 0,
     ) -> CompletionResult:
         if self.config.bounded_acceptance:
             tracker.pre_flight()
@@ -569,6 +575,12 @@ class OpenAICompatibleProvider(VisionProvider):
         )
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for image in images:
+            if not self.config.bounded_acceptance:
+                label = image.label or "primary image"
+                content.append({
+                    "type": "text",
+                    "text": f"[IMAGE asset_id={image.asset_id} label={label}]",
+                })
             b64 = base64.b64encode(image.data).decode("ascii")
             content.append(
                 {
@@ -576,14 +588,13 @@ class OpenAICompatibleProvider(VisionProvider):
                     "image_url": {"url": f"data:{image.mime};base64,{b64}"},
                 }
             )
+        messages: list[dict[str, Any]] = []
+        if system_prompt and not self.config.bounded_acceptance:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": content})
         body = {
             "model": self.config.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": content,
-                }
-            ],
+            "messages": messages,
             "temperature": 0.2,
             # The pipeline always requires strict JSON; this model declares
             # json_mode support. Bounded cap large enough for a full batch.
@@ -617,9 +628,14 @@ class OpenAICompatibleProvider(VisionProvider):
             if due > 0:
                 self._sleep(due)
             self._last_request = time.monotonic()
+            attempt_idx = attempt_offset * 10 + attempt
             try:
-                with ai_execution.attempt("A" if images else "B", [image.asset_id for image in images],
-                                          lambda: tracker.reserve_request(max_output_tokens, retry=attempt > 0)) as reservation:
+                with ai_execution.attempt(
+                    "A" if images else "B",
+                    [image.asset_id for image in images],
+                    lambda: tracker.reserve_request(max_output_tokens, retry=(attempt > 0 or attempt_offset > 0)),
+                    attempt_index=attempt_idx,
+                ) as reservation:
                     response = self._transport({
                         "url": self.config.endpoint,
                         "headers": headers,
@@ -649,10 +665,10 @@ class OpenAICompatibleProvider(VisionProvider):
                 raise
             except requests.HTTPError as exc:
                 # Retry ONLY rate limits (bounded, honoring retry-after) and
-                # transient 5xx. 401/403/413 are authoritative: no retry.
+                # transient 5xx when permitted by execution fencing. 401/403/413 never retry.
                 response = getattr(exc, "response", None)
                 code = int(getattr(response, "status_code", 0) or 0)
-                headers = getattr(response, "headers", {}) or {}
+                resp_headers = getattr(response, "headers", {}) or {}
                 reported = tracker.record_http_error(response)
                 detail = reported["message"]
                 if reported.get("code"):
@@ -663,23 +679,23 @@ class OpenAICompatibleProvider(VisionProvider):
                         raise RateLimitedError(f"provider quota exhausted: {detail}") from None
                     retry_after = 0.0
                     try:
-                        retry_after = float(str(headers.get("retry-after") or "0").strip())
+                        retry_after = float(str(resp_headers.get("retry-after") or "0").strip())
                     except (TypeError, ValueError):
                         retry_after = 0.0
                     last_error = f"HTTP 429: {detail}"
-                    if attempt < retries:
+                    if attempt < retries and ai_execution.can_retry_http(429):
                         self._sleep(max(retry_after, 2.0 * (2**attempt)))
                         continue
                     raise RateLimitedError(f"provider rate limit: {detail}") from None
                 if 500 <= code < 600:
                     last_error = f"HTTP {code}: {detail}"
-                    if attempt < retries:
+                    if attempt < retries and ai_execution.can_retry_http(code):
                         self._sleep(2.0 * (2**attempt))
                         continue
                 raise RuntimeError(f"provider HTTP error: HTTP {code} {detail}") from None
             except (requests.Timeout, requests.RequestException, ValueError) as exc:
                 last_error = _safe_provider_message(str(exc), self.config.api_key)
-                if attempt < retries:
+                if attempt < retries and ai_execution.can_retry_http(0):
                     self._sleep(2.0 * (2**attempt))
                     continue
                 raise RuntimeError(f"provider error: {last_error}") from None
@@ -694,7 +710,13 @@ class OpenAICompatibleProvider(VisionProvider):
         """
         from app.ai_execution import require_transport
         require_transport()
-        if request["url"] != GROQ_ACCEPTANCE_ENDPOINT:
+        extra_allowed = {
+            u.strip()
+            for u in os.environ.get("AI_ALLOWED_ENDPOINTS", "").split(",")
+            if u.strip().startswith("https://")
+        }
+        allowed_endpoints = {GROQ_ACCEPTANCE_ENDPOINT, *extra_allowed}
+        if request["url"] not in allowed_endpoints:
             raise ProviderUnavailableError("External processing consent for this destination is unavailable")
         response = requests.post(
             request["url"],

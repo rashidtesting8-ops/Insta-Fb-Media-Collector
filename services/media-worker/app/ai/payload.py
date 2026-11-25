@@ -63,6 +63,7 @@ def select_ai_candidates(
     job_dir: str | Path,
     *,
     max_assets: int = 40,
+    include_undated_website: bool = False,
 ) -> SelectionReport:
     job_dir = Path(job_dir)
     resolved_root = job_dir.resolve()
@@ -90,9 +91,15 @@ def select_ai_candidates(
         if item.get("type") == "frame":
             continue  # frames are supplied via their parent video
         date_state = date_eligibility(item, bounds)
-        if date_state != "in_window":
+        undated_website_allowed = (
+            include_undated_website
+            and date_state == "unknown_date"
+            and item.get("platform") == "website"
+        )
+        if date_state != "in_window" and not undated_website_allowed:
             report.excluded.append({"asset_id": item["asset_id"], "reason": date_state})
             continue
+        selection_reason = "selected_undated_website_approved" if undated_website_allowed else "selected"
         outcome = _outcome(item)
         if outcome in ("corrupted", "missing_file", "video_probe_failed"):
             report.excluded.append({"asset_id": item["asset_id"], "reason": outcome})
@@ -127,6 +134,7 @@ def select_ai_candidates(
                     kind="video",
                     payload_files=[p for p, _ in frame_pairs],
                     frame_timestamps=[ts for _, ts in frame_pairs],
+                    reason=selection_reason,
                 )
             )
         else:
@@ -135,7 +143,7 @@ def select_ai_candidates(
                 report.excluded.append({"asset_id": item["asset_id"], "reason": "missing_file"})
                 continue
             report.candidates.append(
-                Candidate(asset=item, kind="image", payload_files=[path])
+                Candidate(asset=item, kind="image", payload_files=[path], reason=selection_reason)
             )
 
     # Duplicate-group handling: only representatives are analyzed
@@ -211,6 +219,28 @@ def _encode_jpeg_under(im: Image.Image, max_bytes: int) -> bytes:
     raise ValueError("Could not encode JPEG within the configured byte cap")
 
 
+def sample_candidate_frames(candidate: Candidate, max_frames: int) -> Candidate:
+    """Evenly subsample a video candidate's frames to fit within max_images_per_request."""
+    if candidate.kind != "video" or max_frames < 1 or len(candidate.payload_files) <= max_frames:
+        return candidate
+    total = len(candidate.payload_files)
+    if max_frames == 1:
+        indices = [total // 2]
+    else:
+        indices = sorted({round(i * (total - 1) / (max_frames - 1)) for i in range(max_frames)})
+    return Candidate(
+        asset=candidate.asset,
+        kind=candidate.kind,
+        payload_files=[candidate.payload_files[i] for i in indices],
+        frame_timestamps=[
+            candidate.frame_timestamps[i]
+            for i in indices
+            if i < len(candidate.frame_timestamps)
+        ],
+        reason=candidate.reason,
+    )
+
+
 def build_image_payloads(
     candidate: Candidate,
     *,
@@ -249,6 +279,7 @@ __all__ = [
     "Candidate",
     "SelectionReport",
     "select_ai_candidates",
+    "sample_candidate_frames",
     "convert_for_payload",
     "build_image_payloads",
     "probe_payload_readable",

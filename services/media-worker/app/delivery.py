@@ -1,13 +1,15 @@
-"""Phase 6 Google Drive delivery planning/finalization (worker side).
+"""Phase 6 + V2.1 Google Drive delivery planning/finalization (worker side).
 
-n8n owns Drive authentication and uploads; this module only computes a
-deterministic, validated plan from the persisted curation + manifest and
-records the upload ledger returned by n8n. No secrets, no public sharing,
+n8n owns Drive authentication and uploads; this module computes a deterministic,
+validated plan from persisted curation + manifest, packages sanitized client
+AI curation and media inventory reports for the Drive `Reports/` subfolder,
+and records the upload ledger returned by n8n. No secrets, no public sharing,
 no fabricated assets, no mock/fixture curation released by default.
 """
 
 from __future__ import annotations
 
+import datetime as _dt
 import hashlib
 import json
 import re
@@ -28,6 +30,7 @@ _MIME_TO_EXT = {
     "video/webm": ".webm",
     "video/quicktime": ".mov",
 }
+_ALLOWED_SUBFOLDERS = ("Best Images", "Best Videos", "Reports")
 
 
 def sanitize_folder_name(business: str, job_id: str) -> str:
@@ -67,6 +70,11 @@ def _safe_delivery_filename(asset_id: str, disk: Path, mime: Any, sha: str) -> s
     return f"{stem}-{sha[:8]}{ext}"
 
 
+def _target_subfolder_for_mime(mime: Any) -> str:
+    clean = str(mime or "").split(";", 1)[0].strip().lower()
+    return "Best Videos" if clean.startswith("video/") else "Best Images"
+
+
 def _fixture_or_mock(envelope: dict[str, Any]) -> bool:
     if envelope.get("ai_envelope", {}).get("mock") is not False:
         return True
@@ -77,6 +85,143 @@ def _fixture_or_mock(envelope: dict[str, Any]) -> bool:
         str(envelope.get("fixture", "")).lower(),
     ]
     return any(any(m in marker for m in MOCK_MARKERS) for marker in markers)
+
+
+def _package_client_reports(
+    job_dir: Path,
+    job_id: str,
+    folder_name: str,
+    manifest: dict[str, Any],
+    envelope: dict[str, Any],
+    released_assets: list[dict[str, Any]],
+    pending_rights_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Write sanitized client-facing AI curation and media inventory JSON reports for Drive `Reports/`.
+
+    Never includes internal disk paths, tokens, or unverified binary paths.
+    Deterministic content (stable sorted JSON without volatile timestamps) ensures SHA-256
+    upload_keys stay idempotent across delivery retries.
+    """
+    reports_dir = job_dir / "delivery_reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    released_by_id = {a["asset_id"]: a for a in released_assets}
+    manifest_by_id = {
+        a.get("asset_id"): a for a in (manifest.get("assets") or []) if isinstance(a, dict) and a.get("asset_id")
+    }
+    curation_body = envelope.get("curation") if isinstance(envelope.get("curation"), dict) else {}
+    ai_env = envelope.get("ai_envelope") if isinstance(envelope.get("ai_envelope"), dict) else {}
+
+    best_images = []
+    for rec in curation_body.get("best_images") or []:
+        if not isinstance(rec, dict) or rec.get("asset_id") not in released_by_id:
+            continue
+        asset_info = released_by_id[rec["asset_id"]]
+        best_images.append({
+            "asset_id": rec["asset_id"],
+            "filename": asset_info["filename"],
+            "target_subfolder": asset_info["target_subfolder"],
+            "recommended_section": rec.get("recommended_section"),
+            "hero_rank": rec.get("hero_rank"),
+            "overall_score": rec.get("overall_score"),
+            "focal_point": rec.get("focal_point"),
+            "crop_guidance": rec.get("crop_guidance"),
+            "strengths": rec.get("strengths") or [],
+            "weaknesses": rec.get("weaknesses") or [],
+        })
+
+    best_videos = []
+    for rec in curation_body.get("best_videos") or []:
+        if not isinstance(rec, dict) or rec.get("asset_id") not in released_by_id:
+            continue
+        asset_info = released_by_id[rec["asset_id"]]
+        best_videos.append({
+            "asset_id": rec["asset_id"],
+            "filename": asset_info["filename"],
+            "target_subfolder": asset_info["target_subfolder"],
+            "recommended_section": rec.get("recommended_section"),
+            "overall_score": rec.get("overall_score"),
+            "best_thumbnail_frame_index": rec.get("best_thumbnail_frame_index"),
+            "strengths": rec.get("strengths") or [],
+            "weaknesses": rec.get("weaknesses") or [],
+        })
+
+    ai_report = {
+        "schema_version": "1.0-client-ai-report",
+        "job_id": job_id,
+        "folder_name": folder_name,
+        "prompt_version": ai_env.get("prompt_version"),
+        "prompt_sha256": ai_env.get("prompt_sha256"),
+        "include_undated_website": bool(ai_env.get("include_undated_website")),
+        "released_asset_count": len(released_assets),
+        "pending_rights_count": len(pending_rights_ids),
+        "released_asset_ids": [a["asset_id"] for a in released_assets],
+        "best_images": best_images,
+        "best_videos": best_videos,
+        "selection_summary": curation_body.get("selection_summary") or {},
+        "note": "Commercial use applies only to rights-verified assets listed in released_asset_ids.",
+    }
+
+    released_inventory = []
+    for a in released_assets:
+        src = manifest_by_id.get(a["asset_id"]) or {}
+        released_inventory.append({
+            "asset_id": a["asset_id"],
+            "filename": a["filename"],
+            "target_subfolder": a["target_subfolder"],
+            "platform": src.get("platform"),
+            "type": src.get("type"),
+            "mime": a["mime"],
+            "bytes": a["bytes"],
+            "sha256": a["sha256"],
+            "width": src.get("width"),
+            "height": src.get("height"),
+            "duration_sec": src.get("duration_sec"),
+            "published_at_utc": src.get("published_at_utc"),
+            "publication_date_source": src.get("publication_date_source"),
+            "source_url": a.get("source_url"),
+            "rights_status": a["rights_status"],
+            "rights_evidence_ref": a.get("rights_evidence_ref"),
+        })
+
+    inventory_report = {
+        "schema_version": "1.0-client-inventory-summary",
+        "job_id": job_id,
+        "folder_name": folder_name,
+        "website_url": manifest.get("website_url"),
+        "collection_window": manifest.get("collection_window") or {
+            "start_utc": manifest.get("window_start_utc"),
+            "end_utc": manifest.get("window_end_utc"),
+        },
+        "counts": manifest.get("counts"),
+        "coverage": manifest.get("coverage"),
+        "released_assets": released_inventory,
+        "pending_rights_count": len(pending_rights_ids),
+    }
+
+    specs = [
+        ("ai_curation_report", "ai-curation-report.json", ai_report),
+        ("media_inventory_summary", "media-inventory-summary.json", inventory_report),
+    ]
+    out: list[dict[str, Any]] = []
+    for report_id, filename, payload in specs:
+        rel = f"delivery_reports/{filename}"
+        disk = job_dir / rel
+        atomic_write_json(disk, payload)
+        raw = disk.read_bytes()
+        sha = hashlib.sha256(raw).hexdigest()
+        out.append({
+            "report_id": report_id,
+            "filename": filename,
+            "local_path": rel,
+            "n8n_path": "/data/media/" + job_id + "/" + rel,
+            "sha256": sha,
+            "bytes": len(raw),
+            "mime": "application/json",
+            "target_subfolder": "Reports",
+            "upload_key": f"report:{report_id}:{sha}",
+        })
+    return out
 
 
 def build_delivery_plan(
@@ -191,6 +336,7 @@ def build_delivery_plan(
         if safe_name is None:
             errors.append(f"unsupported delivery mime: {aid}")
             continue
+        mime = item.get("mime") or "application/octet-stream"
         assets.append({
             "asset_id": aid,
             "filename": safe_name,
@@ -198,7 +344,8 @@ def build_delivery_plan(
             "n8n_path": "/data/media/" + job_id + "/" + str(item["local_path"]),
             "sha256": sha,
             "bytes": len(data),
-            "mime": item.get("mime") or "application/octet-stream",
+            "mime": mime,
+            "target_subfolder": _target_subfolder_for_mime(mime),
             "source_url": item.get("source_url"),
             "rights_status": rights_status,
             "rights_review_required": False,
@@ -221,14 +368,40 @@ def build_delivery_plan(
     status = "ready" if assets and not errors else ("partial" if assets else "failed")
     if not assets and pending_rights:
         status = "blocked_rights_review"
+    folder_name = sanitize_folder_name(business_name or manifest.get("website_url", ""), job_id)
+
+    reports: list[dict[str, Any]] = []
+    pending_reports: list[dict[str, Any]] = []
+    uploaded_report_keys = [
+        u["upload_key"] for u in (existing_delivery.get("reports_uploaded") or [])
+        if u.get("upload_key") and u.get("status") == "uploaded" and u.get("drive_file_id")
+    ]
+    if status == "ready":
+        reports = _package_client_reports(
+            job_dir, job_id, folder_name, manifest, envelope, assets, pending_rights
+        )
+        pending_reports = [r for r in reports if r["upload_key"] not in uploaded_report_keys]
+
+    existing_subfolders = existing_delivery.get("subfolders")
+    subfolders: dict[str, str] = {}
+    if isinstance(existing_subfolders, dict):
+        for name in _ALLOWED_SUBFOLDERS:
+            val = existing_subfolders.get(name)
+            if isinstance(val, str) and val.strip():
+                subfolders[name] = val.strip()
+
     return {
         "status": status, "job_id": job_id,
-        "folder_name": sanitize_folder_name(business_name or manifest.get("website_url", ""), job_id),
+        "folder_name": folder_name,
         "visibility": "private",
         "public_sharing": False,
         "assets": assets, "errors": errors[:30],
         "pending_uploads": pending_uploads,
         "uploaded_keys": uploaded_keys,
+        "reports": reports,
+        "pending_reports": pending_reports,
+        "uploaded_report_keys": uploaded_report_keys,
+        "subfolders": subfolders,
         "drive_folder_id": existing_delivery.get("drive_folder_id"),
         "drive_folder_link": existing_delivery.get("drive_folder_link"),
         "pending_rights_ids": pending_rights,
@@ -246,6 +419,8 @@ def finalize_delivery(
     drive_folder_link: str | None = None,
     public_sharing: bool = False,
     visibility: str = "private",
+    report_uploads: list[dict[str, Any]] | None = None,
+    subfolders: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist delivery.json. Rights gating: without explicit authorization,
     no upload is recorded as an approved commercial release."""
@@ -263,13 +438,16 @@ def finalize_delivery(
     by_key = {a["upload_key"]: a for a in plan.get("assets", [])
               if a.get("rights_status") == "verified" and a.get("rights_review_required") is False}
     # Merge with any prior ledger so retries do not lose successful uploads.
-    existing_ledger = []
+    existing_doc: dict[str, Any] = {}
     existing_path = job_dir / "delivery.json"
     if existing_path.is_file():
         try:
-            existing_ledger = list((json.loads(existing_path.read_text(encoding="utf-8")) or {}).get("uploaded") or [])
+            loaded = json.loads(existing_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing_doc = loaded
         except (OSError, json.JSONDecodeError):
-            existing_ledger = []
+            existing_doc = {}
+    existing_ledger = list(existing_doc.get("uploaded") or [])
     by_upload = {row["upload_key"]: row for row in existing_ledger if row.get("upload_key")}
     for upload in uploads:
         key = str(upload.get("upload_key") or "")
@@ -282,6 +460,7 @@ def finalize_delivery(
         by_upload[key] = {
             "asset_id": asset["asset_id"], "upload_key": key,
             "filename": asset.get("filename"),
+            "target_subfolder": asset.get("target_subfolder"),
             "drive_file_id": upload.get("drive_file_id"),
             "drive_link": upload.get("drive_link"),
             "status": upload.get("status", "failed"),
@@ -294,18 +473,68 @@ def finalize_delivery(
         "completed" if len(ok) == len(plan.get("assets", [])) and ok and not plan.get("pending_rights_ids") else
         "partial_success" if ok else "failed"
     )
+
+    # Merge client report uploads (AI curation report + media inventory summary) idempotently.
+    report_by_key = {r["upload_key"]: r for r in (plan.get("reports") or []) if r.get("upload_key")}
+    existing_reports = list(existing_doc.get("reports_uploaded") or [])
+    by_report = {row["upload_key"]: row for row in existing_reports if row.get("upload_key")}
+    for ru in (report_uploads or []):
+        key = str(ru.get("upload_key") or "")
+        rep = report_by_key.get(key)
+        if rep is None:
+            continue
+        prev_r = by_report.get(key, {})
+        if prev_r.get("status") == "uploaded" and prev_r.get("drive_file_id"):
+            continue
+        by_report[key] = {
+            "report_id": rep["report_id"],
+            "upload_key": key,
+            "filename": rep["filename"],
+            "target_subfolder": rep.get("target_subfolder", "Reports"),
+            "drive_file_id": ru.get("drive_file_id"),
+            "drive_link": ru.get("drive_link"),
+            "status": ru.get("status", "failed"),
+            "error": ru.get("error"),
+            "sha256": rep["sha256"],
+        }
+    report_ledger = list(by_report.values())
+    reports_ok = [
+        r for r in report_ledger
+        if r["upload_key"] in report_by_key and r["status"] == "uploaded" and r["drive_file_id"]
+    ]
+    if not report_by_key:
+        reports_status = "none"
+    elif len(reports_ok) == len(report_by_key):
+        reports_status = "completed"
+    elif reports_ok:
+        reports_status = "partial_success"
+    else:
+        reports_status = "pending" if not report_uploads else "failed"
+
+    merged_subfolders: dict[str, str] = {}
+    for src_map in (existing_doc.get("subfolders"), plan.get("subfolders"), subfolders):
+        if isinstance(src_map, dict):
+            for name in _ALLOWED_SUBFOLDERS:
+                val = src_map.get(name)
+                if isinstance(val, str) and val.strip():
+                    merged_subfolders[name] = val.strip()
+
     result = {
-        "schema_version": "1.0-delivery", "job_id": plan.get("job_id"),
+        "schema_version": "1.1-delivery", "job_id": plan.get("job_id"),
         "status": status,
+        "reports_status": reports_status,
         "folder_name": plan.get("folder_name"),
         "visibility": "private",
         "public_sharing": False,
         "drive_folder_id": plan.get("drive_folder_id") or drive_folder_id,
         "drive_folder_link": plan.get("drive_folder_link") or drive_folder_link,
+        "subfolders": merged_subfolders,
         "authorization_confirmed": bool(authorization_confirmed),
         "uploaded": ledger,
+        "reports_uploaded": report_ledger,
         "pending_rights_ids": plan.get("pending_rights_ids", []),
         "errors": plan.get("errors", []),
+        "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "note": "Mock/fixture curation is never released as a customer deliverable. "
         "Commercial use requires explicit operator authorization.",
     }

@@ -1,23 +1,33 @@
-# Phase 1 Docker Compose: n8n + Python media worker.
+# Pet Grooming Media Intelligence — V2.1 Docker Compose
 #
 # Networking:
 #   Host browser:    http://localhost:5679 (n8n), http://localhost:8788 (worker)
+#                    http://localhost:3000 (optional dashboard via `--profile frontend`)
 #   n8n -> worker:   http://collector:8787  (Docker service DNS, NOT localhost)
 #
 # Storage:
-#   n8n persistent state -> n8n_media_data volume (NEW, separate from any existing n8n volume)
-#   shared media         -> D:/pgm-media-storage/jobs  (worker RW at /data/projects, n8n RO at /data/media)
+#   n8n persistent state -> n8n_media_data volume (isolated from legacy n8n volumes)
+#   shared media         -> ${MEDIA_STORAGE_DIR:-./storage/jobs}
+#                           (worker RW at /data/projects, n8n RO at /data/media)
 #
-# Ports deliberately avoid the occupied 5678 (existing n8n) and 8787 (local python).
-
-# Explicit project name: keeps containers, volume and network namespaced away
-# from every legacy project (website-builder-testing-*, pet-gromming-agent-factory-*).
+# Explicit project name keeps containers, volume and network isolated from legacy projects.
 name: pgm-media
+
+x-runtime: &runtime
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 services:
   n8n:
+    <<: *runtime
     image: ${N8N_IMAGE:?set N8N_IMAGE in .env}
-    restart: unless-stopped
     ports:
       - "127.0.0.1:5679:5678"
     environment:
@@ -25,23 +35,28 @@ services:
       - GENERIC_TIMEZONE=${GENERIC_TIMEZONE:-UTC}
       - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
       - N8N_RESTRICT_FILE_ACCESS_TO=/data/media
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=true
+      - N8N_PAYLOAD_SIZE_MAX=1
+      - N8N_FORMDATA_FILE_SIZE_MAX=1
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
       - N8N_HOST=localhost
       - N8N_PORT=5678
       - N8N_PROTOCOL=http
       - N8N_EDITOR_BASE_URL=http://127.0.0.1:5679
-      # NOTE: MEDIA_WORKER_TOKEN is intentionally NOT exposed to n8n here.
-      # n8n 2.x blocks $env access in expressions; the worker token lives in an
-      # n8n Credential ("Media Worker API Token", httpHeaderAuth) instead.
+      # NOTE: MEDIA_WORKER_TOKEN is intentionally NOT exposed to n8n.
+      # Worker auth lives in the n8n Credential ("Media Worker API Token", httpHeaderAuth).
     volumes:
       - n8n_media_data:/home/node/.n8n
-      - D:/pgm-media-storage/jobs:/data/media:ro
+      - ${MEDIA_STORAGE_DIR:-./storage/jobs}:/data/media:ro
+      - ./n8n-media:/opt/media-workflows:ro
     depends_on:
       collector:
         condition: service_healthy
     mem_limit: 1g
     mem_reservation: 384m
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz/readiness || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -50,21 +65,26 @@ services:
       - media-net
 
   collector:
+    <<: *runtime
     build:
       context: ./services/media-worker
       dockerfile: Dockerfile
-    restart: unless-stopped
     ports:
       - "127.0.0.1:8788:8787"
     environment:
       - PROJECTS_DIR=/data/projects
       - MEDIA_WORKER_TOKEN=${MEDIA_WORKER_TOKEN:?set MEDIA_WORKER_TOKEN in .env}
       - MEDIA_WORKER_DASHBOARD_TOKEN=${MEDIA_WORKER_DASHBOARD_TOKEN:-}
-      # Phase 5 AI: only these variables are forwarded to the worker.
-      # Secrets live in local .env / n8n credentials, never in the repo.
+      # V2.1 multi-tenant historical collector & M4 immutable approval/rights ledger
+      - COLLECTION_ENGINE=${COLLECTION_ENGINE:-historical}
+      - PUBLIC_COLLECTION_CHECKPOINTS=${PUBLIC_COLLECTION_CHECKPOINTS:-1}
+      - M4_COLLECTION_APPROVAL_ENABLED=${M4_COLLECTION_APPROVAL_ENABLED:-1}
+      - NAMED_ASSERTION_SECRET=${NAMED_ASSERTION_SECRET:-}
+      # AI Visual Director V2 (secrets live only in local .env, never in repo)
       - AI_PROVIDER=${AI_PROVIDER:-}
       - AI_MODEL=${AI_MODEL:-}
       - AI_ENDPOINT=${AI_ENDPOINT:-}
+      - AI_ALLOWED_ENDPOINTS=${AI_ALLOWED_ENDPOINTS:-}
       - AI_API_KEY=${AI_API_KEY:-}
       - AI_TIMEOUT_S=${AI_TIMEOUT_S:-120}
       - AI_MAX_RETRIES=${AI_MAX_RETRIES:-2}
@@ -72,6 +92,7 @@ services:
       - AI_MODE_A_MAX_OUTPUT_TOKENS=${AI_MODE_A_MAX_OUTPUT_TOKENS:-4000}
       - AI_MODE_B_MAX_OUTPUT_TOKENS=${AI_MODE_B_MAX_OUTPUT_TOKENS:-4000}
       - AI_BATCH_SIZE=${AI_BATCH_SIZE:-3}
+      - AI_MAX_IMAGES_PER_REQUEST=${AI_MAX_IMAGES_PER_REQUEST:-5}
       - AI_MAX_IMAGE_DIM=${AI_MAX_IMAGE_DIM:-512}
       - AI_MAX_IMAGE_BYTES=${AI_MAX_IMAGE_BYTES:-300000}
       - AI_MAX_REQUEST_BYTES=${AI_MAX_REQUEST_BYTES:-1000000}
@@ -81,14 +102,50 @@ services:
       - AI_PRICE_IN_PER_1K=${AI_PRICE_IN_PER_1K:-0}
       - AI_PRICE_OUT_PER_1K=${AI_PRICE_OUT_PER_1K:-0}
     volumes:
-      - D:/pgm-media-storage/jobs:/data/projects:rw
+      - ${MEDIA_STORAGE_DIR:-./storage/jobs}:/data/projects:rw
+      - ./docs/AI_VISUAL_DIRECTOR_V2.md:/srv/docs/AI_VISUAL_DIRECTOR_V2.md:ro
     mem_limit: 1g
     mem_reservation: 512m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/ready', timeout=3)"]
       interval: 15s
       timeout: 5s
       retries: 10
+      start_period: 20s
+    networks:
+      - media-net
+
+  dashboard:
+    <<: *runtime
+    profiles: ["frontend"]
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - DASHBOARD_ORIGIN=${DASHBOARD_ORIGIN:-http://localhost:3000}
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:-}
+      - DASHBOARD_SESSION_SECRET=${DASHBOARD_SESSION_SECRET:-}
+      - MEDIA_WORKER_DASHBOARD_TOKEN=${MEDIA_WORKER_DASHBOARD_TOKEN:-}
+      - NAMED_ASSERTION_SECRET=${NAMED_ASSERTION_SECRET:-}
+      - N8N_PIPELINE_TOKEN=${N8N_PIPELINE_TOKEN:-}
+      - N8N_ADMIN_WEBHOOK_TOKEN=${N8N_ADMIN_WEBHOOK_TOKEN:-}
+      - N8N_ADMIN_WEBHOOK_HEADER=${N8N_ADMIN_WEBHOOK_HEADER:-X-Admin-Key}
+      - GOOGLE_DRIVE_READY=${GOOGLE_DRIVE_READY:-0}
+      - WORKER_URL=http://collector:8787
+      - N8N_URL=http://n8n:5678
+    depends_on:
+      collector:
+        condition: service_healthy
+      n8n:
+        condition: service_healthy
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
       start_period: 20s
     networks:
       - media-net

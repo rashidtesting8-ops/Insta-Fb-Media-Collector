@@ -22,9 +22,23 @@ export default function Dashboard() {
   }
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    let active = true;
+    api<{ jobs: JobSummary[]; total: number }>("/api/jobs")
+      .then((data) => {
+        if (active) {
+          setError(null);
+          setJobs(data.jobs || []);
+        }
+      })
+      .catch((e: unknown) => {
+        if (active) setError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const total = jobs.length;

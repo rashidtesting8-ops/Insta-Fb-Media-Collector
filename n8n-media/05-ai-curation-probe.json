@@ -3,7 +3,8 @@
   "nodes": [
     {
       "parameters": {
-        "authentication": "headerAuth", "httpMethod": "GET",
+        "authentication": "headerAuth",
+        "httpMethod": "GET",
         "path": "ai-curation-probe",
         "responseMode": "responseNode",
         "options": {}
@@ -11,7 +12,7 @@
       "id": "a5000000-0000-4000-8000-000000000001",
       "name": "Curation Probe Webhook",
       "type": "n8n-nodes-base.webhook",
-      "credentials": {"httpHeaderAuth":{"name":"Media Admin Webhook Token"}},
+      "credentials": {"httpHeaderAuth": {"name": "Media Admin Webhook Token"}},
       "typeVersion": 2.1,
       "position": [240, 300],
       "webhookId": "b5500000-0000-4000-8000-000000000001"
@@ -34,38 +35,76 @@
       "name": "Extract Job ID",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
-      "position": [460, 300]
+      "position": [440, 300]
     },
     {
       "parameters": {
-        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "GET",
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+          "conditions": [
+            {
+              "id": "jid-valid",
+              "leftValue": "={{ /^[a-f0-9]{32}$/.test($json.job_id) }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a5000000-0000-4000-8000-000000000006",
+      "name": "Valid Job ID?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [620, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ error: 'Invalid job_id (expected 32 lowercase hex characters)' }) }}",
+        "options": {"responseCode": 400}
+      },
+      "id": "a5000000-0000-4000-8000-000000000007",
+      "name": "Respond Invalid Job ID",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [840, 480]
+    },
+    {
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "method": "GET",
         "url": "={{ 'http://collector:8787/jobs/' + $json.job_id }}",
         "options": {}
       },
       "id": "a5000000-0000-4000-8000-000000000003",
       "name": "Job Status (incl. ai_curation)",
       "type": "n8n-nodes-base.httpRequest",
-      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
+      "credentials": {"httpHeaderAuth": {"name": "Media Worker API Token"}},
       "typeVersion": 4.2,
-      "position": [680, 300]
+      "position": [840, 260]
     },
     {
       "parameters": {
-        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "method": "GET",
-        "url": "={{ 'http://collector:8787/jobs/' + $('Extract Job ID').item.json.job_id + '/curation' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "method": "GET",
+        "url": "={{ 'http://collector:8787/jobs/' + $('Extract Job ID').first().json.job_id + '/curation' }}",
         "options": {}
       },
       "id": "a5000000-0000-4000-8000-000000000004",
       "name": "Curation Result (JSON only, no binaries)",
       "type": "n8n-nodes-base.httpRequest",
-      "credentials": {"httpHeaderAuth":{"name":"Media Worker API Token"}},
+      "credentials": {"httpHeaderAuth": {"name": "Media Worker API Token"}},
       "typeVersion": 4.2,
-      "position": [900, 300]
+      "position": [1060, 260]
     },
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ job_id: $('Extract Job ID').item.json.job_id, job_status: $json.status || null, ai_curation: $('Job Status (incl. ai_curation)').item.json.ai_curation || null, curation_mode: ($json.curation && $json.curation.mode) || null, selected_count: ($json.curation && $json.curation.selected_asset_ids) ? $json.curation.selected_asset_ids.length : 0, rights_review_count: ($json.curation && $json.curation.rights_review_required_ids) ? $json.curation.rights_review_required_ids.length : 0 }) }}",
+        "responseBody": "={{ JSON.stringify({ job_id: $('Extract Job ID').first().json.job_id, job_status: $json.status || null, ai_curation: $('Job Status (incl. ai_curation)').first().json.ai_curation || null, curation_mode: ($json.curation && $json.curation.mode) || null, selected_count: ($json.curation && $json.curation.selected_asset_ids) ? $json.curation.selected_asset_ids.length : 0, rights_review_count: ($json.curation && $json.curation.rights_review_required_ids) ? $json.curation.rights_review_required_ids.length : 0 }) }}",
         "options": {
           "responseCode": 200
         }
@@ -74,7 +113,7 @@
       "name": "Respond With Curation Summary",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
-      "position": [1120, 300]
+      "position": [1280, 260]
     }
   ],
   "connections": {
@@ -82,7 +121,13 @@
       "main": [[{"node": "Extract Job ID", "type": "main", "index": 0}]]
     },
     "Extract Job ID": {
-      "main": [[{"node": "Job Status (incl. ai_curation)", "type": "main", "index": 0}]]
+      "main": [[{"node": "Valid Job ID?", "type": "main", "index": 0}]]
+    },
+    "Valid Job ID?": {
+      "main": [
+        [{"node": "Job Status (incl. ai_curation)", "type": "main", "index": 0}],
+        [{"node": "Respond Invalid Job ID", "type": "main", "index": 0}]
+      ]
     },
     "Job Status (incl. ai_curation)": {
       "main": [[{"node": "Curation Result (JSON only, no binaries)", "type": "main", "index": 0}]]

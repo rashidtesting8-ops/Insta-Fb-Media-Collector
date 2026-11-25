@@ -161,7 +161,16 @@ def check_inputs(raw, selected_ids=None):
 
 
 def retry_limit(configured):
-    return 0 if _current.get() is not None else configured
+    if configured <= 0:
+        return 0
+    return min(configured, 2) if _current.get() is not None else configured
+
+
+def can_retry_http(status_code: int) -> bool:
+    """Under fenced execution, retry only definitive non-billed 429 rate limits (never ambiguous 5xx/timeouts)."""
+    if _current.get() is None:
+        return status_code == 0 or status_code == 429 or (500 <= status_code < 600)
+    return status_code == 429
 
 
 def checkpoint_analysis(parsed, ids, model, secret, usage):
@@ -201,15 +210,18 @@ def require_transport():
 
 
 @contextmanager
-def attempt(mode, ids, reserve=None):
+def attempt(mode, ids, reserve=None, *, attempt_index: int = 0):
     run = _current.get()
     require(run, "Current job execution claim required")
     require(mode in ("A", "B") and set(ids) <= run.eligible, "Request outside authorized subset")
-    logical = sha256(json.dumps([mode, sorted(set(ids))]).encode()).hexdigest()
+    require(0 <= int(attempt_index) <= 29, "Retry cap exceeded")
+    logical_key = [mode, sorted(set(ids))] if attempt_index == 0 else [mode, sorted(set(ids)), int(attempt_index)]
+    logical = sha256(json.dumps(logical_key).encode()).hexdigest()
     with run.transaction() as con:
         run.check(con)
-        require(not con.execute("""SELECT 1 FROM ai_provider_attempts WHERE claim=? AND
-            (outcome!='returned' OR logical_request=? OR mode='B')""", (run.nonce, logical)).fetchone(),
+        require(not con.execute("""SELECT 1 FROM ai_provider_attempts WHERE claim=? AND (
+            outcome IN ('dispatching','ambiguous') OR logical_request=?
+        )""", (run.nonce, logical)).fetchone(),
                 "Previous attempt requires reconciliation or was already sent")
         if mode == "B":
             require(con.execute("SELECT 1 FROM ai_provider_attempts WHERE claim=? AND mode='A' AND outcome='returned'",

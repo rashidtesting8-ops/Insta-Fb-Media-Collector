@@ -2,7 +2,7 @@ name: tests
 
 on:
   push:
-    branches: [main, "chore/**"]
+    branches: [main, "stage4-*", "chore/**"]
   pull_request:
     branches: [main]
 
@@ -27,14 +27,32 @@ jobs:
       - run: npx tsc --noEmit
       - run: npm run test:integration
 
+  n8n-workflows:
+    name: n8n workflow contract & Drive v3 tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Run n8n workflow unit tests
+        run: >
+          node --test
+          n8n-media/canonical-qa-workflow.test.mjs
+          n8n-media/approval-qa-workflow.test.mjs
+          n8n-media/private-drive-delivery.test.mjs
+          n8n-media/sprint4-workflows.test.mjs
+      - name: Verify staging workflow sanitizer
+        run: node deploy/staging-workflow.mjs > /dev/null
+
   offline-pytest:
     name: Offline worker test suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ffmpeg (video preprocessing tests)
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install ffmpeg and libsodium (video preprocessing & Argon2id auth tests)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libsodium23
 
       - uses: actions/setup-python@v5
         with:
@@ -51,3 +69,41 @@ jobs:
         env:
           PYTHONPATH: services/media-worker
         run: python -m pytest services/media-worker/tests -q
+
+  compose-validate:
+    name: Validate Docker Compose manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose.media.yml
+        env:
+          N8N_IMAGE: n8nio/n8n:2.48.7
+          N8N_ENCRYPTION_KEY: ci-placeholder-encryption-key-not-real
+          MEDIA_WORKER_TOKEN: ci-placeholder-worker-token-not-real
+        run: docker compose -f compose.media.yml --profile frontend config --quiet
+      - name: Validate deploy/compose.staging.yml
+        env:
+          N8N_IMAGE: n8nio/n8n:2.48.7
+          CADDY_IMAGE: caddy:2.8-alpine
+          N8N_ENCRYPTION_KEY: ci-placeholder-encryption-key-not-real
+          MEDIA_WORKER_TOKEN: ci-placeholder-worker-token-not-real
+          MEDIA_WORKER_DASHBOARD_TOKEN: ci-placeholder-dashboard-token-not-real
+          STAGING_MEDIA_DIR: /tmp/staging-media
+          DASHBOARD_ORIGIN: https://staging.example.test
+          DASHBOARD_PASSWORD: ci-placeholder-password-not-real
+          DASHBOARD_SESSION_SECRET: ci-placeholder-session-secret-32bytes
+          N8N_PIPELINE_TOKEN: ci-placeholder-pipeline-token-not-real
+          STAGING_HOST: staging.example.test
+        run: docker compose -f deploy/compose.staging.yml config --quiet
+
+  secret-scan:
+    name: Gitleaks secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan repository working tree with gitleaks
+        run: >
+          docker run --rm
+          -v "${{ github.workspace }}:/repo:ro"
+          zricethezav/gitleaks:latest
+          dir /repo --no-banner --redact
