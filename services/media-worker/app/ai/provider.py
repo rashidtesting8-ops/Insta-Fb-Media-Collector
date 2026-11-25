@@ -600,7 +600,7 @@ class OpenAICompatibleProvider(VisionProvider):
             # json_mode support. Bounded cap large enough for a full batch.
             "response_format": {"type": "json_object"},
         }
-        if self.config.bounded_acceptance:
+        if self.config.bounded_acceptance or self.config.model == GROQ_ACCEPTANCE_MODEL:
             body["max_completion_tokens"] = max_output_tokens
             body["reasoning_effort"] = "none"
         else:
@@ -743,10 +743,12 @@ def build_provider(
         return None, "disabled"
     if config.provider == "mock":
         return MockVisionProvider(), "mock"
-    if config.provider == "openai_compatible":
-        if not config.endpoint or not config.model:
+    if config.provider in ("openai_compatible", "groq"):
+        endpoint = config.endpoint or (GROQ_ACCEPTANCE_ENDPOINT if config.provider == "groq" else "")
+        if not endpoint or not config.model or not config.api_key:
             return None, "provider_unavailable"
-        if not config.api_key:
-            return None, "provider_unavailable"
+        if endpoint != config.endpoint:
+            from dataclasses import replace
+            config = replace(config, endpoint=endpoint)
         return OpenAICompatibleProvider(config, sleep=sleep, transport=transport), "ready"
     return None, "provider_unavailable"

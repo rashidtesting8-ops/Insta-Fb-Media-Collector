@@ -24,7 +24,7 @@ This runbook defines the exact, reversible operator steps to cut over the live l
    - `M4_COLLECTION_APPROVAL_ENABLED=1`
    - `NAMED_ASSERTION_SECRET=<independent 32+ char secret>`
    - `MEDIA_WORKER_TOKEN=<admin token>` and `MEDIA_WORKER_DASHBOARD_TOKEN=<separate read token>`
-   - `AI_PROVIDER=groq`, `AI_MODEL=meta-llama/llama-4-scout-17b-16e-instruct`, `AI_ENDPOINT=https://api.groq.com/openai/v1/chat/completions`, `AI_API_KEY=<groq key>`, `AI_MAX_IMAGES_PER_REQUEST=5`
+   - `AI_PROVIDER=openai_compatible`, `AI_MODEL=qwen/qwen3.8-27b`, `AI_ENDPOINT=https://api.groq.com/openai/v1/chat/completions`, `AI_API_KEY=<groq key>`, `AI_BATCH_SIZE=1`, `AI_MAX_IMAGES_PER_REQUEST=3`, `AI_MAX_REQUESTS_PER_JOB=40`, `AI_MODE_A_MAX_OUTPUT_TOKENS=1200`, `AI_MODE_B_MAX_OUTPUT_TOKENS=1800`
    - `N8N_PIPELINE_TOKEN=<pipeline webhook token>` and `N8N_ADMIN_WEBHOOK_TOKEN=<separate admin webhook token>`
    - `GOOGLE_DRIVE_READY=1` (only after confirming Google Drive OAuth2 credential in n8n)
 4. Validate rendered Compose config without starting containers:
@@ -58,9 +58,9 @@ This runbook defines the exact, reversible operator steps to cut over the live l
    ```powershell
    docker exec pgm-media-collector-1 python -m app.collection_approval --migrate-db /data/projects/_system/jobs.sqlite
    ```
-2. Bootstrap the first Named Admin account (if not already provisioned):
+2. Bootstrap the first Named Admin account interactively (if not already provisioned):
    ```powershell
-   docker exec -it pgm-media-collector-1 python /srv/scripts/named_bootstrap.py
+   docker exec -it pgm-media-collector-1 python /srv/scripts/named_bootstrap.py --db /data/projects/_system/jobs.sqlite --verified-operator <your-operator-id>
    ```
 3. Sign in to the operator dashboard (`/login` -> **Named Admin**), open `/settings`, verify:
    - **Worker:** `OK` (`collection_engine: historical`, `M4 Approval & Rights Gate: Enabled`)

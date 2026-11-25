@@ -14,7 +14,6 @@ export default function Settings() {
   const [error, setError] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
   const [newPassword, setNewPassword] = useState("");
-  const [newRole, setNewRole] = useState<"admin" | "reviewer">("admin");
   const [adminStatus, setAdminStatus] = useState<{ ok: boolean; text: string } | null>(null);
   const [creating, setCreating] = useState(false);
 
@@ -54,7 +53,7 @@ export default function Settings() {
       const res = await fetch("/api/auth/named/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: newName.trim(), password: newPassword, role: newRole }),
+        body: JSON.stringify({ name: newName.trim(), password: newPassword }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -73,7 +72,7 @@ export default function Settings() {
       setNewPassword("");
       setAdminStatus({
         ok: true,
-        text: `Created ${newRole} account (${data.id || "recorded"}).`,
+        text: `Created Named Admin account (${data.principal_id || "recorded"}).`,
       });
     } catch {
       setAdminStatus({ ok: false, text: "Named Admin service unavailable." });
@@ -152,60 +151,49 @@ export default function Settings() {
       </div>
       <div className="rounded-lg border border-slate-200 bg-white p-4">
         <h2 className="mb-2 font-medium">Named Admin Accounts (Two-Admin Approval)</h2>
-        <p className="mb-4 text-xs text-slate-600">
-          M4 collection approval requires an independent Named Admin separate from the job submitter. Sign in as an
-          existing Named Admin to provision a second Admin or Reviewer account.
-        </p>
-        <form onSubmit={onCreateAdmin} className="max-w-md space-y-3 text-sm">
-          <label className="block">
-            Account name
-            <input
-              type="text"
-              required
-              minLength={2}
-              maxLength={64}
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              placeholder="reviewer-admin"
-              className="mt-1 block w-full rounded border border-slate-300 px-3 py-1.5"
-            />
-          </label>
-          <label className="block">
-            Password (min 12 chars)
-            <input
-              type="password"
-              required
-              minLength={12}
-              autoComplete="new-password"
-              value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
-              className="mt-1 block w-full rounded border border-slate-300 px-3 py-1.5"
-            />
-          </label>
-          <label className="block">
-            Role
-            <select
-              value={newRole}
-              onChange={(e) => setNewRole(e.target.value === "reviewer" ? "reviewer" : "admin")}
-              className="mt-1 block w-full rounded border border-slate-300 px-3 py-1.5"
+          <p className="mb-4 text-xs text-slate-600">
+            M4 collection approval requires an independent Named Admin separate from the job submitter. Sign in as an
+            existing Named Admin to provision a second Admin account.
+          </p>
+          <form onSubmit={onCreateAdmin} className="max-w-md space-y-3 text-sm">
+            <label className="block">
+              Account name
+              <input
+                type="text"
+                required
+                minLength={2}
+                maxLength={64}
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                placeholder="approver-admin"
+                className="mt-1 block w-full rounded border border-slate-300 px-3 py-1.5"
+              />
+            </label>
+            <label className="block">
+              Password (min 12 chars)
+              <input
+                type="password"
+                required
+                minLength={12}
+                autoComplete="new-password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                className="mt-1 block w-full rounded border border-slate-300 px-3 py-1.5"
+              />
+            </label>
+            {adminStatus && (
+              <p className={adminStatus.ok ? "text-green-700" : "text-red-600"} role="status">
+                {adminStatus.text}
+              </p>
+            )}
+            <button
+              type="submit"
+              disabled={creating}
+              className="rounded bg-blue-600 px-4 py-2 font-medium text-white hover:bg-blue-700 disabled:opacity-50"
             >
-              <option value="admin">Admin (can approve, start AI, verify rights, create accounts)</option>
-              <option value="reviewer">Reviewer (read-only named session)</option>
-            </select>
-          </label>
-          {adminStatus && (
-            <p className={adminStatus.ok ? "text-green-700" : "text-red-600"} role="status">
-              {adminStatus.text}
-            </p>
-          )}
-          <button
-            type="submit"
-            disabled={creating}
-            className="rounded bg-blue-600 px-4 py-2 font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-          >
-            {creating ? "Creating…" : "Create Named Account"}
-          </button>
-        </form>
+              {creating ? "Creating…" : "Create Named Admin"}
+            </button>
+          </form>
       </div>
     </div>
   );

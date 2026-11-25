@@ -222,12 +222,11 @@ def ready() -> JSONResponse:
 @app.get("/status")
 def status() -> object:
     """Authenticated worker status used by the n8n health probe and dashboard settings."""
-    provider = (os.environ.get("AI_PROVIDER") or "").strip().lower()
-    ai_configured = bool(
-        provider
-        and provider != "disabled"
-        and (provider == "mock" or (os.environ.get("AI_API_KEY") or "").strip())
-    )
+    from app.ai.provider import AIProviderConfig, build_provider
+
+    cfg = AIProviderConfig.from_env()
+    provider_obj, provider_status = build_provider(cfg)
+    ai_configured = provider_obj is not None and provider_status in ("ready", "mock")
     collection_engine = (
         "historical"
         if (
@@ -243,8 +242,8 @@ def status() -> object:
         "auth": "verified",
         "token_configured": True,
         "ai_configured": ai_configured,
-        "ai_provider": provider or None,
-        "ai_model": (os.environ.get("AI_MODEL") or "").strip() or None,
+        "ai_provider": cfg.provider or None,
+        "ai_model": cfg.model or None,
         "m4_approval_enabled": m4_approval_enabled(),
         "collection_engine": collection_engine,
     }
