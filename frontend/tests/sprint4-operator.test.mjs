@@ -321,3 +321,97 @@ test("JobDetailClient renders video player, filters raw frames, shows counts+cov
   assert.equal(JSON.parse(deliveryPost.opts.body).authorization_confirmed, true);
   unmount();
 });
+
+test("CollectionReview renders plain-English coverage summary and second-admin submitter guidance", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse({
+      job_id: ID,
+      revision: 2,
+      etag: ETAG,
+      state: "pending",
+      start_authorized: false,
+      window_start_utc: "2025-11-26T00:00:00+00:00",
+      window_end_utc: "2026-11-26T00:00:00+00:00",
+      manifest_sha256: "m".repeat(64),
+      eligible_subset_sha256: "s".repeat(64),
+      permissions: { approve: false, deny: true, revoke: false, start: false },
+      eligible_assets: ["fb_upload_01"],
+      inherited_assets: {},
+      sources: [
+        {
+          source: "website",
+          discovered: 4,
+          downloaded: 4,
+          unknown_date: 4,
+          out_of_window: 0,
+          missing_children: 0,
+          coverage: "unknown",
+          evidence: "independent inventory unavailable",
+          outcomes: ["page_budget", "third_party_video_embed"],
+        },
+        {
+          source: "facebook",
+          discovered: 5,
+          downloaded: 2,
+          unknown_date: 0,
+          out_of_window: 0,
+          missing_children: 0,
+          coverage: "unknown",
+          evidence: "independent inventory unavailable",
+          outcomes: ["robots_disallowed", "owner_media_uploaded"],
+        },
+      ],
+      history: [],
+    });
+
+  const { container, unmount } = render(React.createElement(CollectionReview, { id: ID }));
+  await waitFor(() => assert.ok(container.textContent.includes("Independent Second Admin Required")), { timeout: 2000 });
+  assert.ok(container.textContent.includes("Facebook CDN blocked automated downloads (robots.txt)"));
+  assert.ok(container.textContent.includes("Client Facebook media uploaded"));
+  assert.ok(container.textContent.includes("External YouTube/Vimeo video embed detected"));
+  assert.ok(container.textContent.includes("Scan limit reached"));
+  unmount();
+});
+
+test("JobDetailClient renders robots.txt blocked Facebook card and 60-second client export guide", async () => {
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u === `/api/jobs/${ID}`) {
+      return jsonResponse({
+        job_id: ID,
+        status: "partial_success",
+        collection_mode: "public_checkpoint",
+        website_url: "https://www.lilys-club.co.uk/",
+      });
+    }
+    if (u === `/api/jobs/${ID}/status`) {
+      return jsonResponse({ job_id: ID, stage: "partial_success", terminal: true, job_status: "partial_success", detail: "Review needed" });
+    }
+    if (u === `/api/jobs/${ID}/manifest`) {
+      return jsonResponse({
+        job_id: ID,
+        assets: [
+          {
+            asset_id: "fb_blocked_2",
+            platform: "facebook",
+            type: "image",
+            extraction_status: "pending",
+            failure_reason: "robots_disallowed",
+            local_path: null,
+          },
+        ],
+      });
+    }
+    if (u === `/api/jobs/${ID}/curation`) return jsonResponse({ error: "none" }, 404);
+    if (u === `/api/jobs/${ID}/delivery`) return jsonResponse({ error: "none" }, 404);
+    if (u === `/api/jobs/${ID}/rights`) return jsonResponse({ error: "none" }, 404);
+    return jsonResponse({ error: "none" }, 409);
+  };
+
+  const { container, unmount } = render(React.createElement(JobDetailClient, { id: ID }));
+  await waitFor(() => assert.ok(container.textContent.includes("robots.txt blocked")), { timeout: 2000 });
+  assert.ok(container.textContent.includes("Blocked by platform robots.txt policy"));
+  assert.ok(container.textContent.includes("60-second export guide"));
+  assert.ok(container.textContent.includes("Copy WhatsApp / Email instructions for client"));
+  unmount();
+});

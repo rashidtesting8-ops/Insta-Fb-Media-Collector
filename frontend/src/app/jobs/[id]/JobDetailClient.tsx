@@ -206,6 +206,7 @@ export default function JobDetailClient({ id }: { id: string }) {
   const [uploadDate, setUploadDate] = useState("");
   const [uploadingMedia, setUploadingMedia] = useState(false);
   const [uploadMessage, setUploadMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  const [copiedClientGuide, setCopiedClientGuide] = useState(false);
 
   const triggerRefresh = useCallback(() => {
     setRefreshTick((t) => t + 1);
@@ -469,6 +470,22 @@ export default function JobDetailClient({ id }: { id: string }) {
       void navigator.clipboard.writeText(id);
       setCopiedId(true);
       setTimeout(() => setCopiedId(false), 1800);
+    }
+  }
+
+  function copyClientExportMessage() {
+    const name = defaultBusinessName(job, delivery);
+    const msg =
+      `Hi! To include your best Facebook photos & videos from the past 12 months for ${name} ` +
+      `without needing your login password, please export a quick Facebook Page ZIP:\n` +
+      `1. Open Facebook → Settings & Privacy → Settings → Accounts Center → Your information and permissions\n` +
+      `2. Click "Download your information" → select your Business Page → choose "Posts" (Photos & Videos)\n` +
+      `3. Set Date range = "Last year" and Format = "JSON"\n` +
+      `4. Click Create file and send us the .zip file (or send your favorite grooming photos/videos directly).`;
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      void navigator.clipboard.writeText(msg);
+      setCopiedClientGuide(true);
+      setTimeout(() => setCopiedClientGuide(false), 2200);
     }
   }
 
@@ -776,6 +793,34 @@ export default function JobDetailClient({ id }: { id: string }) {
                 {uploadMessage.text}
               </p>
             )}
+            <details className="rounded-xl border border-[#E5DDD2] bg-white/90 px-3.5 py-2.5 text-[#544B43]">
+              <summary className="cursor-pointer font-semibold text-[#181614]">
+                Need the client&apos;s Facebook photos? 60-second export guide &amp; copyable client message
+              </summary>
+              <div className="mt-2.5 space-y-2 text-[11px] leading-relaxed">
+                <ol className="list-decimal space-y-1 pl-4">
+                  <li>
+                    In Facebook, open <strong>Settings &amp; Privacy → Settings → Accounts Center → Your information and permissions</strong>.
+                  </li>
+                  <li>
+                    Choose <strong>Download your information</strong>, pick the salon&apos;s <strong>Facebook Page</strong>, and select <strong>Posts</strong> (photos &amp; videos).
+                  </li>
+                  <li>
+                    Select <strong>Date range: Last year</strong> and <strong>Format: JSON</strong> (so original post dates are read automatically).
+                  </li>
+                  <li>
+                    Download the <code>.zip</code> archive and upload it above (up to 60 photos &amp; videos in one upload).
+                  </li>
+                </ol>
+                <button
+                  type="button"
+                  onClick={copyClientExportMessage}
+                  className="studio-btn-secondary py-1.5 text-[11px]"
+                >
+                  {copiedClientGuide ? "Copied client message!" : "Copy WhatsApp / Email instructions for client"}
+                </button>
+              </div>
+            </details>
           </form>
         )}
 
@@ -946,11 +991,13 @@ export default function JobDetailClient({ id }: { id: string }) {
                           <div className="flex h-full w-full flex-col items-center justify-center p-4 text-center text-[#7A7168]">
                             <span className="text-xs font-semibold text-[#544B43]">No local binary</span>
                             <span className="mt-1 rounded-full bg-white px-2.5 py-0.5 font-mono text-[10px] ring-1 ring-[#E4DCD1]">
-                              {a.extraction_status || "metadata_only"}
+                              {a.failure_reason === "robots_disallowed"
+                                ? "robots.txt blocked"
+                                : a.extraction_status || "metadata_only"}
                             </span>
                             {a.failure_reason === "robots_disallowed" && (
                               <span className="mt-1.5 text-[11px] leading-snug text-[#7A7168]">
-                                Blocked by platform robots.txt policy
+                                Blocked by platform robots.txt policy · Use Client Facebook Upload above
                               </span>
                             )}
                             {a.failure_reason && a.failure_reason !== "robots_disallowed" && (
