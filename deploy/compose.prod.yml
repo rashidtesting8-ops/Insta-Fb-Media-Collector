@@ -1,0 +1,41 @@
+# Pet Grooming Media Intelligence — Public HTTPS Production Compose Override
+#
+# Layer on top of deploy/compose.staging.yml on a hardened Linux VPS:
+#   docker compose --env-file .env.prod -f deploy/compose.staging.yml -f deploy/compose.prod.yml config --quiet
+#   docker compose --env-file .env.prod -f deploy/compose.staging.yml -f deploy/compose.prod.yml up -d --build
+#
+# Security guarantees:
+#   - ONLY the Caddy `https` service publishes public ports (80 & 443) using Caddyfile.prod
+#     (Let's Encrypt TLS, HSTS, security headers, /setup-admin blocked with 404, 105MB cap on uploads only).
+#   - `collector` and `dashboard` stay strictly on internal Docker networks (zero host ports).
+#   - `n8n` stays bound to loopback `127.0.0.1:${STAGING_N8N_ADMIN_PORT:-5680}:5678` (access via SSH tunnel only).
+#   - Production-critical secrets (`NAMED_ASSERTION_SECRET`, `N8N_ADMIN_WEBHOOK_TOKEN`, `ACME_EMAIL`, `AI_API_KEY`)
+#     fail closed if omitted from `.env.prod`.
+
+name: pgm-media-prod
+
+services:
+  collector:
+    mem_limit: 2g
+    environment:
+      NAMED_ASSERTION_SECRET: ${NAMED_ASSERTION_SECRET:?set a 32+ byte random named assertion secret}
+      AI_PROVIDER: ${AI_PROVIDER:-openai_compatible}
+      AI_MODEL: ${AI_MODEL:-qwen/qwen3.8-27b}
+      AI_ENDPOINT: ${AI_ENDPOINT:-https://api.groq.com/openai/v1/chat/completions}
+      AI_API_KEY: ${AI_API_KEY:?set the production Groq API key}
+
+  dashboard:
+    environment:
+      NAMED_ASSERTION_SECRET: ${NAMED_ASSERTION_SECRET:?set a 32+ byte random named assertion secret}
+      N8N_ADMIN_WEBHOOK_TOKEN: ${N8N_ADMIN_WEBHOOK_TOKEN:?set the production n8n admin webhook token}
+
+  https:
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:?set the ACME TLS certificate contact email}
+    ports: !override
+      - "80:80"
+      - "443:443"
+    volumes: !override
+      - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      - caddy_state:/data
+      - caddy_config:/config

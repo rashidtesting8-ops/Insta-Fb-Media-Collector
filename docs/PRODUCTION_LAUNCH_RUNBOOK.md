@@ -1,158 +1,148 @@
 # Pet Grooming Media Intelligence — Public Production Launch Runbook
 
-This runbook covers Priority 3 of the post-pilot launch plan: hosting the hardened V2.1 stack behind public HTTPS, running automated daily WAL-consistent SQLite backups with restore verification, monitoring service readiness, provisioning isolated production Google Drive OAuth, and rotating all secrets cleanly.
+This runbook covers **Milestone P4 (Public HTTPS VPS Deployment & Production Operations Hardening)** for the 100% open-source V2.1 stack (no Meta Graph API): hosting behind public HTTPS via Caddy 2, running fail-closed pre-flight security validation, scheduling daily online WAL-consistent SQLite backups with SHA-256 restore drills, monitoring service readiness & disk pressure, provisioning isolated production Google Drive OAuth, and rotating all secrets cleanly.
 
 > [!IMPORTANT]
-> Never reuse localhost pilot credentials, local `.env` secrets, or the `Google Drive – Local Test` OAuth credential in production. Keep `.env` outside Git at all times.
+> Never reuse localhost pilot credentials, local `.env` secrets, or the `Google Drive – Local Test` OAuth credential in production. Keep `.env.prod` strictly outside Git with `chmod 600`.
 
 ---
 
-## 1. Public HTTPS Deployment (Caddy 2 + `deploy/compose.staging.yml`)
+## 1. Fresh Ubuntu 24.04 VPS Bootstrap (10-Minute Rollout)
 
-The hardened Compose stack in [`deploy/compose.staging.yml`](../deploy/compose.staging.yml) isolates `collector` and `n8n` on an internal `worker` network and exposes only the `dashboard` through the `https` Caddy reverse proxy on `edge`.
+1. Provision an Ubuntu 24.04 LTS VPS (`>= 2 vCPU, 4 GB RAM, 40+ GB SSD` — use `4+ GB RAM` if enabling optional Playwright Chromium fallback) and point your DNS `A` record for `app.yourdomain.com` to the VPS public IP.
+2. Install Docker Engine + Docker Compose v2 plugin and clone this repository on the VPS.
+3. Run the idempotent VPS bootstrap helper (preview first with `--dry-run`):
+   ```bash
+   sudo bash deploy/vps-bootstrap.sh --dry-run --domain app.yourdomain.com
+   sudo bash deploy/vps-bootstrap.sh --domain app.yourdomain.com --alert-webhook https://your-alert-webhook.example/hook
+   ```
+   This configures UFW (`22/tcp`, `80/tcp`, `443/tcp` ONLY), creates `/srv/pgm-media-prod/jobs` (`chmod 750`), writes `/etc/pgm-media/ops.env` (`chmod 600`), and enables `pgm-backup.timer` (daily `02:15 UTC`) and `pgm-readiness.timer` (every 2 minutes).
 
-### Required Production Environment Settings (in host-only `.env.prod`, `chmod 600`)
-- **Canonical HTTPS Origin & Hostname:**
-  - `STAGING_HOST=app.yourdomain.com` *(hostname without scheme or port)*
-  - `DASHBOARD_ORIGIN=https://app.yourdomain.com` *(automatically enables `__Host-` `Secure` cookies and permanently disables `/setup-admin` inside Next.js)*
-  - `ACME_EMAIL=ops@yourdomain.com`
-  - `CADDYFILE_PATH=./Caddyfile.prod`
-- **Pinned Images:**
-  - `N8N_IMAGE=n8nio/n8n:2.48.7`
-  - `CADDY_IMAGE=caddy:2.8-alpine`
-- **Isolated Production Storage:**
-  - `STAGING_MEDIA_DIR=/srv/pgm-media-prod/jobs` *(fresh dedicated volume/disk with monitoring for disk pressure)*
-- **Security & M4 Separation (all independent 32+ byte random secrets):**
-  - `COLLECTION_ENGINE=historical`
-  - `PUBLIC_COLLECTION_CHECKPOINTS=1`
-  - `M4_COLLECTION_APPROVAL_ENABLED=1`
-  - `MEDIA_WORKER_TOKEN`, `MEDIA_WORKER_DASHBOARD_TOKEN`, `NAMED_ASSERTION_SECRET`, `DASHBOARD_PASSWORD`, `DASHBOARD_SESSION_SECRET`, `N8N_PIPELINE_TOKEN`, `N8N_ADMIN_WEBHOOK_TOKEN`, `N8N_ENCRYPTION_KEY`
-- **AI Budget & Rate-Limit Controls:**
-  - For Groq `on_demand` (`1,000` OTPM / `8,000` TPM): keep `AI_MODE_A_MAX_OUTPUT_TOKENS=850`, `AI_MODE_B_MAX_OUTPUT_TOKENS=950`, `AI_BATCH_SIZE=1`, `AI_MAX_IMAGES_PER_REQUEST=1`, `AI_MIN_REQUEST_SPACING_S=5`, `AI_MAX_RETRIES=3`.
-  - After upgrading to Groq Developer Tier: see [`docs/V2_2_META_GRAPH_API_PLAN.md`](./V2_2_META_GRAPH_API_PLAN.md) for safe production throughput tuning.
+---
 
-### Publishing Ports 80 & 443 Safely
-By default, `deploy/compose.staging.yml` binds `https` to loopback `127.0.0.1:8443:443` so staging is never accidentally public. For public production hosting on a hardened Linux VPS, use a small host-local override file (e.g., `compose.prod.override.yml`) publishing `80:80` and `443:443` on `https` ONLY (never expose `collector:8787`, `dashboard:3000`, or `n8n:5678` publicly; access n8n admin strictly via SSH tunnel to `127.0.0.1:5680`):
+## 2. Production Configuration & Fail-Closed Pre-Flight Check
 
-```yaml
-services:
-  https:
-    ports: !override
-      - "80:80"
-      - "443:443"
-```
-
-Validate before starting:
-```bash
-docker compose --env-file .env.prod -f deploy/compose.staging.yml -f compose.prod.override.yml config --quiet
-docker compose --env-file .env.prod -f deploy/compose.staging.yml -f compose.prod.override.yml up -d --build
-```
-
-### Production Admin Provisioning (No Browser Bootstrap)
-Because `DASHBOARD_ORIGIN=https://...` AND [`deploy/Caddyfile.prod`](../deploy/Caddyfile.prod) both block `/setup-admin*` (`404`), bootstrap the first Named Admin exclusively via authenticated server SSH + CLI:
+Create host-only `.env.prod` from [`deploy/.env.prod.example`](../deploy/.env.prod.example):
 
 ```bash
-docker exec pgm-media-staging-collector-1 python -m app.collection_approval --migrate-db /data/projects/_system/jobs.sqlite
-docker exec -it pgm-media-staging-collector-1 python /srv/scripts/named_bootstrap.py \
+cp deploy/.env.prod.example .env.prod
+chmod 600 .env.prod
+# Generate 8 independent 32+ byte secrets (never reuse across keys!):
+for i in 1 2 3 4 5 6 7 8; do openssl rand -hex 32; done
+```
+
+Key production settings:
+- **Public HTTPS & Edge Security:** `STAGING_HOST=app.yourdomain.com`, `DASHBOARD_ORIGIN=https://app.yourdomain.com`, `ACME_EMAIL=ops@yourdomain.com`, `CADDYFILE_PATH=./Caddyfile.prod` (auto-enables `__Host-` `Secure` cookies and blocks `/setup-admin*` at both Caddy and Next.js with `404`).
+- **AI Throughput Preset (`AI_TIER_PRESET`):**
+  - Keep `AI_TIER_PRESET=on_demand` while on Groq Free / On-Demand OTPM limits (`batch=1`, `mode_b=950`, `spacing=5s`, `cap=$0.25`).
+  - Switch to `AI_TIER_PRESET=dev` once your Groq account is upgraded to Developer Tier (`batch=3`, `mode_b=3500`, `spacing=0.5s`, `max_requests=60`, `cap=$1.50`). Leave the 7 individual `AI_*` override vars blank so `AI_TIER_PRESET` controls them cleanly.
+- **Optional Playwright JS Fallback:** Set both `INSTALL_PLAYWRIGHT=1` and `PLAYWRIGHT_FALLBACK_ENABLED=1` only if you want SSRF-hardened Chromium fallback for heavily JS-rendered Wix/React salon galleries.
+
+Validate Compose + run the fail-closed pre-flight security audit BEFORE launching:
+
+```bash
+docker compose --env-file .env.prod -f deploy/compose.staging.yml -f deploy/compose.prod.yml config --quiet
+docker compose --env-file .env.prod -f deploy/compose.staging.yml -f deploy/compose.prod.yml build
+
+docker run --rm \
+  -v "$PWD/.env.prod:/tmp/.env.prod:ro" \
+  -v "/srv/pgm-media-prod/jobs:/srv/pgm-media-prod/jobs:rw" \
+  pgm-media-prod-collector \
+  python /srv/scripts/prod_preflight.py --env-file /tmp/.env.prod --check-host --max-disk-pct 80
+```
+
+Launch production containers (ONLY Caddy publishes `80` and `443`; `collector`, `dashboard` stay on internal networks; `n8n` binds strictly to `127.0.0.1:5680`):
+
+```bash
+docker compose --env-file .env.prod -f deploy/compose.staging.yml -f deploy/compose.prod.yml up -d
+```
+
+---
+
+## 3. Production Admin Provisioning (No Browser Bootstrap)
+
+Because `DASHBOARD_ORIGIN=https://...` AND [`deploy/Caddyfile.prod`](../deploy/Caddyfile.prod) both block `/setup-admin*` (`404`), bootstrap Admin #1 exclusively over SSH:
+
+```bash
+docker exec pgm-media-prod-collector-1 python -m app.collection_approval --migrate-db /data/projects/_system/jobs.sqlite
+docker exec -it pgm-media-prod-collector-1 python /srv/scripts/named_bootstrap.py \
   --db /data/projects/_system/jobs.sqlite --verified-operator <admin1-operator-id>
 ```
 
-Then sign in as Admin #1 over HTTPS (`https://app.yourdomain.com/login` -> **Named Admin**) and create Admin #2 in `/settings` so independent two-admin approval separation is active from day one.
+Then sign in as Admin #1 at `https://app.yourdomain.com/login` (**Named Admin**) and create Admin #2 in `/settings` so independent two-admin approval separation is active from day one.
 
 ---
 
-## 2. Automated Daily WAL-Consistent SQLite Backups & Off-Host Sync
+## 4. Automated Daily WAL-Consistent SQLite Backups & Restore Drills
 
-Never use raw `cp`, `rsync`, or `Copy-Item` on a live WAL-mode SQLite file. Use [`services/media-worker/scripts/sqlite_backup.py`](../services/media-worker/scripts/sqlite_backup.py), which uses Python's `sqlite3.Connection.backup()` API, validates `PRAGMA integrity_check == "ok"`, generates a `.sha256` sidecar, and prunes old backups cleanly.
+Never use raw `cp`, `rsync`, or `Copy-Item` on a live WAL-mode SQLite database. [`services/media-worker/scripts/sqlite_backup.py`](../services/media-worker/scripts/sqlite_backup.py) uses `sqlite3.Connection.backup()`, validates `PRAGMA integrity_check == "ok"`, writes a `.sha256` sidecar, and retains the newest 14 copies.
 
-### Manual Test & Verification
+Systemd timer [`deploy/systemd/pgm-backup.timer`](../deploy/systemd/pgm-backup.timer) runs daily at `02:15 UTC`. For off-host encrypted backups, configure `rclone` and uncomment `ExecStartPost` in [`deploy/systemd/pgm-backup.service`](../deploy/systemd/pgm-backup.service).
+
+### Manual Backup & Monthly Restore Verification Drill
 ```bash
-# 1. Create a WAL-consistent verified backup (retains 14 newest copies)
-docker exec pgm-media-staging-collector-1 python /srv/scripts/sqlite_backup.py \
+# 1. Create a WAL-consistent verified backup
+docker exec pgm-media-prod-collector-1 python /srv/scripts/sqlite_backup.py \
   --db /data/projects/_system/jobs.sqlite \
   --out-dir /data/projects/_system/backups \
   --keep 14
 
-# 2. Verify backup integrity + SHA-256 checksum
-docker exec pgm-media-staging-collector-1 python /srv/scripts/sqlite_backup.py \
+# 2. Verify SHA-256 + SQLite PRAGMA integrity_check + table counts
+docker exec pgm-media-prod-collector-1 python /srv/scripts/sqlite_backup.py \
   --verify /data/projects/_system/backups/<filename>.bak
 ```
 
-### Linux Daily Cron Example (`/etc/cron.d/pgm-sqlite-backup`)
-```cron
-# Run daily at 02:15 UTC, then sync encrypted backups off-host (e.g., rclone/S3/B2)
-15 2 * * * root docker exec pgm-media-staging-collector-1 python /srv/scripts/sqlite_backup.py --db /data/projects/_system/jobs.sqlite --out-dir /data/projects/_system/backups --keep 14 >> /var/log/pgm-backup.log 2>&1 && rclone sync /srv/pgm-media-prod/jobs/_system/backups remote-encrypted:pgm-prod-backups/sqlite >> /var/log/pgm-backup.log 2>&1
-```
-
-### Windows Task Scheduler Equivalent (Local Host Pilot / Staging)
-```powershell
-docker exec pgm-media-collector-1 python /srv/scripts/sqlite_backup.py --db /data/projects/_system/jobs.sqlite --out-dir /data/projects/_system/backups --keep 14
-```
-
-### Monthly Restore Drill
-1. Download the newest off-host `.bak` and `.bak.sha256` to a temporary directory.
-2. Run `python services/media-worker/scripts/sqlite_backup.py --verify /tmp/restore-test/<file>.bak`.
-3. Confirm exit code `0`, `integrity_check: "ok"`, `sha256_verified: true`, and non-zero expected `table_counts` (`jobs`, `named_accounts`, `collection_approvals`, `asset_rights_decisions`).
+Confirm exit code `0`, `integrity_check: "ok"`, `sha256_verified: true`, and expected row counts (`jobs`, `named_accounts`, `collection_approvals`, `asset_rights_decisions`).
 
 ---
 
-## 3. Uptime & Readiness Monitoring
+## 5. Readiness, Disk-Pressure & Alert Monitoring
 
-Use [`services/media-worker/scripts/readiness_probe.py`](../services/media-worker/scripts/readiness_probe.py) from cron, systemd timer, or an external monitor (returns exit `0` when all services report ready, `1` if any endpoint is degraded or unreachable):
+Systemd timer [`deploy/systemd/pgm-readiness.timer`](../deploy/systemd/pgm-readiness.timer) runs [`services/media-worker/scripts/readiness_probe.py`](../services/media-worker/scripts/readiness_probe.py) every 2 minutes across:
+- Collector `/ready`
+- n8n `/healthz/readiness`
+- Public HTTPS Dashboard `https://app.yourdomain.com/api/ready`
+- Host storage disk pressure (`/data/projects` fails closed at `>= 80%` used)
+- Optional sanitized HTTPS alert webhook (`ALERT_WEBHOOK_URL` in `/etc/pgm-media/ops.env`) firing **only** when readiness or disk status degrades.
 
+Verify live status anytime:
 ```bash
-# Localhost / host-network probe
-python services/media-worker/scripts/readiness_probe.py \
-  --worker-url http://127.0.0.1:8788/ready \
-  --n8n-url http://127.0.0.1:5679/healthz/readiness \
-  --dashboard-url http://127.0.0.1:3000/api/ready \
-  --timeout 5
-
-# Production edge HTTPS probe (plus internal collector/n8n checks via container network)
-python services/media-worker/scripts/readiness_probe.py \
-  --worker-url "" \
-  --n8n-url "" \
-  --dashboard-url https://app.yourdomain.com/api/ready \
-  --timeout 5
+sudo systemctl status pgm-readiness.timer pgm-backup.timer
+sudo journalctl -u pgm-readiness.service -n 20 --no-pager
 ```
 
-Recommended alert thresholds:
-- Alert immediately on 2 consecutive probe failures (2-minute interval).
-- Alert when host disk usage on `STAGING_MEDIA_DIR` exceeds `80%`.
-- Alert when daily Groq spend approaches the operator budget threshold.
-
 ---
 
-## 4. Production Google Drive OAuth & Secret Rotation Checklist
+## 6. Production Google Drive OAuth & Secret Rotation
 
-### Separate Production Google Drive OAuth
-1. Create a dedicated Google Cloud project / OAuth2 client (**Production**) — do **not** reuse the `Google Drive – Local Test` credential from localhost testing.
-2. Restrict OAuth scopes strictly to Google Drive file creation/upload (`drive.file` or scoped Drive folder management as required by n8n Drive v3 nodes).
-3. Configure the authorized redirect URI for your production n8n instance (`https://<n8n-admin-tunnel-or-domain>/rest/oauth2-credential/callback`).
-4. Inside production n8n, bind ONLY the two active V2.1 production workflows:
-   - `07-pipeline-orchestration.json` (`pgmPipeV21Orch07`)
-   - `06-google-drive-delivery.json` (`pgmDriveV21Deliv`)
+### Isolated Production Google Drive OAuth (via SSH Tunnel to n8n)
+1. Never expose n8n publicly. Access production n8n admin strictly via SSH port forward:
+   `ssh -L 5680:127.0.0.1:5680 ops@<vps-ip>` → open `http://127.0.0.1:5680`.
+2. Create a dedicated Google Cloud project / OAuth2 client (**Production**) — never reuse localhost test credentials.
+3. Import and activate ONLY the two V2.1 production workflows:
+   - `n8n-media/07-pipeline-orchestration.json` (`pgmPipeV21Orch07`)
+   - `n8n-media/06-google-drive-delivery.json` (`pgmDriveV21Deliv`)
    - Keep `00-health-probe.json` and `05-ai-curation-probe.json` **unpublished**.
-5. Confirm `GOOGLE_DRIVE_READY=1` only after verifying a real private folder write + `public_sharing: false` check.
+4. Flip `GOOGLE_DRIVE_READY=1` in `.env.prod` and recreate `dashboard` only after verifying 1 real private folder write (`public_sharing: false`).
 
-### Secret Rotation Order (Zero Data Loss)
-Generate fresh 32+ byte random tokens (`openssl rand -hex 32`) before public launch and rotate every 90 days:
-1. **`MEDIA_WORKER_TOKEN`** — update `.env.prod`, recreate `collector`, and update n8n `Media Worker API Token` credential.
-2. **`MEDIA_WORKER_DASHBOARD_TOKEN`** — update `.env.prod`, recreate `collector` and `dashboard`.
-3. **`N8N_PIPELINE_TOKEN` & `N8N_ADMIN_WEBHOOK_TOKEN`** — update `.env.prod`, recreate `dashboard`, and update corresponding n8n Header Auth credentials (`X-Pipeline-Key`, `X-Admin-Key`).
-4. **`NAMED_ASSERTION_SECRET` & `DASHBOARD_SESSION_SECRET`** — update `.env.prod`, recreate `collector` and `dashboard` (existing browser sessions cleanly re-login).
-5. **`AI_API_KEY`** — provision a dedicated production Groq key with monthly spend cap, update `.env.prod`, recreate `collector`, and revoke the old key.
-6. **`N8N_ENCRYPTION_KEY`** — **WARNING:** rotating `N8N_ENCRYPTION_KEY` invalidates stored n8n credentials unless you first export/re-import credentials or re-enter them in the production n8n instance. Always generate a brand-new `N8N_ENCRYPTION_KEY` when provisioning a fresh production instance, and back it up in an encrypted password manager / vault (never Git).
+### 90-Day Secret Rotation Order (Zero Data Loss)
+Generate fresh 32+ byte random tokens (`openssl rand -hex 32`):
+1. `MEDIA_WORKER_TOKEN` → update `.env.prod`, recreate `collector`, update n8n `Media Worker API Token` credential.
+2. `MEDIA_WORKER_DASHBOARD_TOKEN` → update `.env.prod`, recreate `collector` and `dashboard`.
+3. `N8N_PIPELINE_TOKEN` & `N8N_ADMIN_WEBHOOK_TOKEN` → update `.env.prod`, recreate `dashboard`, update n8n Header Auth credentials (`X-Pipeline-Key`, `X-Admin-Key`).
+4. `NAMED_ASSERTION_SECRET` & `DASHBOARD_SESSION_SECRET` → update `.env.prod`, recreate `collector` and `dashboard` (existing browser sessions re-login cleanly).
+5. `AI_API_KEY` → provision new Groq production key with monthly spend cap, update `.env.prod`, recreate `collector`, revoke old key.
+6. `N8N_ENCRYPTION_KEY` → generate brand new per fresh instance and back up in an encrypted password manager / vault (rotating an existing key invalidates stored n8n credentials unless re-entered).
 
 ---
 
-## 5. Production Launch Go / No-Go Gate
+## 7. Production Launch Go / No-Go Gate
 
 Do not onboard paying clients publicly until **all 7 gates** pass:
-1. [ ] `fix/p3-live-uat-hardening` and `ops/production-launch-readiness` merged to `main` with all GitHub Actions jobs green (`frontend`, `n8n-workflows`, `offline-pytest`, `compose-validate`, `secret-scan`).
-2. [ ] Public HTTPS live via `Caddyfile.prod` with valid Let's Encrypt certificate, HSTS header verified, and `/setup-admin` returning `404`.
-3. [ ] Two independent Named Admins provisioned via CLI + `/settings`; self-approval confirmed blocked.
-4. [ ] Automated daily `sqlite_backup.py` cron + off-host sync active, with 1 verified restore drill (`--verify` = `ok`).
-5. [ ] Readiness probes active on `/api/ready`, `/ready`, and `/healthz/readiness`.
-6. [ ] Production Google Drive OAuth configured and tested on 1 bounded multi-asset (photo + video) job confirming `Best Images/`, `Best Videos/`, `Reports/`, and `visibility: private`.
-7. [ ] Groq Developer Tier enabled (or bounded pilot job limits communicated honestly to operators) with hard per-job cost cap configured.
+1. [ ] All GitHub Actions CI checks (`frontend`, `n8n-workflows`, `offline-pytest`, `compose-validate`, `secret-scan`) are green on `main` including P1–P4.
+2. [ ] `prod_preflight.py --env-file .env.prod --check-host` exits `0` (`ok: true`, zero errors).
+3. [ ] Public HTTPS is live via `deploy/compose.prod.yml` + `deploy/Caddyfile.prod` with valid Let's Encrypt cert, HSTS verified, and `/setup-admin` returning `404`.
+4. [ ] Two independent Named Admins are provisioned via SSH CLI + `/settings`; self-approval confirmed blocked.
+5. [ ] `pgm-backup.timer` + off-host `rclone` sync active with 1 verified restore drill (`sqlite_backup.py --verify` = `ok`).
+6. [ ] `pgm-readiness.timer` active with `/api/ready`, `/ready`, `/healthz/readiness`, and disk threshold `< 80%` reporting `overall: "ok"`.
+7. [ ] Isolated production Google Drive OAuth verified on 1 combined photo + video job confirming `Best Images/`, `Best Videos/`, `Reports/`, `visibility: private`, and Groq tier (`AI_TIER_PRESET=dev` or bounded `on_demand`) clearly configured.

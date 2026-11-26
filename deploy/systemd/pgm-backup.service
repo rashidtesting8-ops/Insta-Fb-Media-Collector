@@ -1,0 +1,13 @@
+[Unit]
+Description=Atelier Media Online WAL SQLite Backup & SHA-256 Verification
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/pgm-media/ops.env
+ExecStart=/usr/bin/docker exec pgm-media-prod-collector-1 python /srv/scripts/sqlite_backup.py --db /data/projects/_system/jobs.sqlite --out-dir /data/projects/_system/backups --keep 14
+# Optional off-host encrypted backup sync (uncomment after configuring rclone remote):
+# ExecStartPost=/usr/bin/rclone sync /srv/pgm-media-prod/jobs/_system/backups remote-encrypted:pgm-prod-backups/sqlite
+StandardOutput=journal
+StandardError=journal

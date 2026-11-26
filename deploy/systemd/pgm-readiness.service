@@ -1,0 +1,11 @@
+[Unit]
+Description=Atelier Media Readiness & Disk Pressure Probe
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/pgm-media/ops.env
+ExecStart=/bin/bash -c 'set -euo pipefail; docker exec pgm-media-prod-collector-1 python /srv/scripts/readiness_probe.py --worker-url http://127.0.0.1:8787/ready --n8n-url http://n8n:5678/healthz/readiness --dashboard-url "${PUBLIC_READY_URL:-http://dashboard:3000/api/ready}" --disk-path /data/projects --max-disk-pct "${MAX_DISK_PCT:-80}" --alert-webhook "${ALERT_WEBHOOK_URL:-}" --timeout 5'
+StandardOutput=journal
+StandardError=journal

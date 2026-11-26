@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Atelier Media Readiness & Disk Probe Every 2 Minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
