@@ -466,10 +466,48 @@ def choose_srcset(srcset: str) -> str:
     return max(picks, default=(0.0, ""))[1]
 
 
+_BUILDER_JSON_MEDIA_RE = re.compile(
+    r"https://(?:static\.wixstatic\.com/media/|video\.wixstatic\.com/video/"
+    r"|images\.squarespace-cdn\.com/|static1\.squarespace\.com/"
+    r"|cdn\.shopify\.com/s/files/|cdn\.shopifycdn\.net/s/files/"
+    r"|cdn\.prod\.website-files\.com/)"
+    r"[^\s\"'<>\\)]+",
+    re.IGNORECASE,
+)
+_THIRD_PARTY_VIDEO_HOSTS = (
+    "youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "vimeo.com",
+    "player.vimeo.com",
+    "wistia.com",
+    "fast.wistia.net",
+)
+
+
 def candidate_url(raw: str, base: str) -> str | None:
     if not raw or raw.startswith(("data:", "blob:", "javascript:", "mailto:")):
         return None
-    return urljoin(base, raw.strip())
+    cleaned = raw.strip()
+    # Normalize Shopify / builder responsive URL templates such as `_{width}x.jpg`.
+    if "{width}" in cleaned or "{height}" in cleaned:
+        cleaned = cleaned.replace("{width}", "1600").replace("{height}", "1600")
+    return urljoin(base, cleaned)
+
+
+def detect_third_party_video_embeds(soup: BeautifulSoup, page_url: str) -> list[str]:
+    """Identify third-party video iframe embeds (YouTube/Vimeo/Wistia) for honest diagnostics."""
+    embeds: list[str] = []
+    for tag in soup.select("iframe[src], iframe[data-src]"):
+        raw = _attr_str(tag.get("src") or tag.get("data-src") or "")
+        url = candidate_url(raw, page_url)
+        if not url:
+            continue
+        host = (urlparse(url).hostname or "").lower()
+        if any(host == h or host.endswith("." + h) for h in _THIRD_PARTY_VIDEO_HOSTS):
+            if url not in embeds:
+                embeds.append(url)
+    return embeds
 
 
 def _attr_str(value: Any) -> str:
@@ -512,6 +550,66 @@ def grab_media(soup: BeautifulSoup, page_url: str) -> list[dict[str, Any]]:
                         "discovery": tag.name,
                     }
                 )
+    # Webflow native Background Video containers store comma-separated MP4/WebM URLs.
+    for tag in soup.select("[data-video-urls]"):
+        for piece in _attr_str(tag.get("data-video-urls", "")).split(","):
+            url = candidate_url(piece, page_url)
+            if url:
+                found.append(
+                    {"url": url, "source_page": page_url, "alt": "", "discovery": "video"}
+                )
+    # Squarespace / WordPress lazy-loading plugins often place full-res <img> inside <noscript>.
+    for ns in soup.find_all("noscript"):
+        ns_html = ns.decode_contents() if hasattr(ns, "decode_contents") else ns.get_text()
+        if "<img" not in ns_html.lower():
+            continue
+        ns_soup = BeautifulSoup(ns_html, "html.parser")
+        for img in ns_soup.find_all("img"):
+            for k in ("src", "data-src", "data-image"):
+                if img.has_attr(k):
+                    url = candidate_url(_attr_str(img[k]), page_url)
+                    if url:
+                        found.append(
+                            {
+                                "url": url,
+                                "source_page": page_url,
+                                "alt": _attr_str(img.get("alt", "")),
+                                "discovery": "noscript-img",
+                            }
+                        )
+    # Embedded builder JSON payloads (Wix Thunderbolt warmup data, Shopify/Squarespace/Webflow JSON).
+    # Treated strictly as inert URL text (never executed) and capped per page.
+    json_media_added = 0
+    json_sources: list[str] = []
+    for script in soup.find_all("script", attrs={"type": "application/json"}):
+        text = script.get_text() or ""
+        if text:
+            json_sources.append(text[:500_000])
+    for tag in soup.select("[data-image-info]"):
+        info = _attr_str(tag.get("data-image-info", ""))
+        if info:
+            json_sources.append(info[:20_000])
+    seen_json_urls: set[str] = set()
+    for blob in json_sources:
+        if json_media_added >= 80:
+            break
+        normalized_blob = blob.replace("\\/", "/")
+        for match in _BUILDER_JSON_MEDIA_RE.finditer(normalized_blob):
+            if json_media_added >= 80:
+                break
+            raw_u = match.group(0).rstrip(".,;}")
+            url = candidate_url(raw_u, page_url)
+            if not url or url in seen_json_urls:
+                continue
+            ext = Path(urlparse(url).path.lower()).suffix
+            if ext not in MEDIA_EXTENSIONS:
+                continue
+            seen_json_urls.add(url)
+            disc = "video" if ext in (".mp4", ".webm", ".mov") or "video.wixstatic.com" in url.lower() else "builder-json"
+            found.append(
+                {"url": url, "source_page": page_url, "alt": "", "discovery": disc}
+            )
+            json_media_added += 1
     # Inline CSS assets and lazy background attributes (Elementor/Divi/Squarespace/Wix banners).
     for tag in soup.select("[style]"):
         for raw in re.findall(r"url\(\s*['\"]?([^)'\"]+)", _attr_str(tag.get("style", "")), re.I):

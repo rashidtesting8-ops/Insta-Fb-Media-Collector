@@ -16,8 +16,19 @@ RUN apt-get update \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Optional bounded Playwright + Chromium JS fallback (disabled by default for lean image/CI).
+# Enable via: docker compose build --build-arg INSTALL_PLAYWRIGHT=1 collector
+ARG INSTALL_PLAYWRIGHT=0
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN if [ "$INSTALL_PLAYWRIGHT" = "1" ]; then \
+        pip install --no-cache-dir "playwright>=1.49,<2" \
+        && playwright install --with-deps chromium \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 RUN useradd --create-home --shell /bin/bash appuser \
- && mkdir -p /data/projects /srv/docs
+ && mkdir -p /data/projects /srv/docs \
+ && if [ -d /ms-playwright ]; then chown -R appuser:appuser /ms-playwright; fi
 
 COPY pyproject.toml ./pyproject.toml
 COPY app ./app
