@@ -9,6 +9,7 @@
 .env
 .env.*
 !.env.example
+!deploy/.env.prod.example
 *.pem
 *.key
 credentials.json

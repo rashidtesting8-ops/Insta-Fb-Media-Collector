@@ -127,6 +127,24 @@ jobs:
           N8N_PIPELINE_TOKEN: ci-placeholder-pipeline-token-not-real
           STAGING_HOST: staging.example.test
         run: docker compose -f deploy/compose.staging.yml config --quiet
+      - name: Validate deploy/compose.staging.yml + deploy/compose.prod.yml
+        env:
+          N8N_IMAGE: n8nio/n8n:2.48.7
+          CADDY_IMAGE: caddy:2.8-alpine
+          N8N_ENCRYPTION_KEY: ci-placeholder-encryption-key-not-real
+          MEDIA_WORKER_TOKEN: ci-placeholder-worker-token-not-real
+          MEDIA_WORKER_DASHBOARD_TOKEN: ci-placeholder-dashboard-token-not-real
+          NAMED_ASSERTION_SECRET: ci-placeholder-named-assertion-secret-32b
+          STAGING_MEDIA_DIR: /tmp/staging-media
+          DASHBOARD_ORIGIN: https://app.example.test
+          DASHBOARD_PASSWORD: ci-placeholder-password-not-real
+          DASHBOARD_SESSION_SECRET: ci-placeholder-session-secret-32bytes
+          N8N_PIPELINE_TOKEN: ci-placeholder-pipeline-token-not-real
+          N8N_ADMIN_WEBHOOK_TOKEN: ci-placeholder-admin-webhook-token-32b
+          STAGING_HOST: app.example.test
+          ACME_EMAIL: ops@example.test
+          AI_API_KEY: ci-placeholder-groq-api-key-not-real
+        run: docker compose -f deploy/compose.staging.yml -f deploy/compose.prod.yml config --quiet
 
   secret-scan:
     name: Gitleaks secret scan

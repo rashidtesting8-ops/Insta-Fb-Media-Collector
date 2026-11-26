@@ -11,7 +11,11 @@ x-runtime: &runtime
 services:
   collector:
     <<: *runtime
-    build: ../services/media-worker
+    build:
+      context: ../services/media-worker
+      dockerfile: Dockerfile
+      args:
+        INSTALL_PLAYWRIGHT: ${INSTALL_PLAYWRIGHT:-0}
     mem_limit: 1g
     environment:
       PROJECTS_DIR: /data/projects
@@ -24,6 +28,7 @@ services:
       PLAYWRIGHT_MAX_PAGES_PER_JOB: ${PLAYWRIGHT_MAX_PAGES_PER_JOB:-2}
       M4_COLLECTION_APPROVAL_ENABLED: ${M4_COLLECTION_APPROVAL_ENABLED:-1}
       NAMED_ASSERTION_SECRET: ${NAMED_ASSERTION_SECRET:-}
+      # Leave the 7 preset-governed limits unset to inherit AI_TIER_PRESET (on_demand default vs dev).
       AI_TIER_PRESET: ${AI_TIER_PRESET:-}
       AI_PROVIDER: ${AI_PROVIDER:-}
       AI_MODEL: ${AI_MODEL:-}
@@ -33,16 +38,16 @@ services:
       AI_TIMEOUT_S: ${AI_TIMEOUT_S:-120}
       AI_MAX_RETRIES: ${AI_MAX_RETRIES:-3}
       AI_BOUNDED_ACCEPTANCE: ${AI_BOUNDED_ACCEPTANCE:-0}
-      AI_MODE_A_MAX_OUTPUT_TOKENS: ${AI_MODE_A_MAX_OUTPUT_TOKENS:-850}
-      AI_MODE_B_MAX_OUTPUT_TOKENS: ${AI_MODE_B_MAX_OUTPUT_TOKENS:-950}
-      AI_BATCH_SIZE: ${AI_BATCH_SIZE:-1}
-      AI_MAX_IMAGES_PER_REQUEST: ${AI_MAX_IMAGES_PER_REQUEST:-1}
+      AI_MODE_A_MAX_OUTPUT_TOKENS: ${AI_MODE_A_MAX_OUTPUT_TOKENS:-}
+      AI_MODE_B_MAX_OUTPUT_TOKENS: ${AI_MODE_B_MAX_OUTPUT_TOKENS:-}
+      AI_BATCH_SIZE: ${AI_BATCH_SIZE:-}
+      AI_MAX_IMAGES_PER_REQUEST: ${AI_MAX_IMAGES_PER_REQUEST:-}
       AI_MAX_IMAGE_DIM: ${AI_MAX_IMAGE_DIM:-512}
       AI_MAX_IMAGE_BYTES: ${AI_MAX_IMAGE_BYTES:-300000}
       AI_MAX_REQUEST_BYTES: ${AI_MAX_REQUEST_BYTES:-1000000}
-      AI_MIN_REQUEST_SPACING_S: ${AI_MIN_REQUEST_SPACING_S:-5}
-      AI_MAX_REQUESTS_PER_JOB: ${AI_MAX_REQUESTS_PER_JOB:-25}
-      AI_MAX_COST_USD_PER_JOB: ${AI_MAX_COST_USD_PER_JOB:-0.25}
+      AI_MIN_REQUEST_SPACING_S: ${AI_MIN_REQUEST_SPACING_S:-}
+      AI_MAX_REQUESTS_PER_JOB: ${AI_MAX_REQUESTS_PER_JOB:-}
+      AI_MAX_COST_USD_PER_JOB: ${AI_MAX_COST_USD_PER_JOB:-}
       AI_PRICE_IN_PER_1K: ${AI_PRICE_IN_PER_1K:-0.0008}
       AI_PRICE_OUT_PER_1K: ${AI_PRICE_OUT_PER_1K:-0.004}
     volumes:
@@ -71,6 +76,8 @@ services:
       EXECUTIONS_DATA_SAVE_ON_ERROR: none
       EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS: "false"
       N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      N8N_EDITOR_BASE_URL: ${N8N_EDITOR_BASE_URL:-http://127.0.0.1:5680}
     volumes:
       - n8n_state:/home/node/.n8n
       - ${STAGING_MEDIA_DIR:?select a fresh staging-only directory}:/data/media:ro
@@ -124,10 +131,16 @@ services:
     volumes:
       - ${CADDYFILE_PATH:-./Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_state:/data
+      - caddy_config:/config
     depends_on:
       dashboard:
         condition: service_healthy
     networks: [edge]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2019/config/ >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
 
 networks:
   edge:
@@ -136,3 +149,4 @@ networks:
 volumes:
   n8n_state:
   caddy_state:
+  caddy_config:
