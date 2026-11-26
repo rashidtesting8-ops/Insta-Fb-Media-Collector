@@ -381,9 +381,11 @@ def build_mode_b_prompt(
     )
     if compact_output:
         prompt += (
-            "\nKeep every required field. Return minified JSON with no extra text. "
-            "Use one brief phrase per text field, 1-2 short entries per required list, "
-            "and [] for categories without evidence so the full JSON fits comfortably "
-            "within the output token budget. Never include extra keys outside the schema."
+            "\nKeep EVERY required top-level key, including business_visual_identity, "
+            "design_art_direction{narrative,layout_guidance,color_and_lighting,typography_mood,section_pairing,diversity_notes}, "
+            "selected_asset_ids, rights_review_required_ids, and "
+            "final_quality_assessment{overall_assessment,strengths,weaknesses,meets_premium_standard}. "
+            "Return minified JSON only, concise phrases (<=10 words), 1-2 items per required list, "
+            "[] for empty categories, no extra keys."
         )
     return prompt

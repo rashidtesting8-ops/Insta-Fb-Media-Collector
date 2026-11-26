@@ -31,6 +31,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from app.ai.payload import (
     DEFAULT_MAX_IMAGE_BYTES,
     DEFAULT_MAX_IMAGE_DIM,
@@ -575,22 +577,30 @@ def run_ai_curation(
     }
     mode_b: ModeBResponse | None = None
     mode_b_errors: list[str] = []
+    mode_b_retry_hint: str | None = None
     for attempt in range(ai_execution.retry_limit(cfg.max_retries) + 1):
+        attempt_prompt = mode_b_prompt
+        if mode_b_retry_hint and not cfg.bounded_acceptance:
+            attempt_prompt = (
+                f"{mode_b_prompt}\n\n"
+                f"SCHEMA VALIDATION FIX REQUIRED: {mode_b_retry_hint}. "
+                "Include every missing/required top-level key and return strict minified JSON only."
+            )
         try:
             with (nullcontext() if isinstance(provider, OpenAICompatibleProvider)
                   else ai_execution.attempt("B", [], attempt_index=attempt)):
                 if use_system_prompt:
                     completion = provider.complete(
-                        mode_b_prompt,
+                        attempt_prompt,
                         [],
                         tracker,
                         system_prompt=system_prompt_for_mode("B"),
                         attempt_offset=attempt,
                     )
                 elif isinstance(provider, OpenAICompatibleProvider):
-                    completion = provider.complete(mode_b_prompt, [], tracker, attempt_offset=attempt)
+                    completion = provider.complete(attempt_prompt, [], tracker, attempt_offset=attempt)
                 else:
-                    completion = provider.complete(mode_b_prompt, [], tracker)
+                    completion = provider.complete(attempt_prompt, [], tracker)
         except ai_execution.InferenceHeld as exc:
             result.errors.append(str(exc))
             return result
@@ -680,8 +690,18 @@ def run_ai_curation(
                     "usage": tracker.as_dict(),
                 }
             candidate_response = ModeBResponse.model_validate(data)
+        except ValidationError as exc:
+            mode_b_errors.append(f"MODE B validation: {str(exc)[:200]}")
+            parts = []
+            for err in exc.errors()[:6]:
+                loc = ".".join(str(seg) for seg in err.get("loc", ())) or "root"
+                msg = str(err.get("msg") or "invalid")
+                parts.append(f"{loc} ({msg})")
+            mode_b_retry_hint = "; ".join(parts)[:300] if parts else "fix schema validation errors"
+            continue
         except Exception as exc:  # noqa: BLE001
             mode_b_errors.append(f"MODE B validation: {str(exc)[:200]}")
+            mode_b_retry_hint = f"invalid JSON ({str(exc)[:120]})"
             continue
         # Cross-manifest and analyzed-only validation
         if candidate_response.job_id != job_id:

@@ -61,6 +61,8 @@ export type ManifestAsset = {
   source_url?: string;
   source_caption?: string | null;
   published_at_utc?: string | null;
+  post_date?: string | null;
+  date_status?: string | null;
   publication_date_source?: string | null;
   publication_date_confidence?: string | null;
   frames?: ManifestFrame[];
