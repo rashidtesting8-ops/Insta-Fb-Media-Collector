@@ -111,12 +111,37 @@ class AIUsage:
         return result
 
 
+GROQ_TIER_PRESETS: dict[str, dict[str, Any]] = {
+    "on_demand": {
+        "batch_size": 1,
+        "max_images_per_request": 1,
+        "max_requests_per_job": 25,
+        "max_cost_usd_per_job": 0.25,
+        "min_request_spacing_s": 5.0,
+        "mode_a_max_output_tokens": 850,
+        "mode_b_max_output_tokens": 950,
+        "max_retries": 3,
+    },
+    "dev": {
+        "batch_size": 3,
+        "max_images_per_request": 3,
+        "max_requests_per_job": 60,
+        "max_cost_usd_per_job": 1.50,
+        "min_request_spacing_s": 0.5,
+        "mode_a_max_output_tokens": 1800,
+        "mode_b_max_output_tokens": 3500,
+        "max_retries": 3,
+    },
+}
+
+
 @dataclass
 class AIProviderConfig:
     provider: str = ""          # "mock" | "openai_compatible" | "" (disabled)
     model: str = ""
     endpoint: str = ""
     api_key: str = ""
+    tier_preset: str = ""       # "" | "on_demand" | "dev"
     timeout_s: int = 120
     max_retries: int = 2
     # Conservative vision batch size: several real vision models (including
@@ -167,25 +192,42 @@ class AIProviderConfig:
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "AIProviderConfig":
         e = env if env is not None else dict(os.environ)
+        raw_tier = (e.get("AI_TIER_PRESET") or "").strip().lower()
+        tier_preset = raw_tier if raw_tier in GROQ_TIER_PRESETS else ""
+        preset = GROQ_TIER_PRESETS.get(tier_preset, {})
+
+        def _int_opt(key: str, default: int) -> int:
+            val = (e.get(key) or "").strip()
+            if val:
+                return int(val)
+            return int(preset.get(key.removeprefix("AI_").lower(), default))
+
+        def _float_opt(key: str, default: float) -> float:
+            val = (e.get(key) or "").strip()
+            if val:
+                return float(val)
+            return float(preset.get(key.removeprefix("AI_").lower(), default))
+
         return cls(
             provider=(e.get("AI_PROVIDER") or "").strip().lower(),
             model=(e.get("AI_MODEL") or "").strip(),
             endpoint=(e.get("AI_ENDPOINT") or "").strip(),
             api_key=(e.get("AI_API_KEY") or "").strip(),
-            timeout_s=int(e.get("AI_TIMEOUT_S") or 120),
-            max_retries=int(e.get("AI_MAX_RETRIES") or 2),
-            batch_size=int(e.get("AI_BATCH_SIZE") or 3),
-            max_images_per_request=max(1, int(e.get("AI_MAX_IMAGES_PER_REQUEST") or 5)),
-            max_requests_per_job=int(e.get("AI_MAX_REQUESTS_PER_JOB") or 40),
-            max_cost_usd_per_job=float(e.get("AI_MAX_COST_USD_PER_JOB") or 2.0),
-            max_image_dim=int(e.get("AI_MAX_IMAGE_DIM") or 512),
-            max_image_bytes=int(e.get("AI_MAX_IMAGE_BYTES") or 300_000),
-            max_request_bytes=int(e.get("AI_MAX_REQUEST_BYTES") or 1_000_000),
-            min_request_spacing_s=float(e.get("AI_MIN_REQUEST_SPACING_S") or 2.0),
-            price_in_per_1k=float(e.get("AI_PRICE_IN_PER_1K") or 0.0),
-            price_out_per_1k=float(e.get("AI_PRICE_OUT_PER_1K") or 0.0),
-            mode_a_max_output_tokens=int(e.get("AI_MODE_A_MAX_OUTPUT_TOKENS") or 4000),
-            mode_b_max_output_tokens=int(e.get("AI_MODE_B_MAX_OUTPUT_TOKENS") or 4000),
+            tier_preset=tier_preset,
+            timeout_s=int((e.get("AI_TIMEOUT_S") or "").strip() or 120),
+            max_retries=_int_opt("AI_MAX_RETRIES", 2),
+            batch_size=_int_opt("AI_BATCH_SIZE", 3),
+            max_images_per_request=max(1, _int_opt("AI_MAX_IMAGES_PER_REQUEST", 5)),
+            max_requests_per_job=_int_opt("AI_MAX_REQUESTS_PER_JOB", 40),
+            max_cost_usd_per_job=_float_opt("AI_MAX_COST_USD_PER_JOB", 2.0),
+            max_image_dim=int((e.get("AI_MAX_IMAGE_DIM") or "").strip() or 512),
+            max_image_bytes=int((e.get("AI_MAX_IMAGE_BYTES") or "").strip() or 300_000),
+            max_request_bytes=int((e.get("AI_MAX_REQUEST_BYTES") or "").strip() or 1_000_000),
+            min_request_spacing_s=_float_opt("AI_MIN_REQUEST_SPACING_S", 2.0),
+            price_in_per_1k=float((e.get("AI_PRICE_IN_PER_1K") or "").strip() or 0.0),
+            price_out_per_1k=float((e.get("AI_PRICE_OUT_PER_1K") or "").strip() or 0.0),
+            mode_a_max_output_tokens=_int_opt("AI_MODE_A_MAX_OUTPUT_TOKENS", 4000),
+            mode_b_max_output_tokens=_int_opt("AI_MODE_B_MAX_OUTPUT_TOKENS", 4000),
             bounded_acceptance=e.get("AI_BOUNDED_ACCEPTANCE") == "1",
         )
 

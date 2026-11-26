@@ -273,8 +273,9 @@ def _package_client_reports(
             "width": src.get("width"),
             "height": src.get("height"),
             "duration_sec": src.get("duration_sec"),
-            "published_at_utc": src.get("published_at_utc"),
-            "publication_date_source": src.get("publication_date_source"),
+            "published_at_utc": src.get("published_at_utc")
+            or (src.get("post_date") if src.get("date_status") == "verified" else None),
+            "publication_date_source": src.get("publication_date_source") or src.get("date_status"),
             "source_url": a.get("source_url"),
             "rights_status": a["rights_status"],
             "rights_evidence_ref": a.get("rights_evidence_ref"),

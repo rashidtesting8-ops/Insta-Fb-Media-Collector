@@ -338,6 +338,8 @@ def build_mode_b_prompt(
     }
     evidence = []
     asset_metadata = asset_metadata or {}
+    large_batch = len(analyses) > 12
+    text_budget = 140 if large_batch else 320
     for analysis in analyses:
         item: dict[str, Any] = {}
         for key in _MODE_B_EVIDENCE_FIELDS:
@@ -345,7 +347,9 @@ def build_mode_b_prompt(
                 continue
             val = analysis[key]
             if key in ("detected_content", "selection_reason", "visual_strengths", "visual_weaknesses"):
-                val, _ = _sanitize_value(val, max_len=320)
+                if large_batch and isinstance(val, list):
+                    val = val[:2]
+                val, _ = _sanitize_value(val, max_len=text_budget)
             item[key] = val
         if analysis.get("media_type") == "video":
             for key in ("filename", "source", "video_review_status", "evaluated_frames"):

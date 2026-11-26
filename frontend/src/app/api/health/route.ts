@@ -7,7 +7,14 @@ export async function GET() {
   const result: {
     worker: { ok: boolean; status?: number; collection_engine?: string; m4_approval_enabled?: boolean };
     n8n: { ok: boolean; status?: number };
-    ai: { configured: boolean; provider?: string | null; model?: string | null };
+    ai: {
+      configured: boolean;
+      provider?: string | null;
+      model?: string | null;
+      tier_preset?: string | null;
+      max_images_per_request?: number;
+      mode_b_max_output_tokens?: number;
+    };
     drive: { configured: boolean; delivery_webhook_configured: boolean };
   } = {
     worker: { ok: false },
@@ -39,6 +46,9 @@ export async function GET() {
           configured: data.ai_configured === true,
           provider: typeof data.ai_provider === "string" ? data.ai_provider : null,
           model: typeof data.ai_model === "string" ? data.ai_model : null,
+          tier_preset: typeof data.ai_tier_preset === "string" ? data.ai_tier_preset : null,
+          max_images_per_request: typeof data.ai_max_images_per_request === "number" ? data.ai_max_images_per_request : undefined,
+          mode_b_max_output_tokens: typeof data.ai_mode_b_max_output_tokens === "number" ? data.ai_mode_b_max_output_tokens : undefined,
         };
       }
     } catch {
