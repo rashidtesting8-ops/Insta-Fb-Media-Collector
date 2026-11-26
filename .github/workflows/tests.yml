@@ -6,10 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   frontend:
     name: Frontend tests, lint, build and types
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: frontend
@@ -48,11 +53,38 @@ jobs:
   offline-pytest:
     name: Offline worker test suite
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ffmpeg and libsodium (video preprocessing & Argon2id auth tests)
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg libsodium23
+      - name: Ensure ffmpeg and libsodium (video preprocessing & Argon2id auth tests)
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkgs=()
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            pkgs+=(ffmpeg)
+          fi
+          if ! ldconfig -p | grep -q 'libsodium\.so\.23'; then
+            pkgs+=(libsodium23)
+          fi
+          if [ "${#pkgs[@]}" -eq 0 ]; then
+            echo "ffmpeg, ffprobe, and libsodium23 already installed; skipping apt-get."
+            exit 0
+          fi
+          echo "Installing missing system packages: ${pkgs[*]}"
+          apt_opts=(-o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
+          tmp_apt=""
+          trap 'rm -rf "${tmp_apt}"' EXIT
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            tmp_apt="$(mktemp -d)"
+            cp /etc/apt/sources.list.d/ubuntu.sources "${tmp_apt}/ubuntu.sources"
+            apt_opts+=(-o "Dir::Etc::sourceparts=${tmp_apt}")
+          elif [ -f /etc/apt/sources.list ]; then
+            apt_opts+=(-o Dir::Etc::sourceparts=-)
+          fi
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get update "${apt_opts[@]}"
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${apt_opts[@]}" "${pkgs[@]}"
 
       - uses: actions/setup-python@v5
         with:
