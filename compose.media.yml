@@ -84,6 +84,7 @@ services:
       - M4_COLLECTION_APPROVAL_ENABLED=${M4_COLLECTION_APPROVAL_ENABLED:-1}
       - NAMED_ASSERTION_SECRET=${NAMED_ASSERTION_SECRET:-}
       # AI Visual Director V2 (secrets live only in local .env, never in repo)
+      - AI_TIER_PRESET=${AI_TIER_PRESET:-}
       - AI_PROVIDER=${AI_PROVIDER:-}
       - AI_MODEL=${AI_MODEL:-}
       - AI_ENDPOINT=${AI_ENDPOINT:-}

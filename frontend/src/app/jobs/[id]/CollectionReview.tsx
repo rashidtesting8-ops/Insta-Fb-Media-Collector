@@ -51,6 +51,63 @@ function sourceTitle(source: string): string {
   return source;
 }
 
+const CAP_OUTCOMES = new Set([
+  "page_budget",
+  "budget_reached",
+  "attachment_cap",
+  "discovery_cap",
+  "listing_cap",
+  "transfer_budget",
+  "request_budget",
+  "time_budget",
+  "byte_budget",
+  "global_budget",
+]);
+
+function humanizeCoverageStatus(s: Review["sources"][number]): { notes: string[]; raw: string } {
+  const rawTokens = [s.coverage, s.evidence, ...s.outcomes].filter(Boolean);
+  const raw = rawTokens.join(" · ");
+  const lowerOutcomes = new Set(s.outcomes.map((o) => o.toLowerCase()));
+  const notes: string[] = [];
+
+  if (lowerOutcomes.has("not_requested") || s.coverage === "not_requested") {
+    return { notes: ["Not requested (optional)"], raw };
+  }
+  if (lowerOutcomes.has("owner_media_uploaded")) {
+    notes.push("Client Facebook media uploaded");
+  }
+  if (lowerOutcomes.has("robots_disallowed")) {
+    notes.push("Facebook CDN blocked automated downloads (robots.txt) — use Client Upload below");
+  } else if (lowerOutcomes.has("login_redirect") || lowerOutcomes.has("restricted")) {
+    notes.push("Platform login or access restriction encountered");
+  } else if (lowerOutcomes.has("rate_limited")) {
+    notes.push("Platform rate limit reached");
+  } else if (lowerOutcomes.has("access_blocked") && s.downloaded === 0) {
+    notes.push("Blocked by platform access policy");
+  }
+  if (lowerOutcomes.has("third_party_video_embed")) {
+    notes.push("External YouTube/Vimeo video embed detected");
+  }
+  if (lowerOutcomes.has("js_rendered_fallback")) {
+    notes.push("JS-rendered gallery scanned");
+  } else if (lowerOutcomes.has("js_renderer_unavailable")) {
+    notes.push("JS gallery renderer unavailable");
+  }
+  if ([...lowerOutcomes].some((o) => CAP_OUTCOMES.has(o))) {
+    notes.push("Scan limit reached (click Resume Collection for more)");
+  }
+  if (notes.length === 0) {
+    if (s.downloaded > 0) {
+      notes.push("Partial sample collected (full site inventory cannot be independently verified)");
+    } else if (s.discovered > 0) {
+      notes.push("Metadata discovered (no files downloaded)");
+    } else {
+      notes.push("Coverage unverified");
+    }
+  }
+  return { notes, raw };
+}
+
 export default function CollectionReview({
   id,
   includeUndatedWebsite = false,
@@ -288,8 +345,21 @@ export default function CollectionReview({
                       <td className="px-3.5 py-2.5 tabular-nums text-[#6B635B]">{s.unknown_date}</td>
                       <td className="px-3.5 py-2.5 tabular-nums text-[#6B635B]">{s.out_of_window}</td>
                       <td className="px-3.5 py-2.5 tabular-nums text-[#6B635B]">{s.missing_children}</td>
-                      <td className="px-3.5 py-2.5 text-[#6B635B]">
-                        {[s.coverage, s.evidence, ...s.outcomes].filter(Boolean).join(" · ") || "—"}
+                      <td className="px-3.5 py-2.5 text-[#544B43]">
+                        {(() => {
+                          const { notes, raw } = humanizeCoverageStatus(s);
+                          return (
+                            <div className="space-y-1">
+                              <div>{notes.join(" · ")}</div>
+                              {raw && (
+                                <details className="text-[11px] text-[#877D73]">
+                                  <summary className="cursor-pointer hover:text-[#544B43]">Technical details</summary>
+                                  <div className="mt-0.5 font-mono text-[10px] leading-relaxed">{raw}</div>
+                                </details>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </td>
                     </tr>
                   ))}
@@ -346,6 +416,25 @@ export default function CollectionReview({
                   {includeUndatedWebsite ? "Exclude undated website media" : "Include undated website media"}
                 </button>
               </div>
+            </div>
+          )}
+
+          {/* Submitter / Zero-Eligible Guidance Banner */}
+          {review.state === "pending" && !review.permissions.approve && (
+            <div className="rounded-xl border border-sky-200 bg-sky-50/80 px-4 py-3 text-xs leading-relaxed text-sky-950">
+              {review.eligible_assets.length === 0 ? (
+                <>
+                  <strong className="font-semibold">No eligible assets in Revision {review.revision} yet:</strong>{" "}
+                  Upload client Facebook media below or include undated website media above to publish an eligible
+                  revision for approval.
+                </>
+              ) : (
+                <>
+                  <strong className="font-semibold">Independent Second Admin Required:</strong>{" "}
+                  You submitted or updated Revision {review.revision}. Under Two-Admin M4 governance, a{" "}
+                  <strong>second Named Admin</strong> must sign in to approve this revision and launch AI selection.
+                </>
+              )}
             </div>
           )}
 

@@ -244,6 +244,14 @@ def status() -> object:
         "ai_configured": ai_configured,
         "ai_provider": cfg.provider or None,
         "ai_model": cfg.model or None,
+        "ai_tier_preset": cfg.tier_preset or (
+            "on_demand" if cfg.mode_b_max_output_tokens <= 1000 and cfg.max_images_per_request == 1 else "custom"
+        ),
+        "ai_batch_size": cfg.batch_size,
+        "ai_max_images_per_request": cfg.max_images_per_request,
+        "ai_mode_b_max_output_tokens": cfg.mode_b_max_output_tokens,
+        "ai_max_requests_per_job": cfg.max_requests_per_job,
+        "ai_max_cost_usd_per_job": cfg.max_cost_usd_per_job,
         "m4_approval_enabled": m4_approval_enabled(),
         "collection_engine": collection_engine,
     }

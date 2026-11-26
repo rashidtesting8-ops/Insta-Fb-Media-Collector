@@ -6,7 +6,14 @@ import { FolderCloudIcon, RefreshIcon, ShieldCheckIcon, SparklesIcon } from "@/c
 type HealthResponse = {
   worker?: { ok: boolean; status?: number; collection_engine?: string; m4_approval_enabled?: boolean };
   n8n?: { ok: boolean; status?: number };
-  ai?: { configured: boolean; provider?: string | null; model?: string | null };
+  ai?: {
+    configured: boolean;
+    provider?: string | null;
+    model?: string | null;
+    tier_preset?: string | null;
+    max_images_per_request?: number;
+    mode_b_max_output_tokens?: number;
+  };
   drive?: { configured: boolean; delivery_webhook_configured?: boolean };
 };
 
@@ -109,7 +116,15 @@ export default function Settings() {
       ok: Boolean(health?.ai?.configured),
       statusText: health?.ai?.configured ? "Configured" : "Not Configured",
       detail: health?.ai?.configured
-        ? `${health.ai.provider ?? "Provider"} · ${health.ai.model ?? "Vision Model"}`
+        ? `${health.ai.provider ?? "Provider"} · ${health.ai.model ?? "Vision Model"}${
+            health.ai.tier_preset
+              ? ` · Tier: ${health.ai.tier_preset}${
+                  health.ai.max_images_per_request
+                    ? ` (${health.ai.max_images_per_request} img/req, ${health.ai.mode_b_max_output_tokens ?? "—"} out tok)`
+                    : ""
+                }`
+              : ""
+          }`
         : "AI curation requires a configured vision provider in worker environment.",
       Icon: SparklesIcon,
     },

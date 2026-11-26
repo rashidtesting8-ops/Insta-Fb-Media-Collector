@@ -202,6 +202,7 @@ class PublicHTTP:
         self.held_origins = held_origins if held_origins is not None else {}
         self.diagnostic_issues: list[str] = []
         self.blocked_url_reasons: dict[str, str] = {}
+        self.blocked_origin_reasons: dict[tuple[str, str, int], str] = {}
         self.remaining = limit(config, "request_budget")
         self.deadline = time.monotonic() + limit(config, "time_budget_seconds")
 
@@ -258,6 +259,10 @@ class PublicHTTP:
 
     def _record_block(self, url: str, reason: str) -> None:
         self.blocked_url_reasons[url] = reason
+        try:
+            self.blocked_origin_reasons[origin(url)] = reason
+        except ValueError:
+            pass
         if reason not in self.diagnostic_issues:
             self.diagnostic_issues.append(reason)
 
@@ -650,6 +655,11 @@ def collect_public_job(
                 report["issues"] = list(dict.fromkeys([*report["issues"], *transport.diagnostic_issues]))
             if transport.blocked_url_reasons:
                 report["blocked_url_reasons"] = dict(transport.blocked_url_reasons)
+            if transport.blocked_origin_reasons:
+                report["blocked_origin_reasons"] = {
+                    f"{scheme}://{host}:{port}": rsn
+                    for (scheme, host, port), rsn in transport.blocked_origin_reasons.items()
+                }
             if getattr(inventory, "tools_executed", None):
                 tools_by_source[source] = list(inventory.tools_executed)
         reports[source] = report
@@ -709,6 +719,11 @@ def publish_checkpoint_manifest(
             manifest["sources"][source].update(discovery_status=report["coverage"], coverage="unknown")
         items = {item["id"]: item for item in report["items"]}
         blocked_reasons = report.get("blocked_url_reasons") or {}
+        blocked_origins = report.get("blocked_origin_reasons") or {}
+        fbcdn_robots_blocked = source == "facebook" and any(
+            rsn == "robots_disallowed" and ".fbcdn.net:" in orig
+            for orig, rsn in blocked_origins.items()
+        )
         for asset in report["assets"]:
             normalized = {
                 **asset, "platform": source, "job_id": job["job_id"],
@@ -716,8 +731,19 @@ def publish_checkpoint_manifest(
                 "type": asset.get("kind"), "sha256": asset["digest"], "bytes": asset["size"],
                 "rights_status": "unverified",
             }
-            if asset.get("url") in blocked_reasons and asset.get("status") != "verified":
-                normalized["failure_reason"] = blocked_reasons[asset["url"]]
+            asset_url = asset.get("url")
+            if asset.get("status") != "verified" and isinstance(asset_url, str):
+                reason_hit = blocked_reasons.get(asset_url)
+                if reason_hit is None:
+                    try:
+                        s, h, pt = origin(asset_url)
+                        reason_hit = blocked_origins.get(f"{s}://{h}:{pt}")
+                        if reason_hit is None and fbcdn_robots_blocked and h.lower().endswith(".fbcdn.net"):
+                            reason_hit = "robots_disallowed"
+                    except ValueError:
+                        reason_hit = None
+                if reason_hit:
+                    normalized["failure_reason"] = reason_hit
             if items[asset["item"]].get("shortcode") is not None:
                 normalized["source_shortcode"] = items[asset["item"]]["shortcode"]
             if items[asset["item"]].get("caption"):
