@@ -24,9 +24,13 @@ from app.ai.pipeline import run_ai_curation
 from app.ai.provider import (
     AIProviderConfig,
     CompletionResult,
+    GEMINI_OPENAI_ENDPOINT,
     GROQ_ACCEPTANCE_ENDPOINT,
     GROQ_ACCEPTANCE_MODEL,
+    OpenAICompatibleProvider,
+    UsageTracker,
     VisionProvider,
+    _safe_provider_message,
 )
 from app.delivery import build_delivery_plan, finalize_delivery
 from app.publication import frozen_window, publication_evidence
@@ -415,3 +419,52 @@ def test_p3_25_asset_mixed_dev_tier_scale_and_combined_drive_idempotency(tmp_pat
     assert repeat_plan["subfolders"] == drive_subs
     assert repeat_plan["pending_uploads"] == []
     assert repeat_plan["pending_reports"] == []
+
+
+def test_gemini_3_vision_preset_reasoning_effort_and_secret_scrubbing():
+    """Verify AI_TIER_PRESET=gemini caps, reasoning_effort='none' for Gemini 3 thinking models,
+    and Gemini key scrubbing (both AIza and AQ. formats) without any live network calls."""
+    cfg = AIProviderConfig.from_env({
+        "AI_TIER_PRESET": "gemini",
+        "AI_PROVIDER": "openai_compatible",
+        "AI_MODEL": "gemini-3.1-flash-lite",
+        "AI_ENDPOINT": GEMINI_OPENAI_ENDPOINT,
+        "AI_API_KEY": "test-gemini-key",
+        "AI_MIN_REQUEST_SPACING_S": "0",
+    })
+    assert cfg.tier_preset == "gemini"
+    assert cfg.batch_size == 3
+    assert cfg.max_images_per_request == 3
+    assert cfg.mode_a_max_output_tokens == 2200
+    assert cfg.mode_b_max_output_tokens == 4000
+    assert cfg.max_requests_per_job == 40
+    assert cfg.max_cost_usd_per_job == 1.0
+
+    captured: list[dict] = []
+
+    def fake_transport(req: dict) -> dict:
+        captured.append(req)
+        return {
+            "choices": [{"message": {"content": '{"ok": true}'}}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 12},
+        }
+
+    provider = OpenAICompatibleProvider(cfg, sleep=lambda _s: None, transport=fake_transport)
+    tracker = UsageTracker(cfg)
+    result = provider.complete("Return JSON", [], tracker)
+    assert result.text == '{"ok": true}'
+    assert len(captured) == 1
+    body = captured[0]["body"]
+    assert body["model"] == "gemini-3.1-flash-lite"
+    assert body["reasoning_effort"] == "none"
+    assert body["max_tokens"] == 4000
+    assert body["response_format"] == {"type": "json_object"}
+
+    # Verify both Google AI Studio (AIza...) and Vertex/Express (AQ....) keys are scrubbed in error messages.
+    fake_aiza = "AIza" + "AbCdEfGhIjKlMnOpQrStUvWxYz123456789"
+    fake_aq = "AQ." + "Ab8RN6K8uVxYz1234567890AbCdEfGhIjKlMnOpQrStUv"
+    scrubbed_aiza = _safe_provider_message(f"Upstream rejected key {fake_aiza}", "")
+    scrubbed_aq = _safe_provider_message(f"Upstream rejected key {fake_aq}", "")
+    assert fake_aiza not in scrubbed_aiza
+    assert fake_aq not in scrubbed_aq
+    assert "[REDACTED]" in scrubbed_aiza and "[REDACTED]" in scrubbed_aq

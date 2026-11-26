@@ -53,7 +53,7 @@ _PLACEHOLDER_MARKERS = (
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
-_ALLOWED_TIER_PRESETS = {"", "on_demand", "dev"}
+_ALLOWED_TIER_PRESETS = {"", "on_demand", "dev", "gemini"}
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -184,9 +184,9 @@ def validate_prod_env(
 
     tier_preset = get("AI_TIER_PRESET").lower()
     if tier_preset not in _ALLOWED_TIER_PRESETS:
-        errors.append("AI_TIER_PRESET must be empty, 'on_demand', or 'dev'.")
+        errors.append("AI_TIER_PRESET must be empty, 'on_demand', 'dev', or 'gemini'.")
     elif tier_preset in ("", "on_demand"):
-        warnings.append("AI_TIER_PRESET is 'on_demand' (bounded pilot throughput); switch to 'dev' once Groq Developer Tier is enabled.")
+        warnings.append("AI_TIER_PRESET is 'on_demand' (bounded pilot throughput); switch to 'dev' (Groq) or 'gemini' for multi-asset scale.")
 
     max_cost_raw = get("AI_MAX_COST_USD_PER_JOB")
     if max_cost_raw:

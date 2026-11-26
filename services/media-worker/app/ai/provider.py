@@ -38,6 +38,7 @@ from PIL import Image
 
 GROQ_ACCEPTANCE_MODEL = "qwen/qwen3.8-27b"
 GROQ_ACCEPTANCE_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+GEMINI_OPENAI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 # Reserve the full model context as an input-token upper bound, including image tokens.
 GROQ_ACCEPTANCE_INPUT_TOKEN_BOUND = 131_072
 # Published Qwen rates in USD per 1,000 tokens. Use higher account rates if configured.
@@ -48,7 +49,8 @@ SecretPattern = re.compile(r"(?i)(authorization|api[_-]?key|bearer|token)\s*[=:]
 BearerPattern = re.compile(r"(?i)\bBearer\s+\S+")
 _SENSITIVE_DIAGNOSTIC = re.compile(
     r"https?://[^\s\"'<>]+|\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b|"
-    r"\b(?:gsk|org|proj|sk)[_-][A-Za-z0-9_-]{8,}\b",
+    r"\b(?:gsk|org|proj|sk)[_-][A-Za-z0-9_-]{8,}\b|"
+    r"\bAIza[A-Za-z0-9_-]{20,}\b|\bAQ\.[A-Za-z0-9_.-]{20,}\b",
     re.IGNORECASE,
 )
 _PROVIDER_CODE = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -130,6 +132,16 @@ GROQ_TIER_PRESETS: dict[str, dict[str, Any]] = {
         "min_request_spacing_s": 0.5,
         "mode_a_max_output_tokens": 1800,
         "mode_b_max_output_tokens": 3500,
+        "max_retries": 3,
+    },
+    "gemini": {
+        "batch_size": 3,
+        "max_images_per_request": 3,
+        "max_requests_per_job": 40,
+        "max_cost_usd_per_job": 1.00,
+        "min_request_spacing_s": 1.0,
+        "mode_a_max_output_tokens": 2200,
+        "mode_b_max_output_tokens": 4000,
         "max_retries": 3,
     },
 }
@@ -644,6 +656,11 @@ class OpenAICompatibleProvider(VisionProvider):
         }
         if self.config.bounded_acceptance or self.config.model == GROQ_ACCEPTANCE_MODEL:
             body["max_completion_tokens"] = max_output_tokens
+            body["reasoning_effort"] = "none"
+        elif self.config.endpoint == GEMINI_OPENAI_ENDPOINT or self.config.model.lower().startswith("gemini-3"):
+            # Gemini 3 thinking models default to consuming output tokens on hidden reasoning;
+            # disable thinking so strict MODE A / MODE B JSON never truncates mid-response.
+            body["max_tokens"] = max_output_tokens
             body["reasoning_effort"] = "none"
         else:
             body["max_tokens"] = max_output_tokens
