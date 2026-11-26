@@ -8,14 +8,27 @@ from xml.etree import ElementTree
 
 from bs4 import BeautifulSoup
 
+from app.browser_renderer import BrowserRendererUnavailable, looks_like_js_rendered_page
 from app.collection_checkpoint import Attachment, InventoryPage, SourceItem, SourceStop
-from app.legacy_collector import MEDIA_EXTENSIONS, candidate_url, grab_media, normalize_page_url
+from app.legacy_collector import (
+    MEDIA_EXTENSIONS,
+    candidate_url,
+    detect_third_party_video_embeds,
+    grab_media,
+    normalize_page_url,
+)
 
 _HISTORICAL_PATH_HINTS = (
     "archive", "archives", "blog", "news", "post", "posts", "article", "articles",
     "category", "categories", "gallery", "galleries", "portfolio", "photo", "photos",
     "video", "videos", "media", "transformation", "transformations", "before-after",
     "work", "our-work", "grooming", "updates", "diary", "journal", "showcase",
+    # Core pet grooming salon sections (so sites without robots.txt sitemaps still crawl key pages)
+    "about", "about-us", "team", "our-team", "meet-the-team", "staff", "stylist",
+    "groomer", "groomers", "service", "services", "spa", "bath", "dog", "dogs",
+    "cat", "cats", "puppy", "puppies", "pet", "pets", "price", "prices", "pricing",
+    "package", "packages", "salon", "studio", "facility", "facilities", "reviews",
+    "testimonials", "client", "clients", "collection", "collections", "product", "products",
 )
 _EXCLUDED_PATH_HINTS = (
     "/logout", "/login", "/signin", "/sign-in", "/signup", "/sign-up", "/register",
@@ -205,6 +218,8 @@ class WebsiteInventory:
         media_permitted=None,
         historical_mode: bool = False,
         robots_sitemaps=(),
+        js_renderer=None,
+        max_js_pages: int = 2,
     ):
         if min(document_limit, entry_limit) < 1:
             raise ValueError("Fixture discovery limits must be positive")
@@ -217,6 +232,10 @@ class WebsiteInventory:
         self.media_permitted = media_permitted or self._allowed
         self.document_limit = document_limit
         self.entry_limit = entry_limit
+        self.js_renderer = js_renderer
+        self.max_js_pages = max(0, min(int(max_js_pages), 4))
+        self._js_pages_rendered = 0
+        self._js_disabled = False
 
     @staticmethod
     def _origin(url):
@@ -317,6 +336,8 @@ class WebsiteInventory:
             candidate_url(str(tag.get("src") or tag.get("data-src") or ""), base)
             for tag in soup.select("video[src], video[data-src], video source[src], video source[data-src]")
         }
+        if detect_third_party_video_embeds(soup, base):
+            issues.append("third_party_video_embed")
         if not self.historical_mode:
             attachments = {}
             for media in grab_media(soup, base):
@@ -390,6 +411,35 @@ class WebsiteInventory:
                 links, attachments, _ = self._html(body, final_url, issues)
             else:
                 links, grouped, _ = self._html(body, final_url, issues)
+                downloadable_static = sum(1 for att, _ in grouped if att.kind in ("image", "video"))
+                if (
+                    self.js_renderer is not None
+                    and not self._js_disabled
+                    and self._js_pages_rendered < self.max_js_pages
+                    and looks_like_js_rendered_page(body, downloadable_static)
+                ):
+                    try:
+                        rendered_body = self.js_renderer(final_url)
+                        self._js_pages_rendered += 1
+                        r_links, r_grouped, _ = self._html(rendered_body, final_url, issues)
+                        seen_link_set = set(links)
+                        for lnk in r_links:
+                            if lnk not in seen_link_set:
+                                links.append(lnk)
+                                seen_link_set.add(lnk)
+                        merged_grouped = list(grouped)
+                        existing_att_ids = {att.id for att, _ in merged_grouped}
+                        for att, fam_tag in r_grouped:
+                            if att.id not in existing_att_ids:
+                                merged_grouped.append((att, fam_tag))
+                                existing_att_ids.add(att.id)
+                        grouped = tuple(merged_grouped)
+                        issues.append("js_rendered_fallback")
+                    except BrowserRendererUnavailable:
+                        self._js_disabled = True
+                        issues.append("js_renderer_unavailable")
+                    except (PermissionError, SourceStop, OSError, ValueError):
+                        issues.append("js_render_failed")
                 fresh: list[Attachment] = []
                 for att, fam_tag in grouped:
                     # Check exact canonical URL or same WordPress responsive family (when undated/matching).

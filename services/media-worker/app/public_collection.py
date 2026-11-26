@@ -1,12 +1,15 @@
 """Opt-in public collection. No account access or unguarded extractor subprocess."""
 
 import json
+import os
 import re
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from requests import HTTPError
+
+from app.browser_renderer import render_page_html
 
 from app.collection_checkpoint import (
     Attachment, CollectionCheckpoint, Download, GlobalBudget, InventoryPage, SourceItem, SourceStop,
@@ -26,13 +29,18 @@ _ROBOTS_SITEMAP_RE = re.compile(r"^\s*sitemap\s*:\s*(\S+)\s*$", re.IGNORECASE | 
 # Every hop still enforces HTTPS-443, SafeHTTPAdapter DNS/SSRF checks, robots.txt, and magic-byte validation.
 WEBSITE_MEDIA_HOST_SUFFIXES = (
     ".wixstatic.com",
+    ".wixmp.com",
     ".squarespace-cdn.com",
+    ".squarespace.com",
     ".shopify.com",
+    ".shopifycdn.net",
     ".website-files.com",
     ".webflow.com",
     ".wp.com",
     ".cloudinary.com",
     ".wsimg.com",
+    ".godaddysites.com",
+    ".secureserver.net",
     ".ctfassets.net",
     ".sanity.io",
     ".b-cdn.net",
@@ -91,6 +99,9 @@ def build_multitenant_collection_config(job: dict) -> dict:
             "url": website_url,
             "sitemaps": [],
             "discover_robots_sitemaps": True,
+            "probe_default_sitemaps": os.getenv("WEBSITE_PROBE_DEFAULT_SITEMAPS") == "1",
+            "js_fallback_enabled": os.getenv("PLAYWRIGHT_FALLBACK_ENABLED") == "1",
+            "max_js_pages": max(1, min(int(os.getenv("PLAYWRIGHT_MAX_PAGES_PER_JOB", "2") or "2"), 4)),
             "media_origins": _website_media_origins(website_url),
             "media_host_suffixes": list(WEBSITE_MEDIA_HOST_SUFFIXES),
             "download_authorized": True,
@@ -283,26 +294,54 @@ class PublicHTTP:
                 body.extend(chunk)
             return response.url, bytes(body)
 
-    def discover_robots_sitemaps(self, *, max_sitemaps: int = 8) -> list[str]:
-        """Extract same-origin Sitemap: declarations from /robots.txt within request/time budgets."""
+    def discover_robots_sitemaps(self, *, max_sitemaps: int = 8, probe_defaults: bool = False) -> list[str]:
+        """Extract same-origin Sitemap: declarations from /robots.txt within request/time budgets.
+
+        When `probe_defaults=True` and robots.txt declares no sitemaps, safely checks common
+        same-origin sitemap endpoints (`/sitemap.xml`, `/sitemap_index.xml`) used by Squarespace,
+        Wix, Shopify, Webflow, and WordPress while respecting robots.txt and budgets.
+        """
         scheme, host, port = self.origin
         default_port = 443 if scheme == "https" else 80
         netloc = host if port == default_port else f"{host}:{port}"
         robots_url = f"{scheme}://{netloc}/robots.txt"
+        found: list[str] = []
         try:
             _, raw = self.document(robots_url, 262_144)
+            for match in _ROBOTS_SITEMAP_RE.finditer(raw.decode("utf-8", errors="replace")):
+                candidate = match.group(1).strip()
+                try:
+                    if origin(candidate) == self.origin and candidate not in found:
+                        found.append(candidate)
+                except ValueError:
+                    continue
+                if len(found) >= max_sitemaps:
+                    break
         except (SourceStop, HTTPError, OSError, ValueError):
-            return []
-        found: list[str] = []
-        for match in _ROBOTS_SITEMAP_RE.finditer(raw.decode("utf-8", errors="replace")):
-            candidate = match.group(1).strip()
-            try:
-                if origin(candidate) == self.origin and candidate not in found:
-                    found.append(candidate)
-            except ValueError:
-                continue
-            if len(found) >= max_sitemaps:
-                break
+            pass
+
+        if not found and probe_defaults:
+            was_held = self.origin in self.held_origins
+            for suffix in ("/sitemap.xml", "/sitemap_index.xml"):
+                candidate = f"{scheme}://{netloc}{suffix}"
+                try:
+                    if not self.page_permitted(candidate):
+                        continue
+                    final_sm, sm_raw = self.document(candidate, 262_144)
+                    head = sm_raw[:2048].lower()
+                    if b"<urlset" in head or b"<sitemapindex" in head:
+                        if origin(final_sm) == self.origin and final_sm not in found:
+                            found.append(final_sm)
+                            break
+                except SourceStop as exc:
+                    # A 403 on a speculative /sitemap.xml probe must not hold the main website origin.
+                    if str(exc) == "restricted" and not was_held and self.held_origins.get(self.origin) == "restricted":
+                        self.held_origins.pop(self.origin, None)
+                    if str(exc) in ("rate_limited", "time_budget", "request_budget"):
+                        break
+                    continue
+                except (HTTPError, OSError, ValueError):
+                    continue
         return found
 
     def download(self, url, offset, revision):
@@ -447,6 +486,7 @@ def collect_public_job(
     *,
     session_factory=build_collector_session,
     social_runner=None,
+    js_renderer=None,
     clock=time.monotonic,
     run_preprocessing: bool = False,
 ):
@@ -509,10 +549,18 @@ def collect_public_job(
             if source == "website":
                 document_limit = limit(config, "document_limit")
                 robots_sitemaps = (
-                    transport.discover_robots_sitemaps()
+                    transport.discover_robots_sitemaps(
+                        probe_defaults=bool(config.get("probe_default_sitemaps", False)),
+                    )
                     if is_historical and config.get("discover_robots_sitemaps", True)
                     else []
                 )
+                active_js_renderer = js_renderer
+                if active_js_renderer is None and is_historical and config.get("js_fallback_enabled") is True:
+                    active_js_renderer = lambda target: render_page_html(  # noqa: E731
+                        target,
+                        robots_check=transport.page_permitted,
+                    )
                 inventory = WebsiteInventory(
                     url,
                     sitemaps=config["sitemaps"],
@@ -523,6 +571,8 @@ def collect_public_job(
                     entry_limit=limit(config, "entry_limit"),
                     historical_mode=is_historical,
                     robots_sitemaps=robots_sitemaps,
+                    js_renderer=active_js_renderer,
+                    max_js_pages=int(config.get("max_js_pages") or 2),
                 )
             elif config.get("snapshot") is not None or config.get("discovery_mode") != "open_source_cli":
                 inventory = PublicSocialSnapshot(source, url, config.get("snapshot"),
