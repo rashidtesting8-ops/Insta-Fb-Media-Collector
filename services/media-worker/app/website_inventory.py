@@ -313,7 +313,10 @@ class WebsiteInventory:
             links = [("next", target) for target in clean_next]
             links.extend(("html", target) for target in clean_content)
         posters = {candidate_url(str(tag["poster"]), base) for tag in soup.select("video[poster]")}
-        videos = {candidate_url(str(tag["src"]), base) for tag in soup.select("video[src], video source[src]")}
+        videos = {
+            candidate_url(str(tag.get("src") or tag.get("data-src") or ""), base)
+            for tag in soup.select("video[src], video[data-src], video source[src], video source[data-src]")
+        }
         if not self.historical_mode:
             attachments = {}
             for media in grab_media(soup, base):

@@ -480,7 +480,7 @@ def _attr_str(value: Any) -> str:
 
 def grab_media(soup: BeautifulSoup, page_url: str) -> list[dict[str, Any]]:
     found: list[dict[str, str]] = []
-    keys = ("src", "data-src", "data-lazy-src", "data-original", "data-image", "poster")
+    keys = ("src", "data-src", "data-lazy-src", "data-original", "data-image", "data-image-src", "data-src-retina", "poster")
     for tag in soup.find_all(["img", "source", "video", "a", "meta"]):
         vals: list[str] = []
         for k in keys:
@@ -512,13 +512,20 @@ def grab_media(soup: BeautifulSoup, page_url: str) -> list[dict[str, Any]]:
                         "discovery": tag.name,
                     }
                 )
-    # Inline CSS assets such as branded background images.
+    # Inline CSS assets and lazy background attributes (Elementor/Divi/Squarespace/Wix banners).
     for tag in soup.select("[style]"):
         for raw in re.findall(r"url\(\s*['\"]?([^)'\"]+)", _attr_str(tag.get("style", "")), re.I):
             url = candidate_url(raw, page_url)
             if url:
                 found.append(
                     {"url": url, "source_page": page_url, "alt": "", "discovery": "inline-css"}
+                )
+    for bg_attr in ("data-bg", "data-background-image", "data-bg-src"):
+        for tag in soup.select(f"[{bg_attr}]"):
+            url = candidate_url(_attr_str(tag.get(bg_attr, "")), page_url)
+            if url:
+                found.append(
+                    {"url": url, "source_page": page_url, "alt": "", "discovery": bg_attr}
                 )
     dates: dict[str, list[dict]] = {}
 
