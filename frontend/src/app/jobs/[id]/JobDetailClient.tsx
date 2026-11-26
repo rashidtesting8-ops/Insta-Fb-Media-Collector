@@ -198,6 +198,12 @@ export default function JobDetailClient({ id }: { id: string }) {
   const [resuming, setResuming] = useState(false);
   const [resumeMessage, setResumeMessage] = useState<string | null>(null);
 
+  // Owner-supplied Facebook ZIP / media upload state (Milestone OS-2)
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadDate, setUploadDate] = useState("");
+  const [uploadingMedia, setUploadingMedia] = useState(false);
+  const [uploadMessage, setUploadMessage] = useState<{ ok: boolean; text: string } | null>(null);
+
   const triggerRefresh = useCallback(() => {
     setRefreshTick((t) => t + 1);
   }, []);
@@ -377,6 +383,47 @@ export default function JobDetailClient({ id }: { id: string }) {
       setResumeMessage("Resume collection request unavailable.");
     } finally {
       setResuming(false);
+    }
+  }
+
+  async function handleFacebookMediaUpload(ev: React.FormEvent) {
+    ev.preventDefault();
+    if (!uploadFile || uploadingMedia) return;
+    setUploadingMedia(true);
+    setUploadMessage(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", uploadFile);
+      if (uploadDate.trim()) fd.append("published_date", uploadDate.trim());
+      const res = await fetch(`/api/jobs/${id}/media-upload`, {
+        method: "POST",
+        body: fd,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setUploadMessage({
+          ok: false,
+          text: typeof data.error === "string" ? data.error : `Upload rejected (HTTP ${res.status}).`,
+        });
+        return;
+      }
+      setUploadFile(null);
+      const added = Number(data.uploaded_count || 0);
+      const inWin = Number(data.in_window_count || 0);
+      const dupes = Number(data.duplicate_count || 0);
+      const rev = data.revision ? ` (Revision ${data.revision} ready for Admin review)` : "";
+      setUploadMessage({
+        ok: true,
+        text:
+          added > 0
+            ? `Added ${added} Facebook file${added === 1 ? "" : "s"} (${inWin} in 365-day window)${dupes ? `, ${dupes} duplicate skipped` : ""}${rev}.`
+            : `No new files added (${dupes} duplicate${dupes === 1 ? "" : "s"} already in project).`,
+      });
+      triggerRefresh();
+    } catch {
+      setUploadMessage({ ok: false, text: "Client media upload service unavailable." });
+    } finally {
+      setUploadingMedia(false);
     }
   }
 
@@ -661,6 +708,69 @@ export default function JobDetailClient({ id }: { id: string }) {
           <div className="studio-card-soft px-4 py-3 text-sm text-[#6B635B]">
             No genuine AI curation recorded yet. Approve the collection above and launch AI Visual Director V2.
           </div>
+        )}
+
+        {/* Owner-Supplied Facebook Media / Export ZIP Upload (100% open-source, zero Meta API) */}
+        {!selection && !["queued", "running"].includes(String(job.status)) && (
+          <form
+            onSubmit={handleFacebookMediaUpload}
+            className="space-y-3 rounded-2xl border border-teal-200/80 bg-gradient-to-br from-teal-50/50 via-white to-[#FAF8F5] p-4 text-xs"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 font-semibold text-[#181614]">
+                <FolderCloudIcon className="h-4 w-4 text-[#0F766E]" />
+                Add Client Facebook Media (Export ZIP or Photos / Videos)
+              </div>
+              <span className="rounded-full bg-white px-2.5 py-0.5 text-[11px] font-medium text-[#544B43] ring-1 ring-[#E4DCD1]">
+                Up to 100 MB · SHA-256 &amp; FFmpeg verified
+              </span>
+            </div>
+            <p className="leading-relaxed text-[#5C534B]">
+              Facebook&apos;s CDN blocks automated bot downloads via <code>robots.txt</code>. Drop the client&apos;s official
+              Facebook &ldquo;Download Page Information&rdquo; <code>.zip</code> (post dates read automatically) or any
+              authorized Facebook photo/video file below to include it in AI curation and Google Drive delivery.
+            </p>
+            <div className="grid gap-3 sm:grid-cols-12">
+              <label className="block sm:col-span-7">
+                <span className="mb-1 block font-medium text-[#2C2824]">Facebook ZIP archive or photo / video</span>
+                <input
+                  type="file"
+                  accept=".zip,image/jpeg,image/png,image/webp,image/gif,image/avif,video/mp4,video/quicktime,video/webm"
+                  onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
+                  className="block w-full cursor-pointer rounded-xl border border-dashed border-[#C7BCAE] bg-white px-3 py-2 text-xs text-[#2C2824] file:mr-3 file:rounded-lg file:border-0 file:bg-[#F2ECE4] file:px-3 file:py-1 file:text-xs file:font-semibold file:text-[#181614] hover:border-[#0F766E]"
+                />
+              </label>
+              <label className="block sm:col-span-5">
+                <span className="mb-1 block font-medium text-[#2C2824]">Published date (optional for loose files)</span>
+                <input
+                  type="date"
+                  value={uploadDate}
+                  onChange={(e) => setUploadDate(e.target.value)}
+                  className="studio-input py-2 text-xs"
+                />
+              </label>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-[11px] text-[#7A7168]">
+                Uploaded files keep rights unverified and publish a new M4 revision for independent Admin review.
+              </span>
+              <button
+                type="submit"
+                disabled={uploadingMedia || !uploadFile}
+                className="studio-btn-primary py-2 text-xs"
+              >
+                {uploadingMedia ? "Processing & Extracting Frames…" : "Upload Facebook Media"}
+              </button>
+            </div>
+            {uploadMessage && (
+              <p
+                role="status"
+                className={`font-medium ${uploadMessage.ok ? "text-emerald-800" : "text-rose-700"}`}
+              >
+                {uploadMessage.text}
+              </p>
+            )}
+          </form>
         )}
 
         {/* Editorial AI Direction Brief */}
