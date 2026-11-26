@@ -392,3 +392,68 @@ def test_p1_multibatch_website_resume_continues_checkpoint_across_pages(worker, 
     assert {f"{web}/p1.jpg", f"{web}/p2.jpg"} <= urls2
     assert m2["window_start_utc"] == m1["window_start_utc"]
     assert m2["window_end_utc"] == m1["window_end_utc"]
+
+
+def test_website_apex_robots_redirect_and_single_blocked_url_do_not_halt_remaining_downloads(
+    tmp_path, monkeypatch
+):
+    """Regression from live petmania.co.uk UAT:
+    1) A bare-apex image URL (https://salon.test/...) whose /robots.txt 301-redirects to
+       https://www.salon.test/robots.txt (both inside media_origins) must download cleanly.
+    2) A single disallowed/blocked URL on a website must be recorded as access_blocked without
+       aborting downloads for the remaining valid website images.
+    """
+    www = "https://www.petmania-uat.test"
+    apex = "https://petmania-uat.test"
+    jpg_a = _jpeg_bytes(color=(180, 120, 90))
+    jpg_b = _jpeg_bytes(color=(110, 160, 140))
+    jpg_c = _jpeg_bytes(color=(140, 130, 190))
+
+    html = f"""<!doctype html><html><body>
+      <img src="{www}/blocked/secret.jpg">
+      <img src="{apex}/uploads/apex-photo.jpg">
+      <img src="{www}/uploads/www-photo-1.jpg">
+      <img src="{www}/uploads/www-photo-2.jpg">
+    </body></html>""".encode("utf-8")
+
+    responses = {
+        f"{www}/robots.txt": (200, {"Content-Type": "text/plain"}, b"User-agent: *\nDisallow: /blocked/\n"),
+        f"{apex}/robots.txt": (301, {"Location": f"{www}/robots.txt"}, b""),
+        f"{www}/": (200, {"Content-Type": "text/html"}, html),
+        f"{apex}/uploads/apex-photo.jpg": (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(jpg_a))}, jpg_a),
+        f"{www}/uploads/www-photo-1.jpg": (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(jpg_b))}, jpg_b),
+        f"{www}/uploads/www-photo-2.jpg": (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(jpg_c))}, jpg_c),
+    }
+    monkeypatch.setattr(requests.Session, "get", _mock_http_get(responses))
+    monkeypatch.setattr(
+        "app.legacy_collector.SafeHTTPAdapter.send",
+        lambda self, req, **kw: _mock_http_get(responses)(self, req.url, **kw),
+        raising=False,
+    )
+
+    now = datetime(2026, 11, 26, 12, 0, 0, tzinfo=UTC)
+    fb = "https://www.facebook.com/petmaniauat"
+    job = {
+        "job_id": "d" * 32,
+        "website_url": f"{www}/",
+        "facebook_url": fb,
+        "instagram_url": None,
+        "max_pages": 3,
+        "max_media": 10,
+        "social_permission_confirmed": False,
+        **frozen_window(now),
+    }
+    cfg = build_multitenant_collection_config(job)
+    cfg["sources"]["facebook"]["snapshot"] = {"profile_url": fb, "posts": []}
+    cfg["run_preprocessing"] = False
+    job_dir = tmp_path / job["job_id"]
+    job_dir.mkdir(parents=True, exist_ok=True)
+    manifest = collect_public_job(job_dir, job, cfg)
+
+    by_url = {a["source_url"]: a for a in manifest["assets"] if a["platform"] == "website"}
+    assert by_url[f"{www}/blocked/secret.jpg"]["extraction_status"] == "access_blocked"
+    assert by_url[f"{apex}/uploads/apex-photo.jpg"]["extraction_status"] == "downloaded"
+    assert by_url[f"{www}/uploads/www-photo-1.jpg"]["extraction_status"] == "downloaded"
+    assert by_url[f"{www}/uploads/www-photo-2.jpg"]["extraction_status"] == "downloaded"
+    assert "access_blocked" in manifest["sources"]["website"]["issues"]
+    assert manifest["sources"]["website"]["coverage"] == "incomplete"
