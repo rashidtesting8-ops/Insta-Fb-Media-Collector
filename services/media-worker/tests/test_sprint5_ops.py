@@ -83,6 +83,8 @@ def test_staging_compose_and_prod_caddyfile_hardened():
     assert "/setup-admin" in caddy_prod
     assert "/api/auth/setup-admin" in caddy_prod
     assert "respond @bootstrap 404" in caddy_prod
+    assert "@media_upload path /api/jobs/*/media-upload" in caddy_prod
+    assert "max_size 105MB" in caddy_prod
 
 
 def test_sqlite_backup_captures_wal_verifies_sha256_and_prunes(tmp_path):

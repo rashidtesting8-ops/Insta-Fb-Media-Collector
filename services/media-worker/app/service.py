@@ -476,9 +476,68 @@ def execute_started_curation(
     return _run_curation_sync()
 
 
+def handle_owner_media_upload(raw_bytes: bytes, actor: str) -> dict[str, Any]:
+    """Ingest an authenticated Named Admin Facebook ZIP/media upload and publish a new M4 revision."""
+    import re as _re
+    from app.social_upload import ingest_owner_media_upload, parse_framed_upload
+
+    meta, payload = parse_framed_upload(raw_bytes)
+    allowed_keys = {"job_id", "platform", "filename", "published_date"}
+    if not {"job_id", "platform", "filename"} <= set(meta) or not set(meta) <= allowed_keys:
+        raise HTTPException(400, "Expected job_id, platform, and filename in upload metadata")
+    job_id = meta.get("job_id")
+    platform = str(meta.get("platform") or "").strip().lower()
+    filename = str(meta.get("filename") or "").strip()
+    published_date = meta.get("published_date")
+    if not isinstance(job_id, str) or not _re.fullmatch(r"[a-f0-9]{32}", job_id):
+        raise HTTPException(400, "Valid 32-hex job_id required")
+    if not filename or len(filename) > 255:
+        raise HTTPException(400, "Valid filename required")
+    if published_date is not None and not isinstance(published_date, str):
+        raise HTTPException(400, "published_date must be a string when supplied")
+
+    with submission_lock:
+        rec = fetch(job_id)
+        if rec is None:
+            raise HTTPException(404, "Unknown job")
+        collection_base = None
+        if m4_approval_enabled():
+            with connect() as con:
+                has_ledger = con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_revisions'"
+                ).fetchone()
+                if not has_ledger:
+                    raise HTTPException(503, "M4 collection ledger is not migrated")
+                collection_base = con.execute(
+                    "SELECT coalesce(max(revision),0) FROM collection_revisions WHERE job=?",
+                    (job_id,),
+                ).fetchone()[0]
+        job_dir = Path(DATA_DIR) / job_id
+        manifest, summary = ingest_owner_media_upload(
+            job_dir,
+            rec,
+            platform=platform,
+            filename=filename,
+            payload=payload,
+            actor=actor,
+            published_date=published_date,
+        )
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        updated = {
+            **rec,
+            "sources": manifest.get("sources") or rec.get("sources"),
+            "preprocessing": manifest.get("preprocessing") or rec.get("preprocessing") or {"status": "completed"},
+            "updated_at": now_iso,
+        }
+        publish_rev = collection_base if summary["uploaded_count"] > 0 else None
+        store(updated, collection_base=publish_rev)
+        new_revision = (collection_base + 1) if publish_rev is not None else collection_base
+        return {**summary, "revision": new_revision}
+
+
 @app.post("/named/{action}")
 async def named_action(action: str, request: Request):
-    from app.named_auth import dispatch, is_local_bootstrap_peer, verify_admin_action
+    from app.named_auth import dispatch, is_local_bootstrap_peer, verify_admin_action, verify_admin_binary_action
     from starlette.concurrency import run_in_threadpool
 
     if action in ("bootstrap", "bootstrap-status"):
@@ -487,6 +546,19 @@ async def named_action(action: str, request: Request):
             raise HTTPException(403, "Browser bootstrap requires local loopback access")
 
     enabled = m4_approval_enabled()
+    if action == "collection-media-upload":
+        if not enabled:
+            raise HTTPException(404, "Approval adapter unavailable")
+        raw_bytes = await request.body()
+        actor = await run_in_threadpool(
+            verify_admin_binary_action,
+            DB,
+            action,
+            raw_bytes,
+            request.headers.get("x-named-assertion", ""),
+            request.headers.get("x-named-session", ""),
+        )
+        return await run_in_threadpool(handle_owner_media_upload, raw_bytes, actor)
     if action == "collection-resume":
         if not enabled:
             raise HTTPException(404, "Approval adapter unavailable")

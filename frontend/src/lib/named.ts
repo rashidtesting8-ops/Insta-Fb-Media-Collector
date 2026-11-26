@@ -49,3 +49,38 @@ export async function namedCall(
     body: raw,
   });
 }
+
+export async function namedBinaryCall(
+  action: string,
+  meta: Record<string, unknown>,
+  binaryPayload: Uint8Array,
+  session = "",
+  timeoutMs = 90_000,
+) {
+  const key = process.env.NAMED_ASSERTION_SECRET;
+  const dashboard = process.env.MEDIA_WORKER_DASHBOARD_TOKEN;
+  if (!key || key.length < 32 || !dashboard || [
+    dashboard, process.env.MEDIA_WORKER_TOKEN, process.env.DASHBOARD_PASSWORD,
+    process.env.DASHBOARD_SESSION_SECRET, process.env.N8N_PIPELINE_TOKEN,
+  ].includes(key)) throw new Error("Named authentication unavailable");
+  const headerBuf = Buffer.from(JSON.stringify(meta) + "\n", "utf8");
+  const framed = Buffer.concat([headerBuf, Buffer.from(binaryPayload)]);
+  const hashStr = (s: string) => createHash("sha256").update(s).digest("hex");
+  const bodyHash = createHash("sha256").update(framed).digest("hex");
+  const claims = Buffer.from(JSON.stringify({
+    iss: "pgm-frontend", aud: "pgm-worker", sub: hashStr(session), action, body: bodyHash,
+    exp: Math.floor(Date.now() / 1000) + 30, jti: randomUUID().replaceAll("-", ""),
+  })).toString("base64url");
+  const signature = createHmac("sha256", key).update(claims).digest("hex");
+  const url = new URL("/named/" + action, process.env.WORKER_URL || "http://127.0.0.1:8788");
+  return fetch(url, {
+    method: "POST", cache: "no-store", redirect: "error", signal: AbortSignal.timeout(timeoutMs),
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "X-API-Key": dashboard,
+      "X-Named-Session": session,
+      "X-Named-Assertion": claims + "." + signature,
+    },
+    body: framed,
+  });
+}

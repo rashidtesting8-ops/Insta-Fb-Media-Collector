@@ -28,9 +28,20 @@
 		-Server
 	}
 
-	request_body {
-		max_size 64KB
+	# Allow up to 105MB strictly on authenticated owner Facebook media uploads;
+	# enforce tight 64KB limit on every other API/page request.
+	@media_upload path /api/jobs/*/media-upload
+	handle @media_upload {
+		request_body {
+			max_size 105MB
+		}
+		reverse_proxy dashboard:3000
 	}
 
-	reverse_proxy dashboard:3000
+	handle {
+		request_body {
+			max_size 64KB
+		}
+		reverse_proxy dashboard:3000
+	}
 }

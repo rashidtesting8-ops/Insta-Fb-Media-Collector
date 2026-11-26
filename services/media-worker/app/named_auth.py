@@ -420,6 +420,22 @@ def verify_admin_action(db, action, raw, header, session):
     return actor, body
 
 
+def verify_admin_binary_action(db, action, raw, header, session):
+    """Verify HMAC assertion over raw binary bytes, single-use replay nonce, and active named Admin session."""
+    claims = verify_assertion(header, action, raw, session)
+    session_hash = digest(session)
+    now = int(time.time())
+    with closing(_connect(db)) as con, con:
+        _ensure_schema(con)
+        _consume_nonce(con, claims, now)
+        if claims["exp"] <= int(time.time()):
+            raise denied()
+        actor, role = session_actor(con, session_hash)
+        if role != "admin":
+            raise denied()
+    return actor
+
+
 def dispatch(db, action, raw, header, session, *, approval_root=None):
     claims = verify_assertion(header, action, raw, session)
     body = _parse_json_body(raw)

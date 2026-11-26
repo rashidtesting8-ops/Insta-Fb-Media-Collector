@@ -13,9 +13,11 @@ from starlette.responses import JSONResponse
 
 MAX_BODY = 64 * 1024
 MAX_LARGE_BODY = 512 * 1024
+MAX_UPLOAD_BODY = 100 * 1024 * 1024 + 8192
 LOGIN_RATE_LIMIT = 20
 LOGIN_WINDOW_S = 60
 LARGE_BODY_PATH = re.compile(r"^(?:/named/collection-execute|/jobs/[A-Za-z0-9_-]{1,128}/delivery-result)$")
+UPLOAD_BODY_PATH = "/named/collection-media-upload"
 JOB_READ = re.compile(r"/jobs(?:/[A-Za-z0-9_-]{1,128}(?:/(?:file|pipeline-status|delivery|curation|manifest))?)?")
 log = logging.getLogger("uvicorn.error")
 
@@ -109,10 +111,17 @@ class WorkerSecurity:
             return
 
         if method == "POST":
-            if headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
-                await JSONResponse({"detail": "Expected application/json"}, 415)(scope, receive, respond)
+            ctype = headers.get("content-type", "").split(";")[0].strip().lower()
+            is_media_upload = path == UPLOAD_BODY_PATH
+            expected_ctype = "application/octet-stream" if is_media_upload else "application/json"
+            if ctype != expected_ctype:
+                await JSONResponse({"detail": f"Expected {expected_ctype}"}, 415)(scope, receive, respond)
                 return
-            body_limit = MAX_LARGE_BODY if LARGE_BODY_PATH.fullmatch(path) else MAX_BODY
+            body_limit = (
+                MAX_UPLOAD_BODY
+                if is_media_upload
+                else (MAX_LARGE_BODY if LARGE_BODY_PATH.fullmatch(path) else MAX_BODY)
+            )
             length = headers.get("content-length")
             if length is not None and (not length.isascii() or not length.isdecimal() or len(length) > 10):
                 await JSONResponse({"detail": "Invalid Content-Length"}, 400)(scope, receive, respond)
