@@ -34,6 +34,7 @@ type Props = {
   id: string;
   includeUndatedWebsite?: boolean;
   aiStatus?: string | null;
+  externalRefreshTick?: number;
   onChanged?: () => void;
 };
 
@@ -50,7 +51,13 @@ function sourceTitle(source: string): string {
   return source;
 }
 
-export default function CollectionReview({ id, includeUndatedWebsite = false, aiStatus, onChanged }: Props) {
+export default function CollectionReview({
+  id,
+  includeUndatedWebsite = false,
+  aiStatus,
+  externalRefreshTick = 0,
+  onChanged,
+}: Props) {
   const url = `/api/jobs/${id}/collection-approval`;
   const [review, setReview] = useState<Review | null>(null);
   const [message, setMessage] = useState("");
@@ -92,7 +99,7 @@ export default function CollectionReview({ id, includeUndatedWebsite = false, ai
       active = false;
       latest.current += 1;
     };
-  }, [load]);
+  }, [load, externalRefreshTick]);
 
   async function decide(action: Action) {
     if (!review || busy) return;

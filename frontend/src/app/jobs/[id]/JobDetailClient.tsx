@@ -144,9 +144,11 @@ function friendlyFileName(asset: ManifestAsset): string {
 }
 
 function dateBadge(asset: ManifestAsset): { label: string; className: string } {
-  if (asset.published_at_utc) {
+  const verifiedDate =
+    asset.published_at_utc || (asset.date_status === "verified" ? asset.post_date : null);
+  if (verifiedDate) {
     return {
-      label: `Published ${asset.published_at_utc.slice(0, 10)}`,
+      label: `Published ${verifiedDate.slice(0, 10)}`,
       className: "bg-emerald-50 text-emerald-700 border-emerald-200",
     };
   }
@@ -177,6 +179,7 @@ export default function JobDetailClient({ id }: { id: string }) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshTick, setRefreshTick] = useState(0);
+  const [reviewRefreshTick, setReviewRefreshTick] = useState(0);
   const [copiedId, setCopiedId] = useState(false);
 
   // Gallery filter, pagination & photo lightbox
@@ -379,6 +382,7 @@ export default function JobDetailClient({ id }: { id: string }) {
       }
       setResumeMessage("Historical collection resumed from saved checkpoint — polling live progress.");
       triggerRefresh();
+      setReviewRefreshTick((t) => t + 1);
     } catch {
       setResumeMessage("Resume collection request unavailable.");
     } finally {
@@ -420,6 +424,7 @@ export default function JobDetailClient({ id }: { id: string }) {
             : `No new files added (${dupes} duplicate${dupes === 1 ? "" : "s"} already in project).`,
       });
       triggerRefresh();
+      setReviewRefreshTick((t) => t + 1);
     } catch {
       setUploadMessage({ ok: false, text: "Client media upload service unavailable." });
     } finally {
@@ -655,6 +660,7 @@ export default function JobDetailClient({ id }: { id: string }) {
         id={id}
         includeUndatedWebsite={Boolean(job.include_undated_website)}
         aiStatus={job.ai_curation?.status ?? null}
+        externalRefreshTick={reviewRefreshTick}
         onChanged={triggerRefresh}
       />
 

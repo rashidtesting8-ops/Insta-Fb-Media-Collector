@@ -232,6 +232,7 @@ def test_mode_b_normalizes_selected_status_and_compact_otpm_prompt(tmp_path, iso
     class _QwenDriftProvider(VisionProvider):
         name = "openai_compatible"
         model = "qwen/qwen3.8-27b"
+        mode_b_calls = 0
 
         def complete(self, prompt, images, tracker, **_kwargs):
             if images:
@@ -267,46 +268,51 @@ def test_mode_b_normalizes_selected_status_and_compact_otpm_prompt(tmp_path, iso
                     usage={"input_tokens": 200, "output_tokens": 120},
                 )
             assert "minified JSON" in prompt
+            assert "design_art_direction" in prompt and "final_quality_assessment" in prompt
+            self.mode_b_calls += 1
             tracker.record({"input_tokens": 300, "output_tokens": 180}, retries=0)
-            return CompletionResult(
-                text=json.dumps({
-                    "schema_version": "visual-director-v2.0",
-                    "job_id": "job_otpm",
-                    "mode": "FINAL_CURATE",
-                    "business_visual_identity": {
-                        "style_summary": "Warm salon",
-                        "atmosphere": "Friendly",
-                        "brand_personality": "Caring",
-                        "key_visual_strengths": ["Authentic pets"],
-                        "recommended_design_direction": "Clean editorial",
-                    },
-                    "analysis_coverage": {"bogus_ignored": True},
-                    "service_images": [{
-                        "asset_id": "img_01",
-                        "reason": "Clear service visual",
-                        "recommended_section": "service",
-                        "selection_status": "selected",
-                        "extra_model_field": "dropped_safely",
-                    }],
-                    "design_art_direction": {
-                        "narrative": "Warm grooming story",
-                        "layout_guidance": "Grid",
-                        "color_and_lighting": "Bright",
-                        "typography_mood": "Modern",
-                        "section_pairing": "Hero+Service",
-                        "diversity_notes": "Limited sample",
-                    },
-                    "selected_asset_ids": ["img_01"],
-                    "rights_review_required_ids": [],
-                    "final_quality_assessment": {
-                        "overall_assessment": "Good sample",
-                        "strengths": ["Sharp"],
-                        "weaknesses": ["Single photo"],
-                        "meets_premium_standard": False,
-                    },
-                }),
-                usage={"input_tokens": 300, "output_tokens": 180},
-            )
+            payload = {
+                "schema_version": "visual-director-v2.0",
+                "job_id": "job_otpm",
+                "mode": "FINAL_CURATE",
+                "business_visual_identity": {
+                    "style_summary": "Warm salon",
+                    "atmosphere": "Friendly",
+                    "brand_personality": "Caring",
+                    "key_visual_strengths": ["Authentic pets"],
+                    "recommended_design_direction": "Clean editorial",
+                },
+                "analysis_coverage": {"bogus_ignored": True},
+                "service_images": [{
+                    "asset_id": "img_01",
+                    "reason": "Clear service visual",
+                    "recommended_section": "service",
+                    "selection_status": "selected",
+                    "extra_model_field": "dropped_safely",
+                }],
+                "design_art_direction": {
+                    "narrative": "Warm grooming story",
+                    "layout_guidance": "Grid",
+                    "color_and_lighting": "Bright",
+                    "typography_mood": "Modern",
+                    "section_pairing": "Hero+Service",
+                    "diversity_notes": "Limited sample",
+                },
+                "selected_asset_ids": ["img_01"],
+                "rights_review_required_ids": [],
+            }
+            if self.mode_b_calls == 1:
+                # Simulate real Qwen omitting trailing final_quality_assessment on attempt 1
+                return CompletionResult(text=json.dumps(payload), usage={"input_tokens": 300, "output_tokens": 180})
+            assert "SCHEMA VALIDATION FIX REQUIRED" in prompt
+            assert "final_quality_assessment" in prompt
+            payload["final_quality_assessment"] = {
+                "overall_assessment": "Good sample",
+                "strengths": ["Sharp"],
+                "weaknesses": ["Single photo"],
+                "meets_premium_standard": False,
+            }
+            return CompletionResult(text=json.dumps(payload), usage={"input_tokens": 300, "output_tokens": 180})
 
     cfg = AIProviderConfig(
         provider="openai_compatible",
