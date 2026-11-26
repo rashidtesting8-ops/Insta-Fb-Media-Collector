@@ -457,6 +457,7 @@ class CollectionCheckpoint:
         attempted = 0
         source_bytes_used = 0
         stop = None
+        per_asset_issues: list[str] = []
         for asset in report["assets"]:
             if asset.get("kind") not in ("image", "video"):
                 continue
@@ -503,12 +504,20 @@ class CollectionCheckpoint:
                 self._download_status(asset["asset_id"], "pending")
                 stop = "byte_budget"
                 break
+            elif status == "access_blocked" and source == "website":
+                # On a website, one blocked path/host must not halt downloads for the remaining
+                # valid site images; record the honest issue so coverage stays incomplete.
+                if "access_blocked" not in per_asset_issues:
+                    per_asset_issues.append("access_blocked")
             elif status in hard_stop_codes:
                 stop = status
                 break
         report = self.report(source)
-        if stop:
-            report["issues"] = list(dict.fromkeys([*report["issues"], stop]))
+        extra_issues = list(per_asset_issues)
+        if stop and stop not in extra_issues:
+            extra_issues.append(stop)
+        if extra_issues:
+            report["issues"] = list(dict.fromkeys([*report["issues"], *extra_issues]))
             report["coverage"] = "incomplete"
         return report
 

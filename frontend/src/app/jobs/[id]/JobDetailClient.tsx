@@ -1,5 +1,5 @@
 "use client";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import CollectionReview from "./CollectionReview";
 import { api } from "@/lib/api";
@@ -45,7 +45,7 @@ const JOURNEY_STEPS = [
   { num: 5, title: "Drive Delivery", sub: "Private folder" },
 ] as const;
 
-type GalleryFilter = "all" | "selected" | "images" | "videos" | "website" | "facebook";
+type GalleryFilter = "all" | "downloaded" | "selected" | "images" | "videos" | "website" | "facebook";
 
 function stagePresentation(stage: string | undefined): {
   label: string;
@@ -180,6 +180,7 @@ export default function JobDetailClient({ id }: { id: string }) {
   const [loading, setLoading] = useState(true);
   const [refreshTick, setRefreshTick] = useState(0);
   const [reviewRefreshTick, setReviewRefreshTick] = useState(0);
+  const lastReviewSyncKey = useRef<string | null>(null);
   const [copiedId, setCopiedId] = useState(false);
 
   // Gallery filter, pagination & photo lightbox
@@ -238,6 +239,11 @@ export default function JobDetailClient({ id }: { id: string }) {
         setDelivery(d);
         setRights(r);
         setBusinessName((prev) => prev || defaultBusinessName(j, d));
+        const syncKey = `${s?.stage || ""}:${r?.revision ?? ""}:${j?.ai_curation?.status || ""}`;
+        if (lastReviewSyncKey.current !== null && lastReviewSyncKey.current !== syncKey) {
+          setReviewRefreshTick((t) => t + 1);
+        }
+        lastReviewSyncKey.current = syncKey;
       } catch (e: unknown) {
         if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
       } finally {
@@ -315,11 +321,18 @@ export default function JobDetailClient({ id }: { id: string }) {
   }, [selection]);
 
   const primaryAssets = useMemo(() => {
-    return (manifest?.assets || []).filter((a) => a && a.type !== "frame");
+    const list = (manifest?.assets || []).filter((a) => a && a.type !== "frame");
+    // Surface downloaded local media before pending placeholders so operators inspect real photos first.
+    return [...list].sort((a, b) => {
+      const aReady = a.extraction_status === "downloaded" ? 0 : 1;
+      const bReady = b.extraction_status === "downloaded" ? 0 : 1;
+      return aReady - bReady;
+    });
   }, [manifest]);
 
   const filteredAssets = useMemo(() => {
     return primaryAssets.filter((a) => {
+      if (filter === "downloaded") return a.extraction_status === "downloaded";
       if (filter === "selected") return selectedSet.has(a.asset_id);
       if (filter === "images") return a.type === "image" || String(a.mime || "").startsWith("image/");
       if (filter === "videos") return a.type === "video" || String(a.mime || "").startsWith("video/");
@@ -696,6 +709,7 @@ export default function JobDetailClient({ id }: { id: string }) {
             {(
               [
                 ["all", `All (${primaryAssets.length})`],
+                ["downloaded", `Downloaded (${downloadedCount})`],
                 ["selected", `AI Selected (${selectedSet.size})`],
                 ["images", "Images"],
                 ["videos", "Videos"],

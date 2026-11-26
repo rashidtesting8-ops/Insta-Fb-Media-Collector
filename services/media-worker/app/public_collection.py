@@ -239,8 +239,12 @@ class PublicHTTP:
         current = origin(url)
         if current in self.held_origins:
             raise SourceStop(self.held_origins[current])
+        # Allow canonical apex <-> www redirects within the site's declared media_origins
+        # (e.g. https://salon.co.uk/robots.txt -> 301 https://www.salon.co.uk/robots.txt),
+        # while keeping third-party CDN origins pinned strictly to `{current}`.
+        allowed_robots = self.media_origins if current in self.media_origins else {current}
         return robots_allowed(self.session, url, self.robots,
-                              url_policy=lambda hop: self._network_policy(hop, {current}),
+                              url_policy=lambda hop: self._network_policy(hop, allowed_robots),
                               response_policy=self._check_response)
 
     def _check_response(self, response):
