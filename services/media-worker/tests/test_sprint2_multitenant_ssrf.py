@@ -534,3 +534,133 @@ def test_ssrf_safe_http_adapter_blocks_private_dns_before_connect():
     finally:
         session.close()
     assert dialed == []
+
+
+def test_website_builder_cdn_suffixes_allow_vetted_and_block_spoofed_origins():
+    cfg = build_multitenant_collection_config({
+        "website_url": "https://paws-salon.example.test/",
+        "facebook_url": "https://www.facebook.com/pawssalon/",
+        "social_permission_confirmed": True,
+    })
+    web_cfg = cfg["sources"]["website"]
+    assert ".wixstatic.com" in web_cfg["media_host_suffixes"]
+    assert ".squarespace-cdn.com" in web_cfg["media_host_suffixes"]
+    assert ".shopify.com" in web_cfg["media_host_suffixes"]
+    assert ".website-files.com" in web_cfg["media_host_suffixes"]
+
+    with build_collector_session() as session:
+        http = PublicHTTP(web_cfg["url"], web_cfg, session)
+        for allowed_url in (
+            "https://paws-salon.example.test/media/hero.jpg",
+            "https://static.wixstatic.com/media/grooming.jpg",
+            "https://images.squarespace-cdn.com/content/v1/dog.jpg",
+            "https://cdn.shopify.com/s/files/1/salon.webp",
+            "https://cdn.prod.website-files.com/abc/banner.png",
+            "https://i0.wp.com/paws-salon.example.test/photo.jpg",
+            "https://res.cloudinary.com/demo/image/upload/puppy.jpg",
+            "https://img1.wsimg.com/isteam/ip/dog.jpg",
+            "https://salon.b-cdn.net/uploads/cut.jpg",
+        ):
+            assert http.media_permitted(allowed_url) is True, allowed_url
+
+        for blocked_url in (
+            "http://static.wixstatic.com/media/insecure.jpg",
+            "https://static.wixstatic.com:8443/media/port.jpg",
+            "https://evilwixstatic.com/media/spoof.jpg",
+            "https://wixstatic.com/media/bare.jpg",
+            "https://evil-cdn.example.net/offscope.jpg",
+        ):
+            assert http.media_permitted(blocked_url) is False, blocked_url
+
+
+def test_wix_squarespace_lazy_gallery_and_fb_robots_disallowed_diagnostics(worker, tmp_path, monkeypatch):
+    """Multi-builder salon website downloads Wix/Squarespace/lazy video cleanly while
+    Facebook strictly obeys fbcdn robots.txt Disallow and records truthful diagnostics."""
+    web = "https://boutique-grooming.example.test"
+    fb = "https://www.facebook.com/boutiquegrooming/"
+    wix_cdn = "https://static.wixstatic.com"
+    sq_cdn = "https://images.squarespace-cdn.com"
+    fb_cdn = "https://scontent.fkhi22-1.fna.fbcdn.net"
+    window = frozen_window(datetime(2026, 11, 26, 12, 0, 0, tzinfo=UTC))
+
+    wix_jpg = _jpeg_bytes(600, 400, (190, 140, 100))
+    sq_jpg = _jpeg_bytes(640, 480, (90, 160, 150))
+    lazy_mp4 = _mp4_bytes(tmp_path)
+
+    home_html = (
+        "<html><body>"
+        f'<img data-src="{wix_cdn}/media/poodle-cut.jpg">'
+        f'<div data-bg="{sq_cdn}/content/v1/salon-banner.jpg"></div>'
+        f'<img src="https://evil-cdn.example.net/blocked.jpg">'
+        f'<video><source data-src="{web}/media/wash-clip.mp4"></video>'
+        "</body></html>"
+    )
+    responses = {
+        f"{web}/robots.txt": (200, {}, "User-agent: *\nAllow: /\n"),
+        f"{web}/": (200, {"Content-Type": "text/html"}, home_html),
+        f"{web}/media/wash-clip.mp4": (200, {"Content-Type": "video/mp4", "Content-Length": str(len(lazy_mp4))}, lazy_mp4),
+        f"{wix_cdn}/robots.txt": (200, {}, "User-agent: *\nAllow: /\n"),
+        f"{wix_cdn}/media/poodle-cut.jpg": (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(wix_jpg))}, wix_jpg),
+        f"{sq_cdn}/robots.txt": (200, {}, "User-agent: *\nAllow: /\n"),
+        f"{sq_cdn}/content/v1/salon-banner.jpg": (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(sq_jpg))}, sq_jpg),
+        # Real-world Meta fbcdn robots.txt policy: must be strictly respected (never bypassed).
+        f"{fb_cdn}/robots.txt": (200, {}, "User-agent: *\nDisallow: /\n"),
+    }
+    monkeypatch.setattr(requests.Session, "get", _mock_http_get(responses))
+
+    def fake_social_cli(cmd: list[str], _stage: Path) -> tuple[int, str]:
+        if "photos_albums" in cmd[-1]:
+            return 0, json.dumps([])
+        return 0, json.dumps([[3, f"{fb_cdn}/v/t51.82787-15/fb_dog.jpg", {
+            "category": "facebook",
+            "subcategory": "photos",
+            "id": "122299001",
+            "set_id": "pb.555.-2207520000",
+            "caption": "Fresh puppy groom",
+            "date": "2026-10-15 11:00:00",
+            "extension": "jpg",
+        }]])
+
+    monkeypatch.setenv("COLLECTION_ENGINE", "historical")
+    monkeypatch.delenv("PUBLIC_COLLECTION_CHECKPOINTS", raising=False)
+    monkeypatch.delenv("PUBLIC_COLLECTION_CONFIG", raising=False)
+    monkeypatch.setattr(worker, "frozen_window", lambda _: window)
+    real_collect = public_collection.collect_public_job
+    monkeypatch.setattr(
+        public_collection,
+        "collect_public_job",
+        lambda job_dir, job, config, **kw: real_collect(job_dir, job, config, social_runner=fake_social_cli),
+    )
+
+    scheduled: list[tuple] = []
+    monkeypatch.setattr(worker.executor, "submit", lambda *args: scheduled.append(args))
+
+    st, _, raw = request(worker.app, "/jobs", "POST", "test-admin", (json.dumps({
+        "website_url": f"{web}/",
+        "facebook_url": fb,
+        "social_permission_confirmed": True,
+        "max_pages": 3,
+        "max_media": 10,
+        "max_social_files": 5,
+    }).encode(),))
+    assert st == 202, raw
+    job_id = json.loads(raw)["job_id"]
+    fn, *args = scheduled.pop()
+    fn(*args)
+
+    manifest = json.loads((worker.DATA_DIR / job_id / "manifest.json").read_text(encoding="utf-8"))
+    by_url = {a.get("source_url"): a for a in manifest["assets"] if a.get("type") != "frame"}
+
+    # Wix + Squarespace data-bg + lazy video all downloaded cleanly; evil-cdn dropped.
+    assert by_url[f"{wix_cdn}/media/poodle-cut.jpg"]["extraction_status"] == "downloaded"
+    assert by_url[f"{sq_cdn}/content/v1/salon-banner.jpg"]["extraction_status"] == "downloaded"
+    assert by_url[f"{web}/media/wash-clip.mp4"]["extraction_status"] == "downloaded"
+    assert by_url[f"{web}/media/wash-clip.mp4"]["type"] == "video"
+    assert by_url[f"{web}/media/wash-clip.mp4"]["preprocessing"]["outcome"] == "video_processed"
+    assert "https://evil-cdn.example.net/blocked.jpg" not in by_url
+
+    # Facebook strictly obeyed robots.txt Disallow and recorded truthful diagnostics.
+    fb_asset = by_url[f"{fb_cdn}/v/t51.82787-15/fb_dog.jpg"]
+    assert fb_asset["extraction_status"] == "access_blocked"
+    assert fb_asset["failure_reason"] == "robots_disallowed"
+    assert "robots_disallowed" in manifest["sources"]["facebook"]["issues"]

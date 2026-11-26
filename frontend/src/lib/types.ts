@@ -57,6 +57,7 @@ export type ManifestAsset = {
   duration_sec?: number | null;
   rights_status?: string;
   extraction_status?: string;
+  failure_reason?: string | null;
   source_url?: string;
   source_caption?: string | null;
   published_at_utc?: string | null;

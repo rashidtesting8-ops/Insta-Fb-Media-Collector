@@ -832,6 +832,16 @@ export default function JobDetailClient({ id }: { id: string }) {
                             <span className="mt-1 rounded-full bg-white px-2.5 py-0.5 font-mono text-[10px] ring-1 ring-[#E4DCD1]">
                               {a.extraction_status || "metadata_only"}
                             </span>
+                            {a.failure_reason === "robots_disallowed" && (
+                              <span className="mt-1.5 text-[11px] leading-snug text-[#7A7168]">
+                                Blocked by platform robots.txt policy
+                              </span>
+                            )}
+                            {a.failure_reason && a.failure_reason !== "robots_disallowed" && (
+                              <span className="mt-1.5 text-[11px] leading-snug text-[#7A7168]">
+                                {a.failure_reason.replace(/_/g, " ")}
+                              </span>
+                            )}
                           </div>
                         )}
                         {isSelected && (

@@ -21,6 +21,23 @@ SOURCES = ("website", "instagram", "facebook")
 COLLECTION_HOLD = "blocked_unverified_collection"
 _ROBOTS_SITEMAP_RE = re.compile(r"^\s*sitemap\s*:\s*(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
 
+# Vetted website-builder & managed image CDNs used by pet grooming businesses
+# (Wix, Squarespace, Shopify, Webflow, WordPress Jetpack/Cloudinary, GoDaddy, BunnyCDN).
+# Every hop still enforces HTTPS-443, SafeHTTPAdapter DNS/SSRF checks, robots.txt, and magic-byte validation.
+WEBSITE_MEDIA_HOST_SUFFIXES = (
+    ".wixstatic.com",
+    ".squarespace-cdn.com",
+    ".shopify.com",
+    ".website-files.com",
+    ".webflow.com",
+    ".wp.com",
+    ".cloudinary.com",
+    ".wsimg.com",
+    ".ctfassets.net",
+    ".sanity.io",
+    ".b-cdn.net",
+)
+
 
 def origin(url):
     parts = urlsplit(url)
@@ -75,6 +92,7 @@ def build_multitenant_collection_config(job: dict) -> dict:
             "sitemaps": [],
             "discover_robots_sitemaps": True,
             "media_origins": _website_media_origins(website_url),
+            "media_host_suffixes": list(WEBSITE_MEDIA_HOST_SUFFIXES),
             "download_authorized": True,
             "page_budget": web_pages,
             "entry_limit": web_media,
@@ -171,6 +189,8 @@ class PublicHTTP:
         self.session = session
         self.robots = {}
         self.held_origins = held_origins if held_origins is not None else {}
+        self.diagnostic_issues: list[str] = []
+        self.blocked_url_reasons: dict[str, str] = {}
         self.remaining = limit(config, "request_budget")
         self.deadline = time.monotonic() + limit(config, "time_budget_seconds")
 
@@ -225,12 +245,22 @@ class PublicHTTP:
         # Discovery checks origin/suffix only. Robots rules are checked for each actual download hop.
         return self._origin_matches(origin(url), self.media_origins, allow_media_suffixes=True)
 
+    def _record_block(self, url: str, reason: str) -> None:
+        self.blocked_url_reasons[url] = reason
+        if reason not in self.diagnostic_issues:
+            self.diagnostic_issues.append(reason)
+
     def _get(self, url, allowed, headers=None, *, allow_media_suffixes=False):
         def check_hop(hop):
             path = urlsplit(hop).path.lower().rstrip("/")
             if path in ("/login", "/login.php", "/accounts/login", "/checkpoint", "/challenge"):
+                self._record_block(url, "login_redirect")
                 raise SourceStop("restricted")
-            if not self._origin_matches(origin(hop), allowed, allow_media_suffixes=allow_media_suffixes) or not self._robots(hop):
+            if not self._origin_matches(origin(hop), allowed, allow_media_suffixes=allow_media_suffixes):
+                self._record_block(url, "origin_not_allowed")
+                raise SourceStop("access_blocked")
+            if not self._robots(hop):
+                self._record_block(url, "robots_disallowed")
                 raise SourceStop("access_blocked")
             self._network_policy(hop, allowed, allow_media_suffixes=allow_media_suffixes)
 
@@ -566,6 +596,10 @@ def collect_public_job(
             if download_blocked:
                 report["issues"] = list(dict.fromkeys([*report["issues"], "download_authorization_required"]))
                 report["coverage"] = "incomplete"
+            if transport.diagnostic_issues:
+                report["issues"] = list(dict.fromkeys([*report["issues"], *transport.diagnostic_issues]))
+            if transport.blocked_url_reasons:
+                report["blocked_url_reasons"] = dict(transport.blocked_url_reasons)
             if getattr(inventory, "tools_executed", None):
                 tools_by_source[source] = list(inventory.tools_executed)
         reports[source] = report
@@ -624,6 +658,7 @@ def publish_checkpoint_manifest(
         if mode == "recorded_extractor":
             manifest["sources"][source].update(discovery_status=report["coverage"], coverage="unknown")
         items = {item["id"]: item for item in report["items"]}
+        blocked_reasons = report.get("blocked_url_reasons") or {}
         for asset in report["assets"]:
             normalized = {
                 **asset, "platform": source, "job_id": job["job_id"],
@@ -631,6 +666,8 @@ def publish_checkpoint_manifest(
                 "type": asset.get("kind"), "sha256": asset["digest"], "bytes": asset["size"],
                 "rights_status": "unverified",
             }
+            if asset.get("url") in blocked_reasons and asset.get("status") != "verified":
+                normalized["failure_reason"] = blocked_reasons[asset["url"]]
             if items[asset["item"]].get("shortcode") is not None:
                 normalized["source_shortcode"] = items[asset["item"]]["shortcode"]
             if items[asset["item"]].get("caption"):
