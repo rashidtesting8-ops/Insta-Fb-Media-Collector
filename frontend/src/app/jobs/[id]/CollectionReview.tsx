@@ -122,6 +122,7 @@ export default function CollectionReview({
   const [reason, setReason] = useState("");
   const [policyReason, setPolicyReason] = useState("");
   const [consentChecked, setConsentChecked] = useState(false);
+  const [copiedReviewLink, setCopiedReviewLink] = useState(false);
   const [busy, setBusy] = useState(false);
   const requestKey = useRef({ signature: "", key: "" });
   const latest = useRef(0);
@@ -158,10 +159,12 @@ export default function CollectionReview({
     };
   }, [load, externalRefreshTick]);
 
-  async function decide(action: Action) {
+  async function decide(action: Action, overrideReason?: string) {
     if (!review || busy) return;
+    const effectiveReason = (overrideReason ?? reason).trim();
+    if (action !== "start" && !effectiveReason) return;
     setBusy(true);
-    const signature = JSON.stringify([id, review.etag, action, reason]);
+    const signature = JSON.stringify([id, review.etag, action, effectiveReason]);
     if (requestKey.current.signature !== signature) requestKey.current = { signature, key: crypto.randomUUID() };
     try {
       const res = await fetch(action === "start" ? `/api/jobs/${id}/ai-start` : url + "/decisions", {
@@ -171,7 +174,7 @@ export default function CollectionReview({
           "If-Match": '"' + review.etag + '"',
           "Idempotency-Key": requestKey.current.key,
         },
-        body: JSON.stringify(action === "start" ? {} : { action, reason }),
+        body: JSON.stringify(action === "start" ? {} : { action, reason: effectiveReason }),
       });
       if (!res.ok) {
         setMessage((await res.json()).error);
@@ -192,10 +195,11 @@ export default function CollectionReview({
     }
   }
 
-  async function updateWebsitePolicy(nextInclude: boolean) {
-    if (!review || busy || !policyReason.trim()) return;
+  async function updateWebsitePolicy(nextInclude: boolean, overrideReason?: string) {
+    const effectiveReason = (overrideReason ?? policyReason).trim();
+    if (!review || busy || !effectiveReason) return;
     setBusy(true);
-    const signature = JSON.stringify([id, review.etag, "website-policy", nextInclude, policyReason]);
+    const signature = JSON.stringify([id, review.etag, "website-policy", nextInclude, effectiveReason]);
     if (requestKey.current.signature !== signature) requestKey.current = { signature, key: crypto.randomUUID() };
     try {
       const res = await fetch(`/api/jobs/${id}/website-policy`, {
@@ -205,7 +209,7 @@ export default function CollectionReview({
           "If-Match": '"' + review.etag + '"',
           "Idempotency-Key": requestKey.current.key,
         },
-        body: JSON.stringify({ include_undated_website: nextInclude, reason: policyReason.trim() }),
+        body: JSON.stringify({ include_undated_website: nextInclude, reason: effectiveReason }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -219,14 +223,22 @@ export default function CollectionReview({
       onChanged?.();
       setMessage(
         nextInclude
-          ? "Undated website media included — new revision published for approval."
-          : "Undated website media excluded — new revision published for approval.",
+          ? "Website photos included! Ready for an independent team admin to approve."
+          : "Undated website media excluded — updated revision published for approval.",
       );
     } catch {
       setMessage("Outcome unknown. Refresh the review to verify policy revision.");
     } finally {
       setBusy(false);
     }
+  }
+
+  function copyReviewLinkForTeammate() {
+    if (typeof window === "undefined") return;
+    const shareUrl = window.location.href;
+    navigator.clipboard?.writeText(shareUrl).catch(() => {});
+    setCopiedReviewLink(true);
+    setTimeout(() => setCopiedReviewLink(false), 2400);
   }
 
   async function executeAiCuration() {
@@ -368,96 +380,169 @@ export default function CollectionReview({
             </div>
           </div>
 
-          {/* Undated Website Media Policy Toggle */}
-          {websiteUnknown > 0 && (
-            <div className="space-y-3 rounded-xl border border-amber-200 bg-amber-50/75 p-4 text-xs">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="font-semibold text-amber-950">
-                  Undated website media ({websiteUnknown} item{websiteUnknown === 1 ? "" : "s"} without verified publication dates)
+          {/* Undated Website Media Policy Toggle — 1-click Include when excluded; safe collapsed Exclude when included */}
+          {websiteUnknown > 0 && !includeUndatedWebsite && (
+            <div className="space-y-3 rounded-2xl border border-amber-200 bg-gradient-to-br from-amber-50/90 via-white to-amber-50/40 p-4 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-0.5">
+                  <div className="font-semibold text-amber-950">
+                    Undated website media ({websiteUnknown} photo{websiteUnknown === 1 ? "" : "s"} ready to include)
+                  </div>
+                  <p className="leading-relaxed text-amber-900">
+                    Most salon websites don&apos;t list upload dates on gallery photos. Include them in 1 click so AI can pick your best shots.
+                  </p>
                 </div>
-                <span className="rounded-full bg-white px-2.5 py-0.5 text-[11px] font-semibold text-amber-900 ring-1 ring-amber-200">
-                  {includeUndatedWebsite ? "Included (labeled unverified)" : "Currently excluded"}
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => updateWebsitePolicy(true, "Include evergreen salon website gallery")}
+                  className="studio-btn-primary shrink-0 py-2 text-xs"
+                >
+                  <CheckIcon className="h-3.5 w-3.5" />
+                  Yes, Include Website Photos (1-Click)
+                </button>
+              </div>
+              <details className="rounded-xl border border-amber-200/80 bg-white/80 px-3 py-2">
+                <summary className="cursor-pointer text-[11px] font-medium text-amber-900">
+                  Or enter a custom policy reason
+                </summary>
+                <div className="mt-2.5 space-y-2">
+                  <div className="flex flex-wrap gap-1.5">
+                    {["Include evergreen salon website gallery", "Verified current client website media"].map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => setPolicyReason(preset)}
+                        className="rounded-full border border-amber-300 bg-white px-2.5 py-0.5 text-[11px] font-medium text-amber-900 transition hover:bg-amber-100"
+                      >
+                        + {preset}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex flex-col gap-2 sm:flex-row">
+                    <input
+                      type="text"
+                      maxLength={300}
+                      value={policyReason}
+                      onChange={(e) => setPolicyReason(e.target.value)}
+                      placeholder="Reason for website undated-media policy change"
+                      className="studio-input flex-1 py-2 text-xs"
+                    />
+                    <button
+                      type="button"
+                      disabled={busy || !policyReason.trim()}
+                      onClick={() => updateWebsitePolicy(true)}
+                      className="shrink-0 rounded-xl border border-amber-400 bg-white px-4 py-2 text-xs font-semibold text-amber-950 shadow-sm transition hover:bg-amber-100 disabled:opacity-50"
+                    >
+                      Include undated website media
+                    </button>
+                  </div>
+                </div>
+              </details>
+            </div>
+          )}
+
+          {websiteUnknown > 0 && includeUndatedWebsite && (
+            <div className="rounded-xl border border-emerald-200/80 bg-emerald-50/50 px-4 py-3 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-semibold text-emerald-950">
+                  ✓ Undated website media ({websiteUnknown} item{websiteUnknown === 1 ? "" : "s"}) included for AI selection
+                </span>
+                <span className="rounded-full bg-white px-2.5 py-0.5 text-[11px] font-medium text-emerald-800 ring-1 ring-emerald-200">
+                  Included (labeled unverified)
                 </span>
               </div>
-              <p className="leading-relaxed text-amber-900">
-                Many salon websites don&apos;t publish upload dates on gallery photos. Current policy:{" "}
-                <strong>
-                  {includeUndatedWebsite ? "Included in AI curation (labeled unverified)" : "Excluded from AI curation"}
-                </strong>
-                . Updating this policy publishes a new immutable revision for approval.
-              </p>
+              <details className="mt-2">
+                <summary className="cursor-pointer text-[11px] font-medium text-emerald-800 hover:underline">
+                  Need to exclude undated website photos instead?
+                </summary>
+                <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                  <input
+                    type="text"
+                    maxLength={300}
+                    value={policyReason}
+                    onChange={(e) => setPolicyReason(e.target.value)}
+                    placeholder="Reason for website undated-media policy change"
+                    className="studio-input flex-1 py-2 text-xs"
+                  />
+                  <button
+                    type="button"
+                    disabled={busy || !policyReason.trim()}
+                    onClick={() => updateWebsitePolicy(false)}
+                    className="shrink-0 rounded-xl border border-amber-400 bg-white px-4 py-2 text-xs font-semibold text-amber-950 shadow-sm transition hover:bg-amber-100 disabled:opacity-50"
+                  >
+                    Exclude undated website media
+                  </button>
+                </div>
+              </details>
+            </div>
+          )}
+
+          {/* Submitter / Zero-Eligible Guidance Banner with 1-Click Teammate Share Link */}
+          {review.state === "pending" && !review.permissions.approve && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-sky-200 bg-sky-50/80 px-4 py-3 text-xs leading-relaxed text-sky-950">
+              <div className="min-w-0 flex-1">
+                {review.eligible_assets.length === 0 ? (
+                  <>
+                    <strong className="font-semibold">No eligible assets in Revision {review.revision} yet:</strong>{" "}
+                    Click <strong>Yes, Include Website Photos</strong> above or upload client Facebook media below so AI has photos to review.
+                  </>
+                ) : (
+                  <>
+                    <strong className="font-semibold">Independent Second Admin Required:</strong>{" "}
+                    You submitted or updated Revision {review.revision}. Share this link with a{" "}
+                    <strong>second Named Admin</strong> to approve and launch AI selection.
+                  </>
+                )}
+              </div>
+              {review.eligible_assets.length > 0 && (
+                <button
+                  type="button"
+                  onClick={copyReviewLinkForTeammate}
+                  className="studio-btn-secondary shrink-0 py-1.5 text-xs"
+                >
+                  {copiedReviewLink ? "Review Link Copied ✓" : "Copy Review Link for Teammate"}
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Decision Panel — with 1-Click Quick Approve for Independent Admin #2 */}
+          {hasDecisions && (
+            <div className="studio-card-soft space-y-3 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <span className="text-xs font-semibold text-[#181614]">Team Admin Approval</span>
+                  <p className="text-[11px] text-[#7A7168]">
+                    Review the collected photos below, then approve to unlock AI visual selection.
+                  </p>
+                </div>
+                {review.permissions.approve && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => decide("approve", reason.trim() || "Approved after reviewing collected assets")}
+                    className="studio-btn-primary py-2 text-xs"
+                  >
+                    <CheckIcon className="h-3.5 w-3.5" />
+                    Quick Approve (1-Click)
+                  </button>
+                )}
+              </div>
               <div className="flex flex-wrap gap-1.5">
-                {["Include evergreen salon website gallery", "Verified current client website media"].map((preset) => (
+                {["Approved after reviewing collected assets", "Approved by independent reviewer"].map((preset) => (
                   <button
                     key={preset}
                     type="button"
-                    onClick={() => setPolicyReason(preset)}
-                    className="rounded-full border border-amber-300 bg-white px-2.5 py-0.5 text-[11px] font-medium text-amber-900 transition hover:bg-amber-100"
+                    onClick={() => setReason(preset)}
+                    className="rounded-full border border-[#DFD6CA] bg-white px-2.5 py-0.5 text-[11px] font-medium text-[#5C534B] hover:border-[#0F766E] hover:text-[#0F766E]"
                   >
                     + {preset}
                   </button>
                 ))}
               </div>
-              <div className="flex flex-col gap-2 sm:flex-row">
-                <input
-                  type="text"
-                  maxLength={300}
-                  value={policyReason}
-                  onChange={(e) => setPolicyReason(e.target.value)}
-                  placeholder="Reason for website undated-media policy change"
-                  className="studio-input flex-1 py-2 text-xs"
-                />
-                <button
-                  type="button"
-                  disabled={busy || !policyReason.trim()}
-                  onClick={() => updateWebsitePolicy(!includeUndatedWebsite)}
-                  className="shrink-0 rounded-xl border border-amber-400 bg-white px-4 py-2 text-xs font-semibold text-amber-950 shadow-sm transition hover:bg-amber-100 disabled:opacity-50"
-                >
-                  {includeUndatedWebsite ? "Exclude undated website media" : "Include undated website media"}
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Submitter / Zero-Eligible Guidance Banner */}
-          {review.state === "pending" && !review.permissions.approve && (
-            <div className="rounded-xl border border-sky-200 bg-sky-50/80 px-4 py-3 text-xs leading-relaxed text-sky-950">
-              {review.eligible_assets.length === 0 ? (
-                <>
-                  <strong className="font-semibold">No eligible assets in Revision {review.revision} yet:</strong>{" "}
-                  Upload client Facebook media below or include undated website media above to publish an eligible
-                  revision for approval.
-                </>
-              ) : (
-                <>
-                  <strong className="font-semibold">Independent Second Admin Required:</strong>{" "}
-                  You submitted or updated Revision {review.revision}. Under Two-Admin M4 governance, a{" "}
-                  <strong>second Named Admin</strong> must sign in to approve this revision and launch AI selection.
-                </>
-              )}
-            </div>
-          )}
-
-          {/* Decision Panel */}
-          {hasDecisions && (
-            <div className="studio-card-soft space-y-3 p-4">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-xs font-semibold text-[#181614]">Admin Review Decision</span>
-                <div className="flex flex-wrap gap-1.5">
-                  {["Approved after reviewing collected assets", "Approved by independent reviewer"].map((preset) => (
-                    <button
-                      key={preset}
-                      type="button"
-                      onClick={() => setReason(preset)}
-                      className="rounded-full border border-[#DFD6CA] bg-white px-2.5 py-0.5 text-[11px] font-medium text-[#5C534B] hover:border-[#0F766E] hover:text-[#0F766E]"
-                    >
-                      + {preset}
-                    </button>
-                  ))}
-                </div>
-              </div>
               <label className="block text-xs font-medium text-[#5C534B]">
-                Decision reason
+                Decision reason (optional for Quick Approve, required for Deny/Revoke)
                 <textarea
                   maxLength={900}
                   rows={2}
@@ -478,7 +563,7 @@ export default function CollectionReview({
                       onClick={() => decide(a)}
                       className={
                         a === "approve"
-                          ? "studio-btn-primary py-2 text-xs"
+                          ? "studio-btn-secondary py-2 text-xs text-[#0F766E] hover:border-[#0F766E]"
                           : "studio-btn-secondary py-2 text-xs text-rose-700 hover:border-rose-300 hover:bg-rose-50"
                       }
                     >
@@ -582,8 +667,8 @@ export default function CollectionReview({
             </details>
           </div>
 
-          {/* Approval History */}
-          <details className="rounded-xl border border-[#EAE2D8] bg-white px-4 py-3 text-xs" open={review.history.length > 0 && review.history.length <= 6}>
+          {/* Approval History (collapsed by default once review moves forward so screen stays calm) */}
+          <details className="rounded-xl border border-[#EAE2D8] bg-white px-4 py-3 text-xs">
             <summary className="flex cursor-pointer items-center justify-between font-semibold text-[#181614]">
               <span>Approval history ({review.history.length})</span>
               <a
