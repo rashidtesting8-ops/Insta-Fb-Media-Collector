@@ -83,9 +83,17 @@ def test_http_post_uses_requests_with_tls_verify_and_no_ua_override(monkeypatch)
     assert result == {"ok": True}
     assert captured["verify"] is True
     assert captured["allow_redirects"] is False
-    assert captured["timeout"] == 30
+    assert captured["timeout"] == (15.0, 30.0)
     assert captured["json"] == {"model": "m"}
     assert "user-agent" not in {k.lower() for k in captured["headers"]}
+
+    # Shorter configured read timeout clamps connect timeout so connect never exceeds read.
+    captured.clear()
+    OpenAICompatibleProvider._http_post(
+        {"url": "https://api.groq.com/openai/v1/chat/completions", "headers": {"Authorization": "Bearer fake"},
+         "body": {"model": "m"}, "timeout_s": 10}
+    )
+    assert captured["timeout"] == (10.0, 10.0)
 
 
 def test_complete_success_tracks_usage():
