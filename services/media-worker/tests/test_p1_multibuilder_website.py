@@ -526,3 +526,43 @@ def test_apex_to_www_document_redirect_and_yoast_xml_comment_sitemap(tmp_path, m
     )
     with pytest.raises(ValueError, match="Unsupported sitemap markup"):
         inv._sitemap(b'<!DOCTYPE foo [<!ENTITY xxe "bar">]><urlset></urlset>', f"{www}/sitemap.xml")
+
+
+def test_shopify_auth_and_app_proxy_urls_excluded_and_galleries_prioritized():
+    """Regression from live caninecarousel.com UAT:
+    - 'cat' must NOT match 'customer_authentication', and 'post' must NOT match 'job-postings'.
+    - Shopify '/customer_authentication/' and '/apps/' URLs must be excluded.
+    - Salon gallery/grooming pages must sort ahead of generic pages/blogs."""
+    from app.website_inventory import WebsiteInventory
+
+    base = "https://canine-test.example.com"
+    html = (
+        f'<html><body>'
+        f'<a href="{base}/customer_authentication/redirect?locale=en">Sign in</a>'
+        f'<a href="{base}/apps/pages/job-postings">Jobs</a>'
+        f'<a href="{base}/apps/pages/updates">Updates</a>'
+        f'<a href="{base}/blogs/news/autumn-tips">Blog</a>'
+        f'<a href="{base}/pages/grooming-gallery">Grooming Gallery</a>'
+        f'<a href="{base}/pages/cat-food-supplies">Cat Food</a>'
+        f'</body></html>'
+    ).encode("utf-8")
+
+    inv = WebsiteInventory(
+        f"{base}/",
+        sitemaps=(),
+        fetch=lambda _u: (f"{base}/", html),
+        permitted=lambda _u: True,
+        document_limit=100_000,
+        entry_limit=50,
+        historical_mode=True,
+    )
+    links, _, _ = inv._html(html, f"{base}/", [])
+    urls = [u for _, u in links]
+    assert f"{base}/customer_authentication/redirect?locale=en" not in urls
+    assert f"{base}/apps/pages/job-postings" not in urls
+    assert f"{base}/apps/pages/updates" not in urls
+    assert f"{base}/pages/grooming-gallery" in urls
+    assert f"{base}/pages/cat-food-supplies" in urls
+    assert f"{base}/blogs/news/autumn-tips" in urls
+    # Visual gallery page must appear BEFORE blog/product links
+    assert urls.index(f"{base}/pages/grooming-gallery") < urls.index(f"{base}/blogs/news/autumn-tips")
