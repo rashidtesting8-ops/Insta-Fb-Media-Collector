@@ -23,6 +23,18 @@ class InferenceHeld(ValueError):
         self.claim_nonce = claim_nonce
 
 
+_RECONCILIATION_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS ai_attempt_reconciliations(
+ id INTEGER PRIMARY KEY, job TEXT NOT NULL, claim TEXT NOT NULL,
+ logical_request TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL,
+ utc TEXT NOT NULL, UNIQUE(claim,logical_request))""",
+    """CREATE TRIGGER IF NOT EXISTS ai_reconcile_immutable BEFORE UPDATE ON ai_attempt_reconciliations
+ BEGIN SELECT RAISE(ABORT,'immutable ledger'); END""",
+    """CREATE TRIGGER IF NOT EXISTS ai_reconcile_no_delete BEFORE DELETE ON ai_attempt_reconciliations
+ BEGIN SELECT RAISE(ABORT,'immutable ledger'); END""",
+)
+RECONCILIATION_SCHEMA = "\n".join(stmt + ";" for stmt in _RECONCILIATION_STATEMENTS) + "\n"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ai_execution_claims(
  job TEXT NOT NULL, revision INTEGER NOT NULL, decision INTEGER NOT NULL,
@@ -32,7 +44,55 @@ CREATE TABLE IF NOT EXISTS ai_provider_attempts(
  claim TEXT NOT NULL, logical_request TEXT NOT NULL, mode TEXT NOT NULL, reserved TEXT NOT NULL,
  outcome TEXT NOT NULL CHECK(outcome IN ('dispatching','returned','rejected','ambiguous')),
  finished TEXT, PRIMARY KEY(claim,logical_request));
-"""
+""" + RECONCILIATION_SCHEMA
+
+
+def ensure_reconciliation_schema(con) -> None:
+    """Additively create the immutable reconciliation table on already-migrated M4 DBs."""
+    if not con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_provider_attempts'"
+    ).fetchone():
+        return
+    for stmt in _RECONCILIATION_STATEMENTS:
+        con.execute(stmt)
+
+
+def _has_reconciliation_table(con) -> bool:
+    return bool(
+        con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_attempt_reconciliations'"
+        ).fetchone()
+    )
+
+
+def count_unresolved_attempts(con, job: str) -> int:
+    """Count in-flight ('dispatching') or unreconciled ('ambiguous') provider attempts for a job."""
+    if not con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_provider_attempts'"
+    ).fetchone():
+        return 0
+    if _has_reconciliation_table(con):
+        row = con.execute(
+            """SELECT COUNT(*) FROM ai_provider_attempts a
+               JOIN ai_execution_claims e ON a.claim=e.claim
+               LEFT JOIN ai_attempt_reconciliations r
+                 ON r.claim=a.claim AND r.logical_request=a.logical_request
+               WHERE e.job=?
+                 AND (a.outcome='dispatching' OR (a.outcome='ambiguous' AND r.id IS NULL))""",
+            (job,),
+        ).fetchone()
+    else:
+        row = con.execute(
+            """SELECT COUNT(*) FROM ai_provider_attempts a
+               JOIN ai_execution_claims e ON a.claim=e.claim
+               WHERE e.job=? AND a.outcome IN ('dispatching','ambiguous')""",
+            (job,),
+        ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def has_unresolved_attempt(con, job: str) -> bool:
+    return count_unresolved_attempts(con, job) > 0
 
 _current = ContextVar("worker_ai_execution", default=None)
 _dispatching = ContextVar("worker_ai_dispatching", default=False)
@@ -101,9 +161,7 @@ def execution(job_dir, job, processing_consent, start_etag):
     with run.transaction() as con:
         review, decision = run.check(con)
         require(review["etag"] == start_etag, "Requested Start AI does not match this job and revision")
-        require(not con.execute("""SELECT 1 FROM ai_provider_attempts a JOIN ai_execution_claims e
-                ON a.claim=e.claim WHERE e.job=? AND a.outcome IN ('dispatching','ambiguous')""",
-                                (job,)).fetchone(), "Prior request requires reconciliation")
+        require(not has_unresolved_attempt(con, job), "Prior request requires reconciliation")
         raw, subset = con.execute("SELECT manifest,subset FROM collection_revisions WHERE job=? AND revision=?",
                                   (job, review["revision"])).fetchone()
         require(sha256(raw).hexdigest() == review["manifest_sha256"] and

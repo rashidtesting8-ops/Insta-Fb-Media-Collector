@@ -619,6 +619,24 @@ export default function JobDetailClient({ id }: { id: string }) {
     return asset?.extraction_status === "downloaded" && Boolean(asset.local_path) && !verifiedSet.has(aid);
   }).length;
   const downloadedCount = primaryAssets.filter((a) => a.extraction_status === "downloaded").length;
+  const aiStatus = job.ai_curation?.status ?? null;
+  const aiActive = ["queued", "started"].includes(String(aiStatus || ""));
+  const aiFailed = !selection && ["failed", "interrupted"].includes(String(aiStatus || ""));
+  const rawAiFailure =
+    aiFailed && job.ai_curation
+      ? (Array.isArray(job.ai_curation.warnings) &&
+          job.ai_curation.warnings.find((w) => typeof w === "string" && w.trim())) ||
+        (Array.isArray(job.ai_curation.errors) &&
+          job.ai_curation.errors.find((e) => typeof e === "string" && e.trim())) ||
+        (typeof job.ai_curation.error === "string" ? job.ai_curation.error : "")
+      : "";
+  const aiFailureSummary = aiFailed
+    ? !rawAiFailure
+      ? "The AI provider stopped before publishing a final curation."
+      : /timed out/i.test(rawAiFailure)
+        ? `Upstream Vision AI timed out before finishing (${rawAiFailure}).`
+        : rawAiFailure
+    : null;
 
   let nextStepTitle = "Review collected media";
   let nextStepHint = "Check the gathered photos & videos below, then have a second Named Admin approve and start AI curation.";
@@ -634,6 +652,12 @@ export default function JobDetailClient({ id }: { id: string }) {
       verifiedSelectedCount > 0
         ? `${verifiedSelectedCount} of ${selectedIds.length} AI-selected asset(s) are rights-verified. Scroll to Google Drive Delivery to upload.`
         : "Fill in the rights evidence reference below and click Verify on each approved asset you want to include in Google Drive.";
+  } else if (aiActive) {
+    nextStepTitle = "AI Visual Director is analyzing your media";
+    nextStepHint = `Vision AI (${job.ai_curation?.model || "configured model"}) is scoring real pixels and video frames in the background — this page updates automatically every 5 seconds.`;
+  } else if (aiFailed) {
+    nextStepTitle = "AI run stopped before finishing — reconcile & retry";
+    nextStepHint = "Your downloaded photos are safe. Click Reconcile & Reset Failed AI Run in Collection Review below to publish a fresh revision and retry without re-scraping.";
   } else if (["queued", "collecting", "preprocessing", "ai_processing", "delivering"].includes(String(status?.stage || ""))) {
     nextStepTitle = "Working automatically in background";
     nextStepHint = "This page refreshes every 5 seconds — no action needed while processing finishes.";
@@ -773,7 +797,32 @@ export default function JobDetailClient({ id }: { id: string }) {
             {resumeMessage}
           </p>
         )}
-        {job.error && (
+        {aiActive && !selection && (
+          <div
+            role="status"
+            className="flex flex-wrap items-center gap-3 rounded-xl border border-teal-200 bg-teal-50/85 px-4 py-3 text-xs text-teal-950"
+          >
+            <span className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-[#0F766E]" />
+            <div>
+              <strong className="font-semibold">AI Visual Director V2 is running</strong>{" "}
+              ({job.ai_curation?.model || "Vision AI"}) — inspecting real pixels &amp; video frames in batches. This page refreshes automatically every 5 seconds.
+            </div>
+          </div>
+        )}
+        {aiFailed && aiFailureSummary && (
+          <div
+            role="alert"
+            className="space-y-1.5 rounded-xl border border-rose-200 bg-rose-50/90 px-4 py-3 text-xs text-rose-950"
+          >
+            <div className="font-semibold text-rose-900">AI Visual Director stopped before finishing</div>
+            <p className="leading-relaxed text-rose-900/90">{aiFailureSummary}</p>
+            <p className="text-[11px] text-rose-800">
+              Your {downloadedCount} downloaded file{downloadedCount === 1 ? "" : "s"} are preserved. Click{" "}
+              <strong>Reconcile &amp; Reset Failed AI Run</strong> in Collection Review below to retry without re-scraping.
+            </p>
+          </div>
+        )}
+        {job.error && !aiFailed && (
           <div className="rounded-xl border border-amber-200 bg-amber-50/75 px-4 py-3 text-xs text-amber-950">
             <strong className="font-semibold">Review note:</strong>{" "}
             {job.error.includes("unverified")
@@ -788,7 +837,8 @@ export default function JobDetailClient({ id }: { id: string }) {
         key={id}
         id={id}
         includeUndatedWebsite={Boolean(job.include_undated_website)}
-        aiStatus={job.ai_curation?.status ?? null}
+        aiStatus={aiStatus}
+        hasCuration={Boolean(selection)}
         externalRefreshTick={reviewRefreshTick}
         onChanged={triggerRefresh}
       />

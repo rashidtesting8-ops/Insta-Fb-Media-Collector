@@ -738,7 +738,8 @@ class OpenAICompatibleProvider(VisionProvider):
                         raise RateLimitedError(f"provider quota exhausted: {detail}") from None
                     retry_after = 0.0
                     try:
-                        retry_after = float(str(resp_headers.get("retry-after") or "0").strip())
+                        parsed_ra = float(str(resp_headers.get("retry-after") or "0").strip())
+                        retry_after = min(60.0, max(0.0, parsed_ra)) if math.isfinite(parsed_ra) else 0.0
                     except (TypeError, ValueError):
                         retry_after = 0.0
                     last_error = f"HTTP 429: {detail}"
@@ -751,7 +752,8 @@ class OpenAICompatibleProvider(VisionProvider):
                     if attempt < retries and ai_execution.can_retry_http(code):
                         retry_after = 0.0
                         try:
-                            retry_after = float(str(resp_headers.get("retry-after") or "0").strip())
+                            parsed_ra = float(str(resp_headers.get("retry-after") or "0").strip())
+                            retry_after = min(60.0, max(0.0, parsed_ra)) if math.isfinite(parsed_ra) else 0.0
                         except (TypeError, ValueError):
                             retry_after = 0.0
                         self._sleep(max(retry_after, 2.0 * (2**attempt)))
@@ -782,11 +784,12 @@ class OpenAICompatibleProvider(VisionProvider):
         allowed_endpoints = {GROQ_ACCEPTANCE_ENDPOINT, *extra_allowed}
         if request["url"] not in allowed_endpoints:
             raise ProviderUnavailableError("External processing consent for this destination is unavailable")
+        read_timeout = max(1.0, float(request["timeout_s"]))
         response = requests.post(
             request["url"],
             headers=request["headers"],
             json=request["body"],
-            timeout=request["timeout_s"],
+            timeout=(min(15.0, read_timeout), read_timeout),
             verify=True,
             allow_redirects=False,
         )

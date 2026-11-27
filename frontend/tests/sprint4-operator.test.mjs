@@ -542,3 +542,102 @@ test("Guided Studio UX supports 1-click website include, Quick Approve, teammate
   assert.equal(rightsPosts[1].ifMatch, `"${"1".repeat(64)}"`);
   jobRender.unmount();
 });
+
+test("JobDetailClient and CollectionReview surface live AI failure reason and 1-click audited AI reconciliation", async () => {
+  const reconcileCalls = [];
+  let revNum = 2;
+  let claimed = true;
+  let unresolved = 1;
+  let aiStatus = "failed";
+
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    const method = init?.method || "GET";
+    if (u === `/api/jobs/${ID}`) {
+      return jsonResponse({
+        job_id: ID,
+        status: "partial_success",
+        website_url: "https://vanityfurr.co.uk/",
+        include_undated_website: true,
+        ai_curation:
+          aiStatus === "failed"
+            ? {
+                status: "failed",
+                model: "gemini-3.1-flash-lite",
+                warnings: ["MODE A batch failed after 3 attempt(s): Read timed out. (read timeout=120)"],
+                errors: ["Previous attempt requires reconciliation or was already sent"],
+              }
+            : { status: "reconciled" },
+      });
+    }
+    if (u === `/api/jobs/${ID}/status`) {
+      return jsonResponse({
+        job_id: ID,
+        stage: "partial_success",
+        terminal: true,
+        job_status: "partial_success",
+        detail: "AI curation stopped before completing — review error below to reconcile and retry.",
+      });
+    }
+    if (u === `/api/jobs/${ID}/manifest`) {
+      return jsonResponse({
+        job_id: ID,
+        assets: [{ asset_id: "w1", platform: "website", type: "image", extraction_status: "downloaded", local_path: "website/w1.jpg", source_url: "https://vanityfurr.co.uk/groom.jpg" }],
+      });
+    }
+    if (u === `/api/jobs/${ID}/curation` || u === `/api/jobs/${ID}/delivery`) return jsonResponse({ error: "none" }, 404);
+    if (u === `/api/jobs/${ID}/rights`) {
+      return jsonResponse({ job_id: ID, revision: revNum, manifest_sha256: "m".repeat(64), state: claimed ? "approved" : "pending", etag: ETAG, verified_asset_ids: [], verified_rights: {}, history: [] });
+    }
+    if (u === `/api/jobs/${ID}/collection-approval`) {
+      return jsonResponse({
+        job_id: ID,
+        revision: revNum,
+        etag: ETAG,
+        state: claimed ? "approved" : "pending",
+        start_authorized: claimed,
+        ai_execution_claimed: claimed,
+        unresolved_ai_attempts: unresolved,
+        window_start_utc: "2025-11-26T00:00:00Z",
+        window_end_utc: "2026-11-26T00:00:00Z",
+        manifest_sha256: "m".repeat(64),
+        eligible_subset_sha256: "s".repeat(64),
+        permissions: { approve: !claimed, deny: true, revoke: claimed, start: false },
+        eligible_assets: ["w1"],
+        inherited_assets: {},
+        sources: [{ source: "website", discovered: 1, downloaded: 1, unknown_date: 1, out_of_window: 0, missing_children: 0, coverage: "unknown", evidence: "x", outcomes: [] }],
+        history: [],
+      });
+    }
+    if (u === `/api/jobs/${ID}/ai-reconcile` && method === "POST") {
+      const body = JSON.parse(String(init?.body || "{}"));
+      reconcileCalls.push({ body, ifMatch: init?.headers?.["If-Match"], key: init?.headers?.["Idempotency-Key"] });
+      revNum = 3;
+      claimed = false;
+      unresolved = 0;
+      aiStatus = "reconciled";
+      return jsonResponse({ ok: true });
+    }
+    return jsonResponse({ error: "unexpected" }, 404);
+  };
+
+  const rendered = render(React.createElement(JobDetailClient, { id: ID }));
+  await waitFor(() => assert.ok(rendered.container.textContent.includes("AI Visual Director stopped before finishing")), { timeout: 2000 });
+  const reconcileBtn = await waitFor(
+    () => rendered.getByRole("button", { name: "Reconcile & Reset Failed AI Run" }),
+    { timeout: 2000 },
+  );
+  assert.ok(rendered.container.textContent.includes("Read timed out"));
+  // Dead Run AI Curation button must be hidden when revision already has a failed claim
+  assert.ok(!rendered.container.textContent.includes("Run AI Curation (Async)"));
+
+  await act(async () => {
+    fireEvent.click(reconcileBtn);
+  });
+  await waitFor(() => assert.equal(reconcileCalls.length, 1), { timeout: 2000 });
+  assert.equal(reconcileCalls[0].ifMatch, `"${ETAG}"`);
+  assert.ok(reconcileCalls[0].key);
+  assert.ok(reconcileCalls[0].body.reason.length > 10);
+  await waitFor(() => assert.ok(rendered.container.textContent.includes("Quick Approve (1-Click)")), { timeout: 2000 });
+  rendered.unmount();
+});

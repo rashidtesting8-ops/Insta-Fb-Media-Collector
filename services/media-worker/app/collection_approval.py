@@ -20,6 +20,7 @@ ACTIONS = {
     "collection-rights-review",
     "collection-rights-decide",
     "collection-website-policy",
+    "collection-ai-reconcile",
 }
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS collection_revisions (
@@ -318,13 +319,8 @@ def verify_checkpoint_release(
             if not claim_row:
                 return False, "ai_execution_not_claimed", {}, set()
             claim = claim_row[0]
-            unresolved = con.execute(
-                """SELECT 1 FROM ai_provider_attempts a
-                   JOIN ai_execution_claims e ON a.claim=e.claim
-                   WHERE e.job=? AND a.outcome IN ('dispatching','ambiguous')""",
-                (job,),
-            ).fetchone()
-            if unresolved:
+            from app.ai_execution import has_unresolved_attempt
+            if has_unresolved_attempt(con, job):
                 return False, "ai_attempt_unresolved", {}, set()
             mode_b_ok = con.execute(
                 "SELECT 1 FROM ai_provider_attempts WHERE claim=? AND mode='B' AND outcome='returned'",
@@ -357,6 +353,8 @@ def handle(con, root, operation, body, actor, *, precomputed_snapshot=None):
         fields = {"job_id", "asset_id", "decision", "reason", "evidence_ref", "if_match", "request_key"}
     elif action == "website-policy":
         fields = {"job_id", "include_undated_website", "reason", "if_match", "request_key"}
+    elif action == "ai-reconcile":
+        fields = {"job_id", "reason", "if_match", "request_key"}
     else:
         fields = {"job_id"} if action in ("review", "panel") else {"job_id", "if_match", "request_key"}
         if action in ("approve", "deny", "revoke"):
@@ -396,16 +394,84 @@ def handle(con, root, operation, body, actor, *, precomputed_snapshot=None):
             raise HTTPException(412, "Collection or decision changed")
         if not submitter or not con.execute("SELECT 1 FROM named_accounts WHERE id=?", (submitter,)).fetchone():
             raise HTTPException(403, "Verified submitter required")
+        if (Path(root).resolve() / job / "curation.json").exists():
+            raise conflict("Cannot change website media policy after AI curation is published")
         row = con.execute("SELECT payload FROM jobs WHERE id=?", (job,)).fetchone()
         if not row:
             raise HTTPException(404, "Unknown job")
         record = json.loads(row[0])
+        ai_cur = record.get("ai_curation") if isinstance(record.get("ai_curation"), dict) else {}
+        if ai_cur.get("status") in ("queued", "started"):
+            raise conflict("Cannot change website media policy while AI curation is in progress")
         include_flag = bool(body["include_undated_website"])
         updated = {**record, "include_undated_website": include_flag, "updated_at": utc()}
         accept(con, root, updated, rev)
         con.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(updated), job))
         from app.named_auth import audit
         audit(con, actor, "website-policy/" + ("include" if include_flag else "exclude"), job)
+        return handle(con, root, "collection-review", {"job_id": job}, actor)
+    if action == "ai-reconcile":
+        if not current or body["if_match"] != tag:
+            raise HTTPException(412, "Collection or decision changed")
+        if not submitter or not con.execute("SELECT 1 FROM named_accounts WHERE id=?", (submitter,)).fetchone():
+            raise HTTPException(403, "Verified submitter required")
+        if (Path(root).resolve() / job / "curation.json").exists():
+            raise conflict("Existing curation preserved; cannot reconcile completed AI run")
+        row = con.execute("SELECT payload FROM jobs WHERE id=?", (job,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Unknown job")
+        record = json.loads(row[0])
+        ai_cur = record.get("ai_curation") if isinstance(record.get("ai_curation"), dict) else {}
+        if ai_cur.get("status") in ("queued", "started", "completed", "partial"):
+            raise conflict("Cannot reconcile an active or completed AI run")
+        from app.ai_execution import ensure_reconciliation_schema
+        ensure_reconciliation_schema(con)
+        if con.execute(
+            """SELECT 1 FROM ai_provider_attempts a
+               JOIN ai_execution_claims e ON a.claim=e.claim
+               WHERE e.job=? AND a.outcome='dispatching'""",
+            (job,),
+        ).fetchone():
+            raise conflict("AI request is still in-flight; wait for completion or restart recovery")
+        has_claim_on_rev = bool(
+            con.execute(
+                "SELECT 1 FROM ai_execution_claims WHERE job=? AND revision=?",
+                (job, rev),
+            ).fetchone()
+        )
+        unresolved_rows = con.execute(
+            """SELECT a.claim, a.logical_request FROM ai_provider_attempts a
+               JOIN ai_execution_claims e ON a.claim=e.claim
+               LEFT JOIN ai_attempt_reconciliations r
+                 ON r.claim=a.claim AND r.logical_request=a.logical_request
+               WHERE e.job=? AND a.outcome='ambiguous' AND r.id IS NULL""",
+            (job,),
+        ).fetchall()
+        if not has_claim_on_rev and not unresolved_rows:
+            raise conflict("No failed or unresolved AI execution to reconcile")
+        stamp = utc()
+        clean_reason = body["reason"].strip()[:300]
+        for claim_id, logical_req in unresolved_rows:
+            con.execute(
+                """INSERT OR IGNORE INTO ai_attempt_reconciliations(job,claim,logical_request,actor,reason,utc)
+                   VALUES (?,?,?,?,?,?)""",
+                (job, claim_id, logical_req, actor, clean_reason, stamp),
+            )
+        updated = {
+            **record,
+            "ai_curation": {
+                "status": "reconciled",
+                "reconciled_by": actor,
+                "reconciled_at": stamp,
+                "reconciled_attempts": len(unresolved_rows),
+                "reason": clean_reason,
+            },
+            "updated_at": stamp,
+        }
+        accept(con, root, updated, rev)
+        con.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(updated), job))
+        from app.named_auth import audit
+        audit(con, actor, "ai-reconcile", job)
         return handle(con, root, "collection-review", {"job_id": job}, actor)
     if action == "rights-decide":
         if not _rights_table_exists(con):

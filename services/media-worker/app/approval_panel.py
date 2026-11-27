@@ -37,7 +37,16 @@ def panel(con, result, actor, submitter, current, start):
     eligible = json.loads(subset)
     identified = current and bool(con.execute("SELECT 1 FROM named_accounts WHERE id=?", (submitter,)).fetchone())
     state = result["state"]
+    ai_claimed = False
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_execution_claims'").fetchone():
+        ai_claimed = bool(
+            con.execute("SELECT 1 FROM ai_execution_claims WHERE job=? AND revision=?", (job, rev)).fetchone()
+        )
+    from app.ai_execution import count_unresolved_attempts
+    unresolved_attempts = count_unresolved_attempts(con, job)
     return {**result, "window_start_utc": begin, "window_end_utc": end,
+            "ai_execution_claimed": ai_claimed,
+            "unresolved_ai_attempts": unresolved_attempts,
             "sources": source_rows(json.loads(manifest), json.loads(inventory)),
             "eligible_assets": [candidate["asset_id"] for candidate in eligible["candidates"]],
             "inherited_assets": eligible["inherited"],

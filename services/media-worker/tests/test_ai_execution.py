@@ -331,3 +331,169 @@ def test_resume_collection_blocked_while_ai_curation_active(setup, worker):
         worker.resume_collection(job)
     assert exc_info.value.status_code == 409
     assert "AI curation is in progress" in str(exc_info.value.detail)
+
+
+def test_audited_ai_reconcile_recovers_ambiguous_timeout_and_preserves_m4(setup, worker, monkeypatch):
+    """Audited collection-ai-reconcile clears an ambiguous timeout onto rev+1, preserves immutable ledgers,
+    keeps Two-Admin approval enforced on rev+1, and allows Drive release once the retry succeeds."""
+    import base64
+    from requests import Timeout
+    from app import collection_approval
+    from app.ai.pipeline import run_started_curation
+    from app.ai.provider import AIProviderConfig, ImagePayload, MockVisionProvider, OpenAICompatibleProvider, UsageTracker
+
+    folder, job, consent, action = setup
+    action("approve")
+    tag = action("start")
+    monkeypatch.setenv("AI_ALLOWED_ENDPOINTS", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+    config = AIProviderConfig(
+        provider="openai_compatible",
+        model="gemini-3.1-flash-lite",
+        endpoint="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        api_key="offline-test-key",
+        max_retries=2,
+        batch_size=3,
+        min_request_spacing_s=0.0,
+    )
+
+    def timeout_transport(_req):
+        ai_execution.require_transport()
+        raise Timeout("Read timed out. (read timeout=120)")
+
+    # 1. Simulate a network timeout during fenced execution -> records outcome='ambiguous'
+    outcome1 = run_started_curation(
+        folder,
+        job,
+        processing_consent=consent,
+        start_etag=tag,
+        config=config,
+        provider=OpenAICompatibleProvider(config, sleep=lambda _s: None, transport=timeout_transport),
+    )
+    assert outcome1.status == "failed"
+    assert not (folder / "curation.json").exists()
+    rec = worker.fetch(job)
+    rec["ai_curation"] = {"status": "failed", "warnings": outcome1.warnings, "errors": outcome1.errors}
+    worker.store(rec)
+
+    with worker.connect() as con:
+        assert ai_execution.has_unresolved_attempt(con, job) is True
+        # Grab Admin #1 (submitter) and Admin #2 (reviewer)
+        submitter_id = rec["submitter_principal_id"]
+        reviewer_id = con.execute(
+            "SELECT id FROM named_accounts WHERE id!=? AND active=1 AND role='admin' LIMIT 1",
+            (submitter_id,),
+        ).fetchone()[0]
+        panel1 = collection_approval.handle(con, worker.DATA_DIR, "collection-panel", {"job_id": job}, reviewer_id)
+        assert panel1["ai_execution_claimed"] is True
+        assert panel1["unresolved_ai_attempts"] == 1
+
+        # 2. Audited reconcile publishes Revision 2 and records immutable ai_attempt_reconciliations row
+        reconciled = collection_approval.handle(
+            con,
+            worker.DATA_DIR,
+            "collection-ai-reconcile",
+            {
+                "job_id": job,
+                "reason": "Gemini Batch 8 timed out after 120s; verified no curation written",
+                "if_match": panel1["etag"],
+                "request_key": "reconcile-rev1-timeout",
+            },
+            reviewer_id,
+        )
+        assert reconciled["revision"] == 2
+        assert reconciled["state"] == "stale"
+        assert reconciled["start_authorized"] is False
+        assert ai_execution.has_unresolved_attempt(con, job) is False
+        assert con.execute("SELECT COUNT(*) FROM ai_attempt_reconciliations WHERE job=?", (job,)).fetchone()[0] == 1
+        assert con.execute("SELECT COUNT(*) FROM ai_provider_attempts WHERE outcome='ambiguous'").fetchone()[0] == 1
+        # Immutability triggers prevent tampering with reconciliation history
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute("UPDATE ai_attempt_reconciliations SET reason='tampered'")
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute("DELETE FROM ai_attempt_reconciliations")
+
+        # 3. Submitter STILL cannot self-approve Revision 2 (Two-Admin invariant preserved)
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as self_exc:
+            collection_approval.handle(
+                con,
+                worker.DATA_DIR,
+                "collection-approve",
+                {"job_id": job, "reason": "self", "if_match": reconciled["etag"], "request_key": "self-rev2"},
+                submitter_id,
+            )
+        assert self_exc.value.status_code == 403
+
+        # 4. Independent Admin #2 approves & starts Revision 2
+        approved2 = collection_approval.handle(
+            con,
+            worker.DATA_DIR,
+            "collection-approve",
+            {"job_id": job, "reason": "Approved retry revision", "if_match": reconciled["etag"], "request_key": "appr-rev2"},
+            reviewer_id,
+        )
+        started2 = collection_approval.handle(
+            con,
+            worker.DATA_DIR,
+            "collection-start",
+            {"job_id": job, "if_match": approved2["etag"], "request_key": "start-rev2"},
+            reviewer_id,
+        )
+        con.commit()
+
+    # 5. Retry AI execution succeeds on Revision 2 and publishes curation.json
+    def ok_transport(req):
+        ai_execution.require_transport()
+        content = req["body"]["messages"][-1]["content"]
+        images = [
+            ImagePayload("test", "image/jpeg", base64.b64decode(p["image_url"]["url"].split(",")[1]))
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "image_url"
+        ]
+        mock = MockVisionProvider().complete(content[0]["text"], images, UsageTracker(AIProviderConfig(provider="mock")))
+        return {
+            "choices": [{"message": {"content": mock.text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 110, "completion_tokens": 85},
+        }
+
+    outcome2 = run_started_curation(
+        folder,
+        job,
+        processing_consent=consent,
+        start_etag=started2["etag"],
+        config=config,
+        provider=OpenAICompatibleProvider(config, sleep=lambda _s: None, transport=ok_transport),
+    )
+    assert outcome2.status == "completed", outcome2.errors
+    assert (folder / "curation.json").is_file()
+
+    # 6. verify_checkpoint_release passes on Revision 2 (reconciled Rev 1 attempt no longer blocks Drive!)
+    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    ok_release, release_reason, _, _ = collection_approval.verify_checkpoint_release(
+        worker.DB, worker.DATA_DIR, job, manifest
+    )
+    assert ok_release is True, release_reason
+    assert release_reason == "ok"
+
+    # 7. Reconciliation is rejected (409) once curation.json exists
+    with worker.connect() as con:
+        latest_rev = collection_approval.handle(con, worker.DATA_DIR, "collection-review", {"job_id": job}, reviewer_id)
+        with pytest.raises(HTTPException) as post_exc:
+            collection_approval.handle(
+                con,
+                worker.DATA_DIR,
+                "collection-ai-reconcile",
+                {"job_id": job, "reason": "too late", "if_match": latest_rev["etag"], "request_key": "late-rec"},
+                reviewer_id,
+            )
+        assert post_exc.value.status_code == 409
+
+
+def test_orchestration_derive_stage_handles_failed_interrupted_and_partial():
+    from app.orchestration import derive_stage
+    failed = derive_stage({"status": "partial_success", "ai_curation": {"status": "failed"}})
+    assert failed["stage"] == "partial_success"
+    assert "reconcile" in failed["detail"].lower()
+
+    partial = derive_stage({"status": "partial_success", "ai_curation": {"status": "partial", "mock": False}})
+    assert partial["stage"] == "awaiting_rights_approval"
