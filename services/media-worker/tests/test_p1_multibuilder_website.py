@@ -23,9 +23,14 @@ import requests
 
 from app import public_collection
 from app.browser_renderer import (
+    BrowserRenderError,
     BrowserRendererUnavailable,
+    _append_computed_media_hints,
+    _looks_like_challenge_dom,
     looks_like_js_rendered_page,
     make_ssrf_route_handler,
+    playwright_installed,
+    render_page_html,
     verify_browser_url,
 )
 from app.legacy_collector import build_collector_session
@@ -238,10 +243,17 @@ def test_p1_default_sitemap_xml_probe_discovers_pages_when_robots_omits_sitemap(
     assert photo in by_url and by_url[photo]["extraction_status"] == "downloaded"
 
 
-def test_p1_browser_renderer_ssrf_guard_blocks_private_ips_schemes_ports_and_heavy_types():
+def test_p1_browser_renderer_ssrf_guard_blocks_private_ips_schemes_ports_and_heavy_types(monkeypatch):
     def fake_resolver(host: str, port: int):
         mapping = {
             "public-salon.example.test": "93.184.216.34",
+            "www.public-salon.example.test": "93.184.216.34",
+            "cdn.jsdelivr.net": "93.184.216.35",
+            "cdnjs.cloudflare.com": "93.184.216.36",
+            "unpkg.com": "93.184.216.37",
+            "static.wixstatic.com": "93.184.216.38",
+            "evil-tracker.example.net": "93.184.216.39",
+            "other-site.example.org": "93.184.216.40",
             "rebind-loopback.example.test": "127.0.0.1",
             "rebind-rfc1918.example.test": "10.0.0.42",
             "rebind-metadata.example.test": "169.254.169.254",
@@ -265,23 +277,147 @@ def test_p1_browser_renderer_ssrf_guard_blocks_private_ips_schemes_ports_and_hea
         with pytest.raises(ValueError):
             verify_browser_url(bad, resolver=fake_resolver)
 
-    handler = make_ssrf_route_handler(resolver=fake_resolver)
+    # Audit H-3: make_ssrf_route_handler MUST NEVER call route.continue_(); it fetches via
+    # SafeHTTPAdapter + response_get and validates EVERY redirect hop, host, robots, method, and cap.
+    mock_responses = {
+        "https://public-salon.example.test/": (
+            200,
+            {"Content-Type": "text/html", "Set-Cookie": "sid=secret", "Content-Encoding": "gzip"},
+            b"<html><body><div id='root'></div></body></html>",
+        ),
+        "https://public-salon.example.test/app.js": (
+            200,
+            {"Content-Type": "application/javascript", "Access-Control-Allow-Origin": "*"},
+            b"console.log('ok');",
+        ),
+        "https://cdnjs.cloudflare.com/ajax/libs/react.js": (
+            200,
+            {"Content-Type": "application/javascript"},
+            b"// react",
+        ),
+        "https://unpkg.com/gallery.js": (
+            200,
+            {"Content-Type": "application/javascript"},
+            b"// gallery",
+        ),
+        # H-3 Attack 1: 302 redirect to AWS metadata / loopback / internal Docker host
+        "https://public-salon.example.test/redir-metadata": (
+            302,
+            {"Location": "http://169.254.169.254/latest/meta-data/"},
+            b"",
+        ),
+        "https://public-salon.example.test/redir-offsite": (
+            302,
+            {"Location": "https://other-site.example.org/steal"},
+            b"",
+        ),
+        "https://public-salon.example.test/redir-login": (
+            302,
+            {"Location": "https://public-salon.example.test/login"},
+            b"",
+        ),
+        "https://public-salon.example.test/redir-robots": (
+            302,
+            {"Location": "https://public-salon.example.test/private-blocked"},
+            b"",
+        ),
+        # H-3 Attack 2: Document challenge / 403 / 429 must abort truthfully
+        "https://public-salon.example.test/cf-wall": (
+            403,
+            {"Content-Type": "text/html", "cf-mitigated": "challenge"},
+            b"Just a moment...",
+        ),
+        "https://public-salon.example.test/rate-limit": (
+            429,
+            {"Content-Type": "text/html"},
+            b"Too Many Requests",
+        ),
+        # H-3 Attack 3: Oversized subresource payload
+        "https://public-salon.example.test/huge.js": (
+            200,
+            {"Content-Type": "application/javascript"},
+            b"x" * 100_000,
+        ),
+    }
+    monkeypatch.setattr(requests.Session, "get", _mock_http_get(mock_responses))
 
-    def run_route(url: str, resource_type: str = "document") -> str:
-        outcome = []
+    route_state: dict = {}
+    handler = make_ssrf_route_handler(
+        site_url="https://public-salon.example.test/",
+        resolver=fake_resolver,
+        robots_check=lambda u: "/private-blocked" not in u,
+        max_requests=20,
+        max_response_bytes=16_384,
+        state=route_state,
+    )
+
+    def run_route(url: str, resource_type: str = "document", method: str = "GET") -> tuple[str, dict]:
+        outcome: list[tuple[str, dict]] = []
+
+        def forbid_continue():
+            pytest.fail("H-3 violation: route.continue_() must NEVER be called by make_ssrf_route_handler")
+
         route = SimpleNamespace(
-            request=SimpleNamespace(url=url, resource_type=resource_type),
-            continue_=lambda: outcome.append("continue"),
-            abort=lambda: outcome.append("abort"),
+            request=SimpleNamespace(url=url, resource_type=resource_type, method=method),
+            continue_=forbid_continue,
+            fulfill=lambda **kw: outcome.append(("fulfill", kw)),
+            abort=lambda: outcome.append(("abort", {})),
         )
         handler(route)
         return outcome[0]
 
-    assert run_route("https://public-salon.example.test/app.js", "script") == "continue"
-    assert run_route("https://public-salon.example.test/font.woff2", "font") == "abort"
-    assert run_route("https://public-salon.example.test/hero.mp4", "media") == "abort"
-    assert run_route("https://rebind-metadata.example.test/token", "xhr") == "abort"
-    assert run_route("file:///etc/hosts", "document") == "abort"
+    # Allowed same-origin document & scripts fulfill with sanitized headers (Set-Cookie/Content-Encoding stripped)
+    act, kw = run_route("https://public-salon.example.test/", "document")
+    assert act == "fulfill" and kw["status"] == 200
+    assert "set-cookie" not in kw["headers"] and "content-encoding" not in kw["headers"]
+
+    act, kw = run_route("https://public-salon.example.test/app.js", "script")
+    assert act == "fulfill" and kw["headers"].get("access-control-allow-origin") == "*"
+
+    # Vetted exact & suffix CDNs allowed
+    assert run_route("https://cdnjs.cloudflare.com/ajax/libs/react.js", "script")[0] == "fulfill"
+    assert run_route("https://unpkg.com/gallery.js", "script")[0] == "fulfill"
+
+    # Vetted images return 1x1 PNG stub with ZERO upstream requests
+    req_before = route_state["requests"]
+    act, kw = run_route("https://static.wixstatic.com/media/dog.jpg", "image")
+    assert act == "fulfill" and kw["headers"]["content-type"] == "image/png" and kw["body"].startswith(b"\x89PNG\r\n\x1a\n")
+    assert route_state["requests"] == req_before
+
+    # Untrusted image host, blocked resource types, non-GET methods, and untrusted third-party scripts all abort
+    assert run_route("https://evil-tracker.example.net/pixel.png", "image")[0] == "abort"
+    assert run_route("https://evil-tracker.example.net/track.js", "script")[0] == "abort"
+    assert run_route("https://public-salon.example.test/app.js", "script", method="POST")[0] == "abort"
+    assert run_route("https://public-salon.example.test/font.woff2", "font")[0] == "abort"
+    assert run_route("https://public-salon.example.test/hero.mp4", "media")[0] == "abort"
+    assert run_route("https://rebind-metadata.example.test/token", "xhr")[0] == "abort"
+    assert run_route("file:///etc/hosts", "document")[0] == "abort"
+
+    # Server-side 302 redirects to metadata, off-site, login wall, and robots-disallowed MUST all abort
+    assert run_route("https://public-salon.example.test/redir-metadata", "document")[0] == "abort"
+    assert run_route("https://public-salon.example.test/redir-offsite", "document")[0] == "abort"
+    assert run_route("https://public-salon.example.test/redir-login", "document")[0] == "abort"
+    assert run_route("https://public-salon.example.test/redir-robots", "document")[0] == "abort"
+
+    # Document 403/CF challenge & 429 abort and record document_error
+    assert run_route("https://public-salon.example.test/cf-wall", "document")[0] == "abort"
+    assert route_state["document_error"] == "restricted"
+    assert run_route("https://public-salon.example.test/rate-limit", "document")[0] == "abort"
+    assert route_state["document_error"] == "rate_limited"
+
+    # Oversized response exceeds max_response_bytes -> abort
+    assert run_route("https://public-salon.example.test/huge.js", "script")[0] == "abort"
+
+    # Helper checks: computed media escaping & challenge DOM detection
+    injected = _append_computed_media_hints(
+        "<html><body>ok</body></html>",
+        ["https://static.wixstatic.com/media/a.jpg", "https://cdn.prod.website-files.com/v.mp4", "javascript:alert(1)"],
+    )
+    assert 'src="https://static.wixstatic.com/media/a.jpg"' in injected
+    assert '<video src="https://cdn.prod.website-files.com/v.mp4">' in injected
+    assert "javascript:alert" not in injected
+    assert _looks_like_challenge_dom("<html><head><title>Just a moment...</title></head></html>") is True
+    assert _looks_like_challenge_dom("<html><body><h1>Luxury Dog Grooming</h1></body></html>") is False
 
 
 def test_p1_playwright_js_fallback_recovers_spa_gallery_and_degrades_gracefully(tmp_path, monkeypatch):
@@ -293,7 +429,8 @@ def test_p1_playwright_js_fallback_recovers_spa_gallery_and_degrades_gracefully(
 
     spa_shell = '<html><body><div id="root"></div><script src="/bundle.js"></script></body></html>'
     assert looks_like_js_rendered_page(spa_shell, 0) is True
-    assert looks_like_js_rendered_page(spa_shell, 2) is False
+    assert looks_like_js_rendered_page(spa_shell, 2) is True  # Logo + OG image still triggers SPA render
+    assert looks_like_js_rendered_page(spa_shell, 3) is False
 
     responses = {
         f"{web}/robots.txt": (200, {}, "User-agent: *\nAllow: /\n"),
@@ -337,6 +474,17 @@ def test_p1_playwright_js_fallback_recovers_spa_gallery_and_degrades_gracefully(
 
     manifest2 = collect_public_job(job_dir2, job2, build_multitenant_collection_config(job2), js_renderer=missing_renderer)
     assert "js_renderer_unavailable" in manifest2["sources"]["website"]["issues"]
+
+    # 3. When headless Chromium times out (BrowserRenderError) -> degrades gracefully with js_render_failed.
+    job_dir3 = tmp_path / ("e" * 32)
+    job_dir3.mkdir()
+    job3 = {**job, "job_id": job_dir3.name}
+
+    def timeout_renderer(_url: str) -> bytes:
+        raise BrowserRenderError("Headless browser render failed: TimeoutError")
+
+    manifest3 = collect_public_job(job_dir3, job3, build_multitenant_collection_config(job3), js_renderer=timeout_renderer)
+    assert "js_render_failed" in manifest3["sources"]["website"]["issues"]
 
 
 def test_p1_multibatch_website_resume_continues_checkpoint_across_pages(worker, tmp_path, monkeypatch):
@@ -526,3 +674,133 @@ def test_apex_to_www_document_redirect_and_yoast_xml_comment_sitemap(tmp_path, m
     )
     with pytest.raises(ValueError, match="Unsupported sitemap markup"):
         inv._sitemap(b'<!DOCTYPE foo [<!ENTITY xxe "bar">]><urlset></urlset>', f"{www}/sitemap.xml")
+
+
+def test_shopify_auth_and_app_proxy_urls_excluded_and_galleries_prioritized():
+    """Regression from live caninecarousel.com UAT:
+    - 'cat' must NOT match 'customer_authentication', and 'post' must NOT match 'job-postings'.
+    - Shopify '/customer_authentication/' and '/apps/' URLs must be excluded.
+    - Salon gallery/grooming pages must sort ahead of generic pages/blogs."""
+    from app.website_inventory import WebsiteInventory
+
+    base = "https://canine-test.example.com"
+    html = (
+        f'<html><body>'
+        f'<a href="{base}/customer_authentication/redirect?locale=en">Sign in</a>'
+        f'<a href="{base}/apps/pages/job-postings">Jobs</a>'
+        f'<a href="{base}/apps/pages/updates">Updates</a>'
+        f'<a href="{base}/blogs/news/autumn-tips">Blog</a>'
+        f'<a href="{base}/pages/grooming-gallery">Grooming Gallery</a>'
+        f'<a href="{base}/pages/cat-food-supplies">Cat Food</a>'
+        f'</body></html>'
+    ).encode("utf-8")
+
+    inv = WebsiteInventory(
+        f"{base}/",
+        sitemaps=(),
+        fetch=lambda _u: (f"{base}/", html),
+        permitted=lambda _u: True,
+        document_limit=100_000,
+        entry_limit=50,
+        historical_mode=True,
+    )
+    links, _, _ = inv._html(html, f"{base}/", [])
+    urls = [u for _, u in links]
+    assert f"{base}/customer_authentication/redirect?locale=en" not in urls
+    assert f"{base}/apps/pages/job-postings" not in urls
+    assert f"{base}/apps/pages/updates" not in urls
+    assert f"{base}/pages/grooming-gallery" in urls
+    assert f"{base}/pages/cat-food-supplies" in urls
+    assert f"{base}/blogs/news/autumn-tips" in urls
+    # Visual gallery page must appear BEFORE blog/product links
+    assert urls.index(f"{base}/pages/grooming-gallery") < urls.index(f"{base}/blogs/news/autumn-tips")
+
+
+def test_subpage_403_preserves_homepage_downloads_universal_cdns_and_website_only_job(tmp_path, monkeypatch):
+    """Milestone 1 universal resilience:
+    1) A secondary subpage returning 403 must NOT poison held_origins or abort homepage/gallery downloads.
+    2) Duda (.cdn-website.com), GoHighLevel (.msgsndr.com), and GoDaddy (.wsimg.com) images download cleanly.
+    3) Website-only jobs (facebook_url=None, instagram_url=None) collect cleanly with facebook='not_requested'.
+    4) Homepage returning 403 STILL hard-stops as 'restricted' with 0 downloads."""
+    base = "https://www.universal-salon.example.com"
+    duda = "https://irp.cdn-website.com/salon/dog-duda.jpg"
+    ghl = "https://storage.msgsndr.com/salon/dog-ghl.jpg"
+    godaddy = "https://img1.wsimg.com/isteam/ip/dog-godaddy.jpg"
+    gallery_img = f"{base}/media/gallery-pup.jpg"
+    jpg1 = _jpeg_bytes(color=(120, 80, 60))
+    jpg2 = _jpeg_bytes(color=(60, 120, 80))
+    jpg3 = _jpeg_bytes(color=(80, 60, 120))
+    jpg4 = _jpeg_bytes(color=(140, 140, 50))
+
+    home_html = (
+        f'<html><body>'
+        f'<img src="{duda}" /><img src="{ghl}" /><img src="{godaddy}" />'
+        f'<a href="{base}/pages/about-members">Members</a>'
+        f'<a href="{base}/pages/gallery">Gallery</a>'
+        f'</body></html>'
+    ).encode("utf-8")
+    gallery_html = f'<html><body><img src="{gallery_img}" /></body></html>'.encode("utf-8")
+
+    responses = {
+        f"{base}/robots.txt": (200, {"Content-Type": "text/plain"}, b"User-agent: *\nAllow: /\n"),
+        "https://irp.cdn-website.com/robots.txt": (200, {"Content-Type": "text/plain"}, b"User-agent: *\nAllow: /\n"),
+        "https://storage.msgsndr.com/robots.txt": (200, {"Content-Type": "text/plain"}, b"User-agent: *\nAllow: /\n"),
+        "https://img1.wsimg.com/robots.txt": (200, {"Content-Type": "text/plain"}, b"User-agent: *\nAllow: /\n"),
+        f"{base}/": (200, {"Content-Type": "text/html"}, home_html),
+        f"{base}/pages/about-members": (403, {"Content-Type": "text/html"}, b"Forbidden"),
+        f"{base}/pages/gallery": (200, {"Content-Type": "text/html"}, gallery_html),
+        duda: (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(jpg1))}, jpg1),
+        ghl: (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(jpg2))}, jpg2),
+        godaddy: (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(jpg3))}, jpg3),
+        gallery_img: (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(jpg4))}, jpg4),
+    }
+    monkeypatch.setattr(requests.Session, "get", _mock_http_get(responses))
+    monkeypatch.setattr(
+        "app.legacy_collector.SafeHTTPAdapter.send",
+        lambda self, req, **kw: _mock_http_get(responses)(self, req.url, **kw),
+        raising=False,
+    )
+
+    now = datetime(2026, 11, 27, 12, 0, 0, tzinfo=UTC)
+    job = {
+        "job_id": "f" * 32,
+        "website_url": f"{base}/",
+        "facebook_url": None,
+        "instagram_url": None,
+        "max_pages": 5,
+        "max_media": 10,
+        "social_permission_confirmed": False,
+        **frozen_window(now),
+    }
+    cfg = build_multitenant_collection_config(job)
+    cfg["run_preprocessing"] = False
+    job_dir = tmp_path / job["job_id"]
+    job_dir.mkdir(parents=True, exist_ok=True)
+    manifest = collect_public_job(job_dir, job, cfg)
+
+    assert manifest["sources"]["facebook"]["status"] == "not_requested"
+    assert manifest["sources"]["instagram"]["status"] == "not_requested"
+    assert "subpage_restricted" in manifest["sources"]["website"]["issues"]
+    downloaded_urls = {a["source_url"] for a in manifest["assets"] if a["extraction_status"] == "downloaded"}
+    assert downloaded_urls == {duda, ghl, godaddy, gallery_img}
+
+    # Verify root homepage 403 STILL hard-stops cleanly with 0 downloads
+    blocked_base = "https://www.blocked-root.example.com"
+    blocked_responses = {
+        f"{blocked_base}/robots.txt": (200, {"Content-Type": "text/plain"}, b"User-agent: *\nAllow: /\n"),
+        f"{blocked_base}/": (403, {"Content-Type": "text/html"}, b"Forbidden"),
+    }
+    monkeypatch.setattr(requests.Session, "get", _mock_http_get(blocked_responses))
+    monkeypatch.setattr(
+        "app.legacy_collector.SafeHTTPAdapter.send",
+        lambda self, req, **kw: _mock_http_get(blocked_responses)(self, req.url, **kw),
+        raising=False,
+    )
+    job2 = {**job, "job_id": "1" * 32, "website_url": f"{blocked_base}/"}
+    cfg2 = build_multitenant_collection_config(job2)
+    cfg2["run_preprocessing"] = False
+    job2_dir = tmp_path / job2["job_id"]
+    job2_dir.mkdir(parents=True, exist_ok=True)
+    manifest2 = collect_public_job(job2_dir, job2, cfg2)
+    assert manifest2["sources"]["website"]["stop_reason"] == "restricted"
+    assert manifest2["assets"] == []

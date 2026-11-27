@@ -1,5 +1,6 @@
 """Website discovery adapter for an injected, offline or guarded HTTP document transport."""
 
+import inspect
 import json
 from pathlib import PurePosixPath
 import re
@@ -8,7 +9,7 @@ from xml.etree import ElementTree
 
 from bs4 import BeautifulSoup
 
-from app.browser_renderer import BrowserRendererUnavailable, looks_like_js_rendered_page
+from app.browser_renderer import BrowserRenderError, BrowserRendererUnavailable, looks_like_js_rendered_page
 from app.collection_checkpoint import Attachment, InventoryPage, SourceItem, SourceStop
 from app.legacy_collector import (
     MEDIA_EXTENSIONS,
@@ -32,9 +33,17 @@ _HISTORICAL_PATH_HINTS = (
 )
 _EXCLUDED_PATH_HINTS = (
     "/logout", "/login", "/signin", "/sign-in", "/signup", "/sign-up", "/register",
-    "/account", "/cart", "/checkout", "/basket", "/admin", "/wp-admin", "/wp-login",
-    "/feed", "/privacy", "/terms", "/cookie", "/search", "/wp-json",
+    "/account", "/my-account", "/customer_authentication", "/customers", "/password",
+    "/challenge", "/checkpoint", "/oauth", "/sso", "/auth/", "/orders", "/wishlist",
+    "/cart", "/checkout", "/basket", "/admin", "/wp-admin", "/wp-login", "/apps/",
+    "/careers", "/job-posting", "/feed", "/privacy", "/terms", "/cookie", "/search", "/wp-json",
 )
+_PRIORITY_VISUAL_TOKENS = frozenset({
+    "gallery", "galleries", "grooming", "photo", "photos", "video", "videos",
+    "portfolio", "transformation", "transformations", "before", "after",
+    "salon", "studio", "spa", "about", "team", "staff", "groomer", "groomers",
+    "service", "services", "showcase", "media",
+})
 _NON_HTML_EXTS = frozenset(MEDIA_EXTENSIONS | {".pdf", ".zip", ".gz", ".tar", ".xml", ".json", ".css", ".js", ".ico", ".woff", ".woff2"})
 _PAGINATION_PATH_RE = re.compile(r"(?:/page/\d+/?$|(?:^|&)(?:page|paged|p)=\d+(?:&|$))", re.IGNORECASE)
 _WP_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"})
@@ -243,6 +252,10 @@ class WebsiteInventory:
         seed_sitemaps = list(dict.fromkeys([*sitemaps, *(robots_sitemaps if self.historical_mode else ())]))
         self.seed = [("html", website_url), *(("xml", url) for url in seed_sitemaps)]
         self.fetch = fetch
+        try:
+            self._fetch_supports_subpage = "subpage" in inspect.signature(fetch).parameters
+        except (TypeError, ValueError):
+            self._fetch_supports_subpage = False
         self.permitted = permitted
         self.media_permitted = media_permitted or self._allowed
         self.document_limit = document_limit
@@ -288,12 +301,24 @@ class WebsiteInventory:
     def _is_historical_content_url(url: str) -> bool:
         parts = urlsplit(url)
         segments = [seg for seg in (parts.path or "/").lower().split("/") if seg]
-        if any(any(hint == seg or hint in seg for hint in _HISTORICAL_PATH_HINTS) for seg in segments):
-            return True
+        for seg in segments:
+            # Match whole slug or hyphen/underscore-delimited tokens so short hints
+            # like "cat" or "post" never falsely match "customer_authentication" or "job-postings".
+            tokens = {tok for tok in re.split(r"[-_]+", seg) if tok}
+            if seg in _HISTORICAL_PATH_HINTS or any(tok in _HISTORICAL_PATH_HINTS for tok in tokens):
+                return True
         # Match WordPress/static date archives such as /2025/11/ or /2026/02/
         if len(segments) >= 2 and re.fullmatch(r"20\d{2}", segments[0]) and re.fullmatch(r"(?:0[1-9]|1[0-2])", segments[1]):
             return True
         return False
+
+    @staticmethod
+    def _content_priority(url: str) -> tuple[int, str]:
+        parts = urlsplit(url)
+        segments = [seg for seg in (parts.path or "/").lower().split("/") if seg]
+        tokens = {tok for seg in segments for tok in re.split(r"[-_]+", seg) if tok}
+        is_visual = bool(tokens & _PRIORITY_VISUAL_TOKENS)
+        return (0 if is_visual else 1, url)
 
     def _sitemap(self, body, base):
         # Reject NUL bytes and DTD/entity declarations while permitting standard XML comments (e.g. Yoast/WP).
@@ -306,7 +331,7 @@ class WebsiteInventory:
         links = []
         for location in root.findall("./*/{*}loc"):
             target = candidate_url((location.text or "").strip(), base)
-            if target:
+            if target and (kind == "sitemapindex" or not self._is_excluded_page(target)):
                 links.append(("xml" if kind == "sitemapindex" else "html", target))
         return links, ()
 
@@ -343,7 +368,10 @@ class WebsiteInventory:
                 t for t in pag_urls if t and self._same_origin_candidate(t) and not self._is_excluded_page(t)
             )
             clean_next_set = set(clean_next)
-            clean_content = sorted(t for t in content_urls if t not in clean_next_set)
+            clean_content = sorted(
+                (t for t in content_urls if t not in clean_next_set),
+                key=self._content_priority,
+            )
             links = [("next", target) for target in clean_next]
             links.extend(("html", target) for target in clean_content)
         posters = {candidate_url(str(tag["poster"]), base) for tag in soup.select("video[poster]")}
@@ -413,7 +441,11 @@ class WebsiteInventory:
             if not self._allowed(url):
                 raise SourceStop("access_blocked")
             # Fixture or guarded HTTP transport supplies final URL and bytes.
-            final_url, body = self.fetch(url)
+            is_subpage = cursor is not None
+            if self._fetch_supports_subpage:
+                final_url, body = self.fetch(url, subpage=is_subpage)
+            else:
+                final_url, body = self.fetch(url)
             if not self._allowed(final_url):
                 raise SourceStop("access_blocked")
             if len(body) > self.document_limit:
@@ -453,7 +485,7 @@ class WebsiteInventory:
                     except BrowserRendererUnavailable:
                         self._js_disabled = True
                         issues.append("js_renderer_unavailable")
-                    except (PermissionError, SourceStop, OSError, ValueError):
+                    except (BrowserRenderError, PermissionError, SourceStop, OSError, ValueError):
                         issues.append("js_render_failed")
                 fresh: list[Attachment] = []
                 for att, fam_tag in grouped:

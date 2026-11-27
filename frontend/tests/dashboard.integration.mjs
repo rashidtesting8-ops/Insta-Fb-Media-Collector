@@ -102,7 +102,8 @@ test("built dashboard enforces sessions and routes authorized intake to n8n", { 
     instagram_url: "https://www.instagram.com/example/",
     facebook_url: "https://www.facebook.com/example/",
   };
-  assert.equal((await post("/api/jobs", { website_url: sourceUrls.website_url }, { cookie })).status, 400);
+  assert.equal((await post("/api/jobs", { facebook_url: sourceUrls.facebook_url }, { cookie })).status, 400);
+  assert.equal((await post("/api/jobs", { website_url: sourceUrls.website_url, facebook_url: "https://evil.example/page" }, { cookie })).status, 400);
   const intake = await post("/api/jobs", { ...sourceUrls, authorization_confirmed: true }, { cookie });
   assert.deepEqual(await intake.json(), { job_id: id });
   assert.equal(intake.status, 202);

@@ -105,9 +105,9 @@ def test_job_retry_reuses_existing_id_while_slots_are_full(worker, monkeypatch):
 @pytest.mark.parametrize("field, wrong_platform, required", [
     ("website_url", "https://www.facebook.com/example/", True),
     ("instagram_url", "https://www.facebook.com/example/", False),
-    ("facebook_url", "https://www.instagram.com/example/", True),
+    ("facebook_url", "https://www.instagram.com/example/", False),
 ])
-def test_new_jobs_require_website_and_facebook_and_validate_optional_instagram(worker, field, wrong_platform, required):
+def test_new_jobs_require_website_and_validate_optional_social_urls(worker, field, wrong_platform, required):
     bad_values = (None, "", "not a URL", "https://example.test:bad/", wrong_platform) if required else (
         "not a URL", "https://example.test:bad/", wrong_platform
     )

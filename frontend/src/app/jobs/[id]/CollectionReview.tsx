@@ -82,6 +82,8 @@ function humanizeCoverageStatus(s: Review["sources"][number]): { notes: string[]
   }
   if (lowerOutcomes.has("robots_disallowed")) {
     notes.push("Facebook CDN blocked automated downloads (robots.txt) — use Client Upload below");
+  } else if (lowerOutcomes.has("subpage_restricted")) {
+    notes.push("Some private or protected subpages were skipped; public pages collected");
   } else if (lowerOutcomes.has("login_redirect") || lowerOutcomes.has("restricted")) {
     notes.push("Platform login or access restriction encountered");
   } else if (lowerOutcomes.has("rate_limited")) {
@@ -93,9 +95,11 @@ function humanizeCoverageStatus(s: Review["sources"][number]): { notes: string[]
     notes.push("External YouTube/Vimeo video embed detected");
   }
   if (lowerOutcomes.has("js_rendered_fallback")) {
-    notes.push("JS-rendered gallery scanned");
+    notes.push("Dynamic JS gallery scanned safely");
   } else if (lowerOutcomes.has("js_renderer_unavailable")) {
-    notes.push("JS gallery renderer unavailable");
+    notes.push("JS gallery renderer unavailable in worker image");
+  } else if (lowerOutcomes.has("js_render_failed")) {
+    notes.push("Dynamic JS render blocked or timed out — static HTML photos used");
   }
   if ([...lowerOutcomes].some((o) => CAP_OUTCOMES.has(o))) {
     notes.push("Scan limit reached (click Resume Collection for more)");

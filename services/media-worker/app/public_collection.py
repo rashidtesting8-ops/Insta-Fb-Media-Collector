@@ -25,25 +25,45 @@ COLLECTION_HOLD = "blocked_unverified_collection"
 _ROBOTS_SITEMAP_RE = re.compile(r"^\s*sitemap\s*:\s*(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
 
 # Vetted website-builder & managed image CDNs used by pet grooming businesses
-# (Wix, Squarespace, Shopify, Webflow, WordPress Jetpack/Cloudinary, GoDaddy, BunnyCDN).
+# (Wix, Squarespace, Shopify, Webflow, WordPress Jetpack, GoDaddy, Duda, GoHighLevel, Weebly,
+# Cloudinary, Imgix, CloudFront, BunnyCDN, Fastly, Contentful, Sanity, Prismic, S3/GCS).
 # Every hop still enforces HTTPS-443, SafeHTTPAdapter DNS/SSRF checks, robots.txt, and magic-byte validation.
 WEBSITE_MEDIA_HOST_SUFFIXES = (
     ".wixstatic.com",
     ".wixmp.com",
     ".squarespace-cdn.com",
     ".squarespace.com",
+    ".sqspcdn.com",
     ".shopify.com",
     ".shopifycdn.net",
     ".website-files.com",
     ".webflow.com",
+    ".framerusercontent.com",
     ".wp.com",
     ".cloudinary.com",
     ".wsimg.com",
     ".godaddysites.com",
     ".secureserver.net",
+    ".cdn-website.com",
+    ".multiscreensite.com",
+    ".leadconnectorhq.com",
+    ".msgsndr.com",
+    ".filesafe.space",
+    ".weebly.com",
+    ".editmysite.com",
+    ".imgix.net",
+    ".cloudfront.net",
+    ".b-cdn.net",
+    ".fastly.net",
     ".ctfassets.net",
     ".sanity.io",
-    ".b-cdn.net",
+    ".prismic.io",
+    ".strikinglycdn.com",
+    ".zyrosite.com",
+    ".jimcdn.com",
+    ".site123.me",
+    ".amazonaws.com",
+    ".storage.googleapis.com",
 )
 
 
@@ -259,10 +279,19 @@ class PublicHTTP:
                               url_policy=lambda hop: self._network_policy(hop, allowed_robots),
                               response_policy=self._check_response)
 
-    def _check_response(self, response):
+    def _check_response(self, response, *, subpage: bool = False):
         try:
             check_response(response)
         except SourceStop as exc:
+            # On secondary subpages, a single 401/403/407/451 (without Cloudflare challenge or 429)
+            # skips ONLY that subpage without poisoning the already-verified public origin.
+            if (
+                subpage
+                and str(exc) == "restricted"
+                and response.headers.get("cf-mitigated") != "challenge"
+            ):
+                self._record_block(response.url, "subpage_restricted")
+                raise SourceStop("subpage_restricted") from None
             self.held_origins[origin(response.url)] = str(exc)
             raise
 
@@ -282,12 +311,12 @@ class PublicHTTP:
         if reason not in self.diagnostic_issues:
             self.diagnostic_issues.append(reason)
 
-    def _get(self, url, allowed, headers=None, *, allow_media_suffixes=False):
+    def _get(self, url, allowed, headers=None, *, allow_media_suffixes=False, subpage: bool = False):
         def check_hop(hop):
             path = urlsplit(hop).path.lower().rstrip("/")
             if path in ("/login", "/login.php", "/accounts/login", "/checkpoint", "/challenge"):
-                self._record_block(url, "login_redirect")
-                raise SourceStop("restricted")
+                self._record_block(url, "subpage_restricted" if subpage else "login_redirect")
+                raise SourceStop("subpage_restricted" if subpage else "restricted")
             if not self._origin_matches(origin(hop), allowed, allow_media_suffixes=allow_media_suffixes):
                 self._record_block(url, "origin_not_allowed")
                 raise SourceStop("access_blocked")
@@ -298,15 +327,15 @@ class PublicHTTP:
 
         response = response_get(self.session, url, stream=True, url_policy=check_hop, headers=headers)
         try:
-            self._check_response(response)
+            self._check_response(response, subpage=subpage)
             response.raise_for_status()
             return response
         except BaseException:
             response.close()
             raise
 
-    def document(self, url, byte_limit):
-        with self._get(url, self.site_origins) as response:
+    def document(self, url, byte_limit, *, subpage: bool = False):
+        with self._get(url, self.site_origins, subpage=subpage) as response:
             body = bytearray()
             for chunk in response.iter_content(65536):
                 self._clock()
@@ -539,7 +568,7 @@ def collect_public_job(
     active_sources: list[str] = []
     for source in SOURCES:
         submitted_url = job.get(source + "_url")
-        if source == "instagram" and not submitted_url:
+        if source in ("instagram", "facebook") and not submitted_url:
             continue
         if source not in configs or configs[source].get("url") != submitted_url:
             raise ValueError("Public collection configuration does not match the submitted source URLs")
@@ -581,11 +610,13 @@ def collect_public_job(
                     active_js_renderer = lambda target: render_page_html(  # noqa: E731
                         target,
                         robots_check=transport.page_permitted,
+                        site_origins=transport.site_origins,
+                        session_factory=session_factory,
                     )
                 inventory = WebsiteInventory(
                     url,
                     sitemaps=config["sitemaps"],
-                    fetch=lambda target: transport.document(target, document_limit),
+                    fetch=lambda target, subpage=False: transport.document(target, document_limit, subpage=subpage),
                     permitted=transport.page_permitted,
                     media_permitted=transport.media_permitted,
                     document_limit=document_limit,

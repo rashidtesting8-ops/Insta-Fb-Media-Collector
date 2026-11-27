@@ -5,7 +5,14 @@ export async function GET() {
   const denied = await dashboardDenied();
   if (denied) return denied;
   const result: {
-    worker: { ok: boolean; status?: number; collection_engine?: string; m4_approval_enabled?: boolean };
+    worker: {
+      ok: boolean;
+      status?: number;
+      collection_engine?: string;
+      m4_approval_enabled?: boolean;
+      playwright_fallback_enabled?: boolean;
+      playwright_installed?: boolean;
+    };
     n8n: { ok: boolean; status?: number };
     ai: {
       configured: boolean;
@@ -42,6 +49,10 @@ export async function GET() {
         const data = await statusRes.json();
         result.worker.collection_engine = typeof data.collection_engine === "string" ? data.collection_engine : undefined;
         result.worker.m4_approval_enabled = typeof data.m4_approval_enabled === "boolean" ? data.m4_approval_enabled : undefined;
+        result.worker.playwright_fallback_enabled =
+          typeof data.playwright_fallback_enabled === "boolean" ? data.playwright_fallback_enabled : undefined;
+        result.worker.playwright_installed =
+          typeof data.playwright_installed === "boolean" ? data.playwright_installed : undefined;
         result.ai = {
           configured: data.ai_configured === true,
           provider: typeof data.ai_provider === "string" ? data.ai_provider : null,
