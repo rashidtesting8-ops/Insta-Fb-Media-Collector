@@ -21,7 +21,20 @@ export interface JobRecord extends JobSummary {
   collection_mode?: string | null;
   sources?: Record<string, unknown>;
   preprocessing?: { status?: string; [k: string]: unknown } | null;
-  ai_curation?: { status?: string; provider?: string; model?: string; error?: string; errors?: string[]; [k: string]: unknown } | null;
+  ai_curation?: {
+    status?: string;
+    provider?: string;
+    model?: string;
+    error?: string;
+    errors?: string[];
+    warnings?: string[];
+    queued_at?: string;
+    started_at?: string;
+    finished_at?: string;
+    reconciled_at?: string;
+    reconciled_attempts?: number;
+    [k: string]: unknown;
+  } | null;
   manifest_path?: string | null;
   orchestration?: unknown;
   include_undated_website?: boolean;

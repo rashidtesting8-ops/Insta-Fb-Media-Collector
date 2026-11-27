@@ -14,6 +14,8 @@ type Review = {
   window_end_utc: string;
   manifest_sha256: string;
   eligible_subset_sha256: string;
+  ai_execution_claimed?: boolean;
+  unresolved_ai_attempts?: number;
   permissions: Record<Action, boolean>;
   eligible_assets: string[];
   inherited_assets: Record<string, string>;
@@ -34,6 +36,7 @@ type Props = {
   id: string;
   includeUndatedWebsite?: boolean;
   aiStatus?: string | null;
+  hasCuration?: boolean;
   externalRefreshTick?: number;
   onChanged?: () => void;
 };
@@ -112,6 +115,7 @@ export default function CollectionReview({
   id,
   includeUndatedWebsite = false,
   aiStatus,
+  hasCuration = false,
   externalRefreshTick = 0,
   onChanged,
 }: Props) {
@@ -121,6 +125,7 @@ export default function CollectionReview({
   const [login, setLogin] = useState(false);
   const [reason, setReason] = useState("");
   const [policyReason, setPolicyReason] = useState("");
+  const [reconcileReason, setReconcileReason] = useState("");
   const [consentChecked, setConsentChecked] = useState(false);
   const [copiedReviewLink, setCopiedReviewLink] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -273,8 +278,51 @@ export default function CollectionReview({
     }
   }
 
+  async function reconcileFailedAi(overrideReason?: string) {
+    if (!review || busy) return;
+    const effectiveReason =
+      (overrideReason ?? reconcileReason).trim() ||
+      "Reconciled failed or timed-out AI run after verifying no curation was published";
+    setBusy(true);
+    const signature = JSON.stringify([id, review.etag, "ai-reconcile", effectiveReason]);
+    if (requestKey.current.signature !== signature) requestKey.current = { signature, key: crypto.randomUUID() };
+    try {
+      const res = await fetch(`/api/jobs/${id}/ai-reconcile`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "If-Match": '"' + review.etag + '"',
+          "Idempotency-Key": requestKey.current.key,
+        },
+        body: JSON.stringify({ reason: effectiveReason }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setMessage(data.error || "Unable to reconcile failed AI run.");
+        if ([401, 403, 409, 412].includes(res.status)) setReview(null);
+        setLogin(res.status === 401 || res.status === 403);
+        return;
+      }
+      setReconcileReason("");
+      setConsentChecked(false);
+      await load();
+      onChanged?.();
+      setMessage(
+        "Failed AI run reconciled! A fresh revision is now open for independent Team Admin Approval and AI retry.",
+      );
+    } catch {
+      setMessage("Outcome unknown. Refresh the review to verify reconciliation status.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const websiteUnknown = review?.sources.find((s) => s.source === "website")?.unknown_date ?? 0;
   const aiActiveOrDone = ["queued", "started", "completed", "partial"].includes(String(aiStatus || ""));
+  const needsAiReconcile =
+    !aiActiveOrDone &&
+    !hasCuration &&
+    Boolean(review && (review.ai_execution_claimed || (review.unresolved_ai_attempts ?? 0) > 0));
   const hasDecisions = Boolean(review?.permissions.approve || review?.permissions.deny || review?.permissions.revoke);
 
   return (
@@ -479,7 +527,7 @@ export default function CollectionReview({
           )}
 
           {/* Submitter / Zero-Eligible Guidance Banner with 1-Click Teammate Share Link */}
-          {review.state === "pending" && !review.permissions.approve && (
+          {(review.state === "pending" || review.state === "stale") && !review.permissions.approve && (
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-sky-200 bg-sky-50/80 px-4 py-3 text-xs leading-relaxed text-sky-950">
               <div className="min-w-0 flex-1">
                 {review.eligible_assets.length === 0 ? (
@@ -591,8 +639,57 @@ export default function CollectionReview({
             </div>
           )}
 
+          {/* Audited Recovery Card for Failed / Timed-Out AI Execution */}
+          {needsAiReconcile && (
+            <div className="space-y-3 rounded-xl border border-rose-200 bg-rose-50/80 p-4 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className="font-semibold text-rose-950">Recover &amp; Retry Failed AI Run (Audited)</div>
+                  <p className="mt-0.5 leading-relaxed text-rose-900">
+                    Revision {review.revision} already has a failed or timed-out AI execution claim
+                    {(review.unresolved_ai_attempts ?? 0) > 0
+                      ? ` (${review.unresolved_ai_attempts} unresolved provider attempt${review.unresolved_ai_attempts === 1 ? "" : "s"})`
+                      : ""}
+                    . Resetting records an immutable reconciliation entry and opens Revision {review.revision + 1} so your team can approve and retry AI without re-scraping.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => reconcileFailedAi()}
+                  className="shrink-0 rounded-xl bg-rose-700 px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-rose-800 disabled:opacity-50"
+                >
+                  Reconcile &amp; Reset Failed AI Run
+                </button>
+              </div>
+              <details>
+                <summary className="cursor-pointer text-[11px] font-medium text-rose-800 hover:underline">
+                  Add a custom reconciliation note (optional)
+                </summary>
+                <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                  <input
+                    type="text"
+                    maxLength={300}
+                    value={reconcileReason}
+                    onChange={(e) => setReconcileReason(e.target.value)}
+                    placeholder="Reason for reconciling failed or timed-out AI run"
+                    className="studio-input flex-1 py-2 text-xs"
+                  />
+                  <button
+                    type="button"
+                    disabled={busy || !reconcileReason.trim()}
+                    onClick={() => reconcileFailedAi(reconcileReason)}
+                    className="shrink-0 rounded-xl border border-rose-300 bg-white px-4 py-2 text-xs font-semibold text-rose-900 shadow-sm transition hover:bg-rose-100 disabled:opacity-50"
+                  >
+                    Reconcile with custom note
+                  </button>
+                </div>
+              </details>
+            </div>
+          )}
+
           {/* Execute AI Visual Director V2 */}
-          {review.start_authorized && review.state === "approved" && !aiActiveOrDone && (
+          {review.start_authorized && review.state === "approved" && !aiActiveOrDone && !needsAiReconcile && (
             <div className="space-y-3 rounded-xl border border-teal-200 bg-gradient-to-br from-teal-50/90 to-emerald-50/50 p-4 text-xs">
               <div className="flex items-center gap-2 font-semibold text-teal-950">
                 <SparklesIcon className="h-4 w-4 text-[#0F766E]" />

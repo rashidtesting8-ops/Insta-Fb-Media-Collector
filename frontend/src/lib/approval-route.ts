@@ -3,7 +3,7 @@ import { namedCall, namedCookieName } from "./named";
 import { BodyError, dashboardOrigin, readObject } from "./security";
 
 type Context = { params: Promise<{ id: string }> };
-type Operation = "panel" | "decision" | "start" | "website-policy";
+type Operation = "panel" | "decision" | "start" | "website-policy" | "ai-reconcile";
 const response = (data: unknown, status: number) => Response.json(data, {
   status, headers: { "Cache-Control": "private, no-store" },
 });
@@ -38,11 +38,26 @@ export async function approvalRoute(req: Request, ctx: Context, op: Operation) {
           return response({ error: "Website policy flag and reason required" }, 400);
         data.include_undated_website = body.include_undated_website;
         data.reason = body.reason.trim();
+      } else if (op === "ai-reconcile") {
+        if (Object.keys(body).length !== 1 || typeof body.reason !== "string" || !body.reason.trim())
+          return response({ error: "Reconciliation reason required" }, 400);
+        data.reason = body.reason.trim();
       } else if (Object.keys(body).length) return response({ error: "Unexpected Start AI fields" }, 400);
     }
     const upstream = await namedCall("collection-" + action, data, session, 20000);
-    if (!upstream.ok) return response({ error: upstream.status === 412 ? "Review changed. Refresh before deciding." :
-      "Collection review unavailable for this job or session." }, upstream.status);
+    if (!upstream.ok) {
+      if (op === "ai-reconcile") {
+        const errBody = await upstream.json().catch(() => ({}));
+        const detail = typeof errBody?.detail === "string" ? errBody.detail : "";
+        return response({
+          error: upstream.status === 412
+            ? "Review changed. Refresh before reconciling."
+            : detail || "Unable to reconcile AI execution for this revision.",
+        }, upstream.status);
+      }
+      return response({ error: upstream.status === 412 ? "Review changed. Refresh before deciding." :
+        "Collection review unavailable for this job or session." }, upstream.status);
+    }
     if (op !== "panel") return response({ ok: true }, 200);
     const panel = await upstream.json();
     if (panel.job_id !== id) return response({ error: "Worker job mismatch" }, 502);

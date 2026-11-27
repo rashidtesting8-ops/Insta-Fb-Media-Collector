@@ -291,22 +291,26 @@ def derive_stage(job: Mapping[str, Any], delivery: Mapping[str, Any] | None = No
     elif job_status == "partial_success":
         if ai_status in ("queued", "started"):
             stage, detail = "ai_processing", "AI Visual Director V2 curation in progress."
-        elif ai_status == "completed" and ai_record.get("mock") is True:
+        elif ai_status in ("completed", "partial") and ai_record.get("mock") is True:
             stage, detail = "blocked", "Mock curation is available for QA only."
-        elif ai_status == "completed":
+        elif ai_status in ("completed", "partial"):
             stage, detail = "awaiting_rights_approval", "AI curation completed; awaiting rights approval."
+        elif ai_status in ("failed", "interrupted"):
+            stage, detail = "partial_success", "AI curation stopped before completing — review error below to reconcile and retry."
         else:
             stage, detail = "partial_success", str(job.get("error") or "Partial extraction success.")
     elif job_status == "extraction_complete":
         if ai_status in ("queued", "started"):
             stage, detail = "ai_processing", "AI Visual Director V2 curation in progress."
-        elif run_ai or ai_status == "completed":
+        elif run_ai or ai_status in ("completed", "partial", "failed", "interrupted"):
             if ai_status == "awaiting_collection_approval":
                 stage, detail = "blocked", "Collection review and a separate named Start AI are required."
-            elif ai_status == "completed" and ai_record.get("mock") is True:
+            elif ai_status in ("completed", "partial") and ai_record.get("mock") is True:
                 stage, detail = "blocked", "Mock curation is available for QA only."
-            elif ai_status == "completed":
+            elif ai_status in ("completed", "partial"):
                 stage, detail = "awaiting_rights_approval", "AI curation completed; awaiting rights approval."
+            elif ai_status in ("failed", "interrupted"):
+                stage, detail = "partial_success", "AI curation stopped before completing — review error below to reconcile and retry."
             else:
                 stage, detail = "partial_success", "AI curation requested but not completed."
         else:

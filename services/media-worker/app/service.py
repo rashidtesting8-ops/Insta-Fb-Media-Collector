@@ -129,15 +129,39 @@ def _all_job_records() -> list[dict[str, Any]]:
     return out
 
 
-# Recover jobs left running/queued across a restart (fail-closed: mark interrupted).
+# Recover jobs and async AI runs left running/queued across a restart (fail-closed: mark interrupted).
 with connect() as _db:
+    from app.ai_execution import ensure_reconciliation_schema as _ensure_reconcile_schema
+    _ensure_reconcile_schema(_db)
+    _has_attempts = bool(
+        _db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_provider_attempts'").fetchone()
+    )
+    _restart_now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    if _has_attempts:
+        _db.execute(
+            "UPDATE ai_provider_attempts SET outcome='ambiguous', finished=? WHERE outcome='dispatching'",
+            (_restart_now,),
+        )
     for _id, _blob in _db.execute("SELECT id, payload FROM jobs").fetchall():
         _old = json.loads(_blob)
+        _changed = False
         if _old.get("status") in ("running", "queued"):
             _old.update(
                 status="interrupted",
                 error="Service restarted; resubmit to retry",
             )
+            _changed = True
+        _old_ai = _old.get("ai_curation")
+        if isinstance(_old_ai, dict) and _old_ai.get("status") in ("queued", "started"):
+            _old["ai_curation"] = {
+                **_old_ai,
+                "status": "interrupted",
+                "error": "Service restarted during AI curation; reconcile and retry",
+                "finished_at": _restart_now,
+            }
+            _old["updated_at"] = _restart_now
+            _changed = True
+        if _changed:
             _db.execute(
                 "UPDATE jobs SET payload=? WHERE id=?",
                 (json.dumps(_old), _id),
@@ -463,11 +487,44 @@ def execute_started_curation(
         if not slots.acquire(blocking=False):
             raise HTTPException(429, "Worker busy; retry later")
 
+        queued_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        latest_before_queue = fetch(job_id) or rec
+        store({
+            **latest_before_queue,
+            "ai_curation": {
+                "status": "queued",
+                "provider": getattr(provider, "name", cfg.provider),
+                "model": cfg.model or getattr(provider, "model", ""),
+                "actor": actor,
+                "start_etag": start_etag,
+                "queued_at": queued_at,
+            },
+            "updated_at": queued_at,
+        })
+
         def _bg_worker() -> None:
             try:
                 _run_curation_sync()
-            except HTTPException:
-                pass
+            except HTTPException as exc:
+                latest_err = fetch(job_id)
+                cur_ai = (latest_err or {}).get("ai_curation") if isinstance(latest_err, dict) else None
+                if (
+                    isinstance(latest_err, dict)
+                    and isinstance(cur_ai, dict)
+                    and cur_ai.get("status") == "queued"
+                    and cur_ai.get("start_etag") == start_etag
+                ):
+                    failed_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                    store({
+                        **latest_err,
+                        "ai_curation": {
+                            **cur_ai,
+                            "status": "failed",
+                            "error": scrub_secrets(str(exc.detail))[:240],
+                            "finished_at": failed_at,
+                        },
+                        "updated_at": failed_at,
+                    })
             finally:
                 slots.release()
 
