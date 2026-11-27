@@ -135,12 +135,24 @@ function defaultBusinessName(job: JobRecord | null, delivery: Delivery | null): 
 }
 
 function friendlyFileName(asset: ManifestAsset): string {
+  // Prefer a clean human-readable filename from the source URL when local_path is an opaque SHA .media file.
+  if (asset.source_url) {
+    try {
+      const pathname = new URL(asset.source_url).pathname;
+      const tail = decodeURIComponent(pathname.split("/").filter(Boolean).pop() || "");
+      if (tail && !/^[a-f0-9]{24,}\./i.test(tail) && tail.length <= 44) return tail;
+    } catch {
+      // Fall through to local_path
+    }
+  }
   if (asset.local_path) {
     const parts = asset.local_path.split("/");
     const tail = parts[parts.length - 1];
-    if (tail && tail.length <= 42) return tail;
+    if (tail && !tail.endsWith(".media") && tail.length <= 42) return tail;
   }
-  return asset.asset_id.length > 22 ? `${asset.asset_id.slice(0, 12)}…${asset.asset_id.slice(-6)}` : asset.asset_id;
+  const kindLabel = asset.type === "video" ? "Video" : "Photo";
+  const platLabel = asset.platform === "facebook" ? "Facebook" : asset.platform === "website" ? "Website" : "Salon";
+  return `${platLabel} ${kindLabel} · ${asset.asset_id.slice(0, 6)}`;
 }
 
 function dateBadge(asset: ManifestAsset): { label: string; className: string } {
@@ -188,17 +200,20 @@ export default function JobDetailClient({ id }: { id: string }) {
   const [visibleCount, setVisibleCount] = useState(24);
   const [lightboxAsset, setLightboxAsset] = useState<{ asset: ManifestAsset; href: string } | null>(null);
 
-  // Per-asset rights verification state
+  // Per-asset & batch rights verification state
   const [evidenceRef, setEvidenceRef] = useState("");
   const [rightsReason, setRightsReason] = useState("");
   const [rightsBusy, setRightsBusy] = useState<string | null>(null);
+  const [batchRightsProgress, setBatchRightsProgress] = useState<string | null>(null);
   const [rightsMessage, setRightsMessage] = useState<string | null>(null);
+  const [showPreAiRights, setShowPreAiRights] = useState(false);
 
   // Google Drive delivery trigger state
   const [businessName, setBusinessName] = useState("");
   const [releaseConfirmed, setReleaseConfirmed] = useState(false);
   const [delivering, setDelivering] = useState(false);
   const [deliveryMessage, setDeliveryMessage] = useState<string | null>(null);
+  const [copiedDriveLink, setCopiedDriveLink] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [resumeMessage, setResumeMessage] = useState<string | null>(null);
 
@@ -322,13 +337,25 @@ export default function JobDetailClient({ id }: { id: string }) {
 
   const primaryAssets = useMemo(() => {
     const list = (manifest?.assets || []).filter((a) => a && a.type !== "frame");
-    // Surface downloaded local media before pending placeholders so operators inspect real photos first.
+    // Surface Hero #1 & AI Picks first, then downloaded photos/videos, then pending placeholders last.
     return [...list].sort((a, b) => {
-      const aReady = a.extraction_status === "downloaded" ? 0 : 1;
-      const bReady = b.extraction_status === "downloaded" ? 0 : 1;
-      return aReady - bReady;
+      const rankOf = (item: ManifestAsset) => {
+        const rec = imageRecById.get(item.asset_id);
+        if (rec?.hero_rank === 1) return 0;
+        if (selectedSet.has(item.asset_id)) return 1;
+        if (item.extraction_status === "downloaded") return 2;
+        return 3;
+      };
+      return rankOf(a) - rankOf(b);
     });
-  }, [manifest]);
+  }, [manifest, selectedSet, imageRecById]);
+
+  const heroPrimaryAsset = useMemo(() => {
+    const hero1Id = selection?.hero_selection?.find((h) => h.rank === 1)?.asset_id || selection?.hero_selection?.[0]?.asset_id;
+    if (!hero1Id) return null;
+    const found = primaryAssets.find((a) => a.asset_id === hero1Id && a.extraction_status === "downloaded" && Boolean(a.local_path));
+    return found || null;
+  }, [selection, primaryAssets]);
 
   const filteredAssets = useMemo(() => {
     return primaryAssets.filter((a) => {
@@ -371,12 +398,74 @@ export default function JobDetailClient({ id }: { id: string }) {
         return;
       }
       setRights(data as RightsReview);
-      setRightsMessage(`Recorded "${decision}" for ${assetId}.`);
+      setRightsMessage(`Recorded "${decision}" for ${friendlyFileName(primaryAssets.find((x) => x.asset_id === assetId) || { asset_id: assetId })}.`);
     } catch {
       setRightsMessage("Rights decision request failed.");
     } finally {
       setRightsBusy(null);
     }
+  }
+
+  async function verifyAllAiSelectedRights() {
+    if (!rights || rightsBusy || batchRightsProgress) return;
+    const effectiveRef = evidenceRef.trim() || RIGHTS_PRESETS[0].ref;
+    const effectiveReason = rightsReason.trim() || RIGHTS_PRESETS[0].reason;
+    if (!evidenceRef.trim()) setEvidenceRef(effectiveRef);
+    if (!rightsReason.trim()) setRightsReason(effectiveReason);
+
+    const currentSelectedIds = selection?.selected_asset_ids || [];
+    const currentVerifiedSet = new Set(rights.verified_asset_ids || []);
+    const pendingIds = currentSelectedIds.filter((aid) => {
+      const asset = primaryAssets.find((a) => a.asset_id === aid);
+      const isDownloaded = asset?.extraction_status === "downloaded" && Boolean(asset.local_path);
+      return isDownloaded && !currentVerifiedSet.has(aid);
+    });
+    if (pendingIds.length === 0) {
+      setRightsMessage("All AI-selected assets are already rights-verified and ready for Google Drive.");
+      return;
+    }
+
+    let currentRights = rights;
+    let verifiedNow = 0;
+    setRightsMessage(null);
+    try {
+      for (const aid of pendingIds) {
+        setBatchRightsProgress(`Confirming rights ${verifiedNow + 1} of ${pendingIds.length}…`);
+        const res = await fetch(`/api/jobs/${id}/rights`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "If-Match": '"' + currentRights.etag + '"',
+            "Idempotency-Key": crypto.randomUUID(),
+          },
+          body: JSON.stringify({
+            asset_id: aid,
+            decision: "verified",
+            reason: effectiveReason,
+            evidence_ref: effectiveRef,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setRightsMessage(data.error || `Stopped after ${verifiedNow} verified asset(s). Refresh and retry.`);
+          return;
+        }
+        currentRights = data as RightsReview;
+        setRights(currentRights);
+        verifiedNow += 1;
+      }
+      setRightsMessage(`Confirmed commercial rights on all ${verifiedNow} AI pick${verifiedNow === 1 ? "" : "s"} — scroll down to send to Google Drive!`);
+    } catch {
+      setRightsMessage(`Batch rights confirmation interrupted after ${verifiedNow} asset(s). Refresh and retry.`);
+    } finally {
+      setBatchRightsProgress(null);
+    }
+  }
+
+  function copyDriveFolderLink(link: string) {
+    navigator.clipboard?.writeText(link).catch(() => {});
+    setCopiedDriveLink(true);
+    setTimeout(() => setCopiedDriveLink(false), 2400);
   }
 
   async function triggerResumeCollection() {
@@ -525,6 +614,10 @@ export default function JobDetailClient({ id }: { id: string }) {
   const verifiedSet = new Set(rights?.verified_asset_ids || []);
   const selectedIds = selection?.selected_asset_ids || [];
   const verifiedSelectedCount = selectedIds.filter((aid) => verifiedSet.has(aid)).length;
+  const unverifiedSelectedCount = selectedIds.filter((aid) => {
+    const asset = primaryAssets.find((a) => a.asset_id === aid);
+    return asset?.extraction_status === "downloaded" && Boolean(asset.local_path) && !verifiedSet.has(aid);
+  }).length;
   const downloadedCount = primaryAssets.filter((a) => a.extraction_status === "downloaded").length;
 
   let nextStepTitle = "Review collected media";
@@ -609,7 +702,6 @@ export default function JobDetailClient({ id }: { id: string }) {
             <span className="text-xs font-semibold uppercase tracking-wider text-[#7A7168]">Project Progress</span>
             <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-semibold ${visual.badgeClass}`}>
               {visual.label}
-              <span className="font-mono text-[10px] opacity-75">({status?.stage ?? "—"})</span>
             </span>
           </div>
           {status?.detail && <span className="text-xs text-[#6B635B]">{status.detail}</span>}
@@ -682,7 +774,12 @@ export default function JobDetailClient({ id }: { id: string }) {
           </p>
         )}
         {job.error && (
-          <div className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-800">{job.error}</div>
+          <div className="rounded-xl border border-amber-200 bg-amber-50/75 px-4 py-3 text-xs text-amber-950">
+            <strong className="font-semibold">Review note:</strong>{" "}
+            {job.error.includes("unverified")
+              ? "Media collection is ready for a quick team review before AI visual selection runs."
+              : job.error}
+          </div>
         )}
       </section>
 
@@ -870,34 +967,73 @@ export default function JobDetailClient({ id }: { id: string }) {
             </div>
 
             {selection.business_visual_identity?.style_summary && (
-              <div className="rounded-2xl border border-teal-200/80 bg-gradient-to-br from-teal-50/70 via-white to-amber-50/40 p-4 text-sm">
-                <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-[#0F766E]">
-                  <SparklesIcon className="h-4 w-4" />
-                  AI Visual Direction Summary
-                </div>
-                <p className="mt-2 font-medium leading-relaxed text-[#181614]">
-                  {selection.business_visual_identity.style_summary}
-                </p>
-                {selection.business_visual_identity.recommended_design_direction && (
-                  <p className="mt-1.5 text-xs leading-relaxed text-[#5C534B]">
-                    <strong className="font-semibold text-[#2C2824]">Design direction:</strong>{" "}
-                    {selection.business_visual_identity.recommended_design_direction}
-                  </p>
+              <div className="flex flex-col gap-4 rounded-2xl border border-teal-200/80 bg-gradient-to-br from-teal-50/75 via-white to-amber-50/40 p-4 text-sm sm:flex-row sm:items-center">
+                {heroPrimaryAsset?.local_path && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setLightboxAsset({
+                        asset: heroPrimaryAsset,
+                        href: `/api/jobs/${id}/file?path=${encodeURIComponent(heroPrimaryAsset.local_path || "")}`,
+                      })
+                    }
+                    className="group relative h-32 w-full shrink-0 overflow-hidden rounded-xl border border-teal-200 bg-[#F2ECE4] sm:w-44"
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={`/api/jobs/${id}/file?path=${encodeURIComponent(heroPrimaryAsset.local_path)}`}
+                      alt="Hero #1 preview"
+                      className="h-full w-full object-cover transition duration-300 group-hover:scale-105"
+                    />
+                    <span className="absolute left-2 top-2 rounded-full bg-[#0F766E] px-2 py-0.5 text-[10px] font-semibold text-white shadow">
+                      Top Pick · Hero #1
+                    </span>
+                  </button>
                 )}
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-[#0F766E]">
+                    <SparklesIcon className="h-4 w-4" />
+                    AI Visual Direction Summary
+                  </div>
+                  <p className="mt-2 font-medium leading-relaxed text-[#181614]">
+                    {selection.business_visual_identity.style_summary}
+                  </p>
+                  {selection.business_visual_identity.recommended_design_direction && (
+                    <p className="mt-1.5 text-xs leading-relaxed text-[#5C534B]">
+                      <strong className="font-semibold text-[#2C2824]">Design direction:</strong>{" "}
+                      {selection.business_visual_identity.recommended_design_direction}
+                    </p>
+                  )}
+                </div>
               </div>
             )}
           </div>
         )}
 
-        {/* Per-Asset Rights Verification Toolbar */}
-        {rights && primaryAssets.length > 0 && (
+        {/* Commercial Rights Confirmation Toolbar (highlighted after AI picks; optional toggle pre-AI) */}
+        {rights && primaryAssets.length > 0 && (selection || showPreAiRights) && (
           <div className="space-y-3 rounded-2xl border border-[#E5DDD2] bg-[#FAF8F5] p-4 text-xs">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2 font-semibold text-[#181614]">
                 <ShieldCheckIcon className="h-4 w-4 text-[#0F766E]" />
-                Per-Asset Commercial Rights Verification (M4 Immutable Ledger · Revision {rights.revision})
+                Commercial Rights Confirmation
+                <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-medium text-[#7A7168] ring-1 ring-[#E4DCD1]">
+                  Revision {rights.revision}
+                </span>
               </div>
-              <div className="flex flex-wrap gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
+                {selection && unverifiedSelectedCount > 0 && (
+                  <button
+                    type="button"
+                    disabled={Boolean(rightsBusy || batchRightsProgress)}
+                    onClick={verifyAllAiSelectedRights}
+                    className="studio-btn-primary py-1.5 text-xs"
+                  >
+                    <CheckIcon className="h-3.5 w-3.5" />
+                    {batchRightsProgress ||
+                      `Confirm Rights for All ${unverifiedSelectedCount} AI Pick${unverifiedSelectedCount === 1 ? "" : "s"} (1-Click)`}
+                  </button>
+                )}
                 {RIGHTS_PRESETS.map((p) => (
                   <button
                     key={p.ref}
@@ -914,8 +1050,9 @@ export default function JobDetailClient({ id }: { id: string }) {
               </div>
             </div>
             <p className="text-[#6B635B]">
-              Step 1: Enter (or pick) your client release proof below. Step 2: Click the Verify button on each asset
-              card you want to approve for Google Drive.
+              {selection
+                ? "Confirm client release proof once with the 1-Click button above, or click Verify / Reject on individual cards below."
+                : "Step 1: Enter (or pick) your client release proof below. Step 2: Click Verify on individual photos."}
             </p>
             <div className="grid gap-2.5 sm:grid-cols-2">
               <input
@@ -940,6 +1077,18 @@ export default function JobDetailClient({ id }: { id: string }) {
                 {rightsMessage}
               </p>
             )}
+          </div>
+        )}
+        {rights && primaryAssets.length > 0 && !selection && !showPreAiRights && (
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#EAE2D8] bg-[#FAF8F5] px-4 py-2.5 text-xs text-[#6B635B]">
+            <span>Rights verification unlocks cleanly once AI picks your best photos &amp; videos.</span>
+            <button
+              type="button"
+              onClick={() => setShowPreAiRights(true)}
+              className="font-semibold text-[#0F766E] hover:underline"
+            >
+              Show manual pre-AI rights controls
+            </button>
           </div>
         )}
 
@@ -1099,11 +1248,11 @@ export default function JobDetailClient({ id }: { id: string }) {
                             : a.rights_status ?? "unverified"}
                         </span>
                       </div>
-                      {rights && downloaded && (
+                      {rights && downloaded && (selection || showPreAiRights) && (
                         <div className="flex flex-wrap gap-1.5">
                           <button
                             type="button"
-                            disabled={rightsBusy === a.asset_id}
+                            disabled={Boolean(rightsBusy === a.asset_id || batchRightsProgress)}
                             onClick={() => recordAssetRights(a.asset_id, "verified")}
                             className="flex-1 rounded-lg border border-emerald-300 bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-800 transition hover:bg-emerald-100 disabled:opacity-50"
                           >
@@ -1111,7 +1260,7 @@ export default function JobDetailClient({ id }: { id: string }) {
                           </button>
                           <button
                             type="button"
-                            disabled={rightsBusy === a.asset_id}
+                            disabled={Boolean(rightsBusy === a.asset_id || batchRightsProgress)}
                             onClick={() => recordAssetRights(a.asset_id, "rejected")}
                             className="flex-1 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-[11px] font-semibold text-rose-800 transition hover:bg-rose-100 disabled:opacity-50"
                           >
@@ -1120,7 +1269,7 @@ export default function JobDetailClient({ id }: { id: string }) {
                           {ledgerRight && (
                             <button
                               type="button"
-                              disabled={rightsBusy === a.asset_id}
+                              disabled={Boolean(rightsBusy === a.asset_id || batchRightsProgress)}
                               onClick={() => recordAssetRights(a.asset_id, "revoked")}
                               className="rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-900 transition hover:bg-amber-100 disabled:opacity-50"
                             >
@@ -1201,15 +1350,24 @@ export default function JobDetailClient({ id }: { id: string }) {
               </div>
 
               {delivery.drive_folder_link && (
-                <a
-                  className="studio-btn-primary"
-                  href={delivery.drive_folder_link}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  Open Google Drive folder
-                  <ArrowRightIcon className="h-4 w-4" />
-                </a>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => copyDriveFolderLink(delivery.drive_folder_link!)}
+                    className="studio-btn-secondary py-2 text-xs"
+                  >
+                    {copiedDriveLink ? "Drive Link Copied ✓" : "Copy Drive Link"}
+                  </button>
+                  <a
+                    className="studio-btn-primary"
+                    href={delivery.drive_folder_link}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Open Google Drive folder
+                    <ArrowRightIcon className="h-4 w-4" />
+                  </a>
+                </div>
               )}
             </div>
 

@@ -268,9 +268,11 @@ test("JobDetailClient renders video player, filters raw frames, shows counts+cov
     timeout: 2000,
   });
 
-  // Raw frame excluded (3 primary assets, not 4); video rendered as <video>; .media image as <img>; metadata-only has NO <img>
+  // Raw frame excluded (3 primary assets, not 4); video rendered as <video>; .media image as <img> in gallery; metadata-only has NO <img>
   assert.equal(container.querySelectorAll("video").length, 1);
-  assert.equal(container.querySelectorAll("img").length, 1);
+  assert.equal(container.querySelectorAll("article img").length, 1);
+  assert.ok(container.textContent.includes("Top Pick · Hero #1"));
+  assert.ok(container.textContent.includes("Copy Drive Link"));
   assert.ok(container.textContent.includes("No local binary"));
   assert.ok(container.textContent.includes("Website · Date unverified"));
   assert.ok(container.textContent.includes("Published 2026-09-12"));
@@ -414,4 +416,129 @@ test("JobDetailClient renders robots.txt blocked Facebook card and 60-second cli
   assert.ok(container.textContent.includes("60-second export guide"));
   assert.ok(container.textContent.includes("Copy WhatsApp / Email instructions for client"));
   unmount();
+});
+
+test("Guided Studio UX supports 1-click website include, Quick Approve, teammate copy link, and 1-click batch AI rights", async () => {
+  // 1. CollectionReview: 1-click Include Website Photos & Quick Approve
+  const reviewCalls = [];
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    reviewCalls.push({ url: u, opts });
+    if (u.endsWith("/collection-approval")) {
+      return jsonResponse({
+        job_id: ID,
+        revision: 1,
+        etag: ETAG,
+        state: "pending",
+        start_authorized: false,
+        window_start_utc: "2025-11-26T00:00:00+00:00",
+        window_end_utc: "2026-11-26T00:00:00+00:00",
+        manifest_sha256: "m".repeat(64),
+        eligible_subset_sha256: "s".repeat(64),
+        permissions: { approve: true, deny: true, revoke: false, start: false },
+        eligible_assets: ["img_1", "img_2"],
+        inherited_assets: {},
+        sources: [
+          { source: "website", discovered: 10, downloaded: 10, unknown_date: 10, out_of_window: 0, missing_children: 0, coverage: "unknown", evidence: "", outcomes: [] },
+        ],
+        history: [],
+      });
+    }
+    if (u.endsWith("/website-policy") || u.endsWith("/decisions")) {
+      return jsonResponse({ ok: true }, 200);
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+
+  const revRender = render(React.createElement(CollectionReview, { id: ID, includeUndatedWebsite: false }));
+  await waitFor(() => assert.ok(revRender.container.textContent.includes("Yes, Include Website Photos (1-Click)")), { timeout: 2000 });
+  await act(async () => {
+    fireEvent.click(revRender.getByText("Yes, Include Website Photos (1-Click)"));
+  });
+  await waitFor(() => assert.ok(reviewCalls.some((c) => c.url.endsWith("/website-policy"))), { timeout: 2000 });
+  const wpBody = JSON.parse(reviewCalls.find((c) => c.url.endsWith("/website-policy")).opts.body);
+  assert.equal(wpBody.include_undated_website, true);
+  assert.ok(wpBody.reason.length > 5);
+
+  await act(async () => {
+    fireEvent.click(revRender.getByText("Quick Approve (1-Click)"));
+  });
+  await waitFor(() => assert.ok(reviewCalls.some((c) => c.url.endsWith("/decisions"))), { timeout: 2000 });
+  const decBody = JSON.parse(reviewCalls.find((c) => c.url.endsWith("/decisions")).opts.body);
+  assert.equal(decBody.action, "approve");
+  assert.ok(decBody.reason.length > 5);
+  revRender.unmount();
+
+  // 2. JobDetailClient: 1-click batch commercial rights across multiple AI picks (sequential fresh etags)
+  const rightsPosts = [];
+  let rightsSeq = 0;
+  const verifiedSoFar = [];
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    if (u === `/api/jobs/${ID}`) {
+      return jsonResponse({ job_id: ID, status: "partial_success", collection_mode: "public_checkpoint", website_url: "https://www.petmania.co.uk/", ai_curation: { status: "completed" } });
+    }
+    if (u === `/api/jobs/${ID}/status`) {
+      return jsonResponse({ job_id: ID, stage: "awaiting_rights_approval", terminal: true, job_status: "partial_success" });
+    }
+    if (u === `/api/jobs/${ID}/manifest`) {
+      return jsonResponse({
+        job_id: ID,
+        assets: [
+          { asset_id: "a1", platform: "website", type: "image", mime: "image/jpeg", extraction_status: "downloaded", local_path: "collection/a1.media", source_url: "https://www.petmania.co.uk/uploads/groom-1.jpg", bytes: 40000 },
+          { asset_id: "a2", platform: "website", type: "image", mime: "image/jpeg", extraction_status: "downloaded", local_path: "collection/a2.media", source_url: "https://www.petmania.co.uk/uploads/groom-2.jpg", bytes: 42000 },
+        ],
+      });
+    }
+    if (u === `/api/jobs/${ID}/curation`) {
+      return jsonResponse({
+        ai_envelope: { mock: false, prompt_version: "V2.0" },
+        curation: {
+          mode: "FINAL_CURATE",
+          business_visual_identity: { style_summary: "Warm salon portraits" },
+          selected_asset_ids: ["a1", "a2"],
+          hero_selection: [{ rank: 1, asset_id: "a1", reason: "Sharp portrait" }],
+          gallery_images: [{ asset_id: "a2", reason: "Happy pup" }],
+          analysis_coverage: { mock: false },
+        },
+      });
+    }
+    if (u === `/api/jobs/${ID}/rights` && opts?.method === "POST") {
+      const body = JSON.parse(opts.body);
+      rightsPosts.push({ asset_id: body.asset_id, ifMatch: opts.headers["If-Match"] });
+      verifiedSoFar.push(body.asset_id);
+      rightsSeq += 1;
+      const nextTag = String(rightsSeq).repeat(64);
+      return jsonResponse({
+        job_id: ID,
+        revision: 2,
+        manifest_sha256: "m".repeat(64),
+        state: "approved",
+        etag: nextTag,
+        verified_asset_ids: [...verifiedSoFar],
+        verified_rights: Object.fromEntries(verifiedSoFar.map((aid) => [aid, { actor: "admin2", evidence_ref: body.evidence_ref, reason: body.reason, utc: "2026-11-27T00:00:00Z", decision: "verified" }])),
+        history: [],
+      });
+    }
+    if (u === `/api/jobs/${ID}/rights`) {
+      return jsonResponse({ job_id: ID, revision: 2, manifest_sha256: "m".repeat(64), state: "approved", etag: ETAG, verified_asset_ids: [], verified_rights: {}, history: [] });
+    }
+    if (u === `/api/jobs/${ID}/delivery`) return jsonResponse({ error: "none" }, 404);
+    return jsonResponse({ error: "none" }, 409);
+  };
+
+  const jobRender = render(React.createElement(JobDetailClient, { id: ID }));
+  await waitFor(() => assert.ok(jobRender.container.textContent.includes("Confirm Rights for All 2 AI Picks (1-Click)")), { timeout: 2000 });
+  // Human-readable source_url filenames shown instead of raw SHA hashes!
+  assert.ok(jobRender.container.textContent.includes("groom-1.jpg"));
+  assert.ok(jobRender.container.textContent.includes("groom-2.jpg"));
+
+  await act(async () => {
+    fireEvent.click(jobRender.getByText("Confirm Rights for All 2 AI Picks (1-Click)"));
+  });
+  await waitFor(() => assert.equal(rightsPosts.length, 2), { timeout: 2000 });
+  assert.deepEqual(rightsPosts.map((r) => r.asset_id), ["a1", "a2"]);
+  assert.equal(rightsPosts[0].ifMatch, `"${ETAG}"`);
+  assert.equal(rightsPosts[1].ifMatch, `"${"1".repeat(64)}"`);
+  jobRender.unmount();
 });
