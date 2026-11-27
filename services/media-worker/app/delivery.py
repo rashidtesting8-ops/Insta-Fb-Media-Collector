@@ -12,9 +12,12 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+import os
 import re
+import shutil
 from pathlib import Path, PureWindowsPath
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from app.manifest import atomic_write_json
 
@@ -53,7 +56,31 @@ def _safe_disk_path(job_dir: Path, rel: Any) -> Path | None:
     return candidate if candidate.is_relative_to(job_dir.resolve()) and candidate.is_file() else None
 
 
-def _safe_delivery_filename(asset_id: str, disk: Path, mime: Any, sha: str) -> str | None:
+def _human_stem_from_url(source_url: Any) -> str:
+    if not isinstance(source_url, str) or not source_url.strip():
+        return ""
+    try:
+        raw_path = unquote(urlsplit(source_url).path or "")
+    except ValueError:
+        return ""
+    leaf = raw_path.rsplit("/", 1)[-1]
+    if not leaf:
+        return ""
+    stem = leaf.rsplit(".", 1)[0] if "." in leaf else leaf
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", stem).strip("._-")[:40]
+    if len(cleaned) < 2 or cleaned.lower() in ("image", "img", "photo", "media", "file", "index"):
+        return ""
+    return cleaned
+
+
+def _safe_delivery_filename(
+    asset_id: str,
+    disk: Path,
+    mime: Any,
+    sha: str,
+    *,
+    source_url: Any = None,
+) -> str | None:
     """Derive a safe Drive filename without exposing raw .media files or unsafe paths."""
     if disk.suffix.lower() != ".media":
         name = Path(disk.name).name
@@ -64,10 +91,58 @@ def _safe_delivery_filename(asset_id: str, disk: Path, mime: Any, sha: str) -> s
     ext = _MIME_TO_EXT.get(clean_mime)
     if not ext:
         return None
-    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", str(asset_id or "")).strip("._-")[:40]
+    stem = _human_stem_from_url(source_url) or re.sub(r"[^A-Za-z0-9_-]+", "_", str(asset_id or "")).strip("._-")[:40]
     if not stem:
         return None
     return f"{stem}-{sha[:8]}{ext}"
+
+
+def _stage_delivery_media(job_dir: Path, job_id: str, assets: list[dict[str, Any]]) -> None:
+    """Materialize real-extension staged files for `.media` originals so n8n detects exact MIME types.
+
+    n8n's Read/Write Files from Disk infers `binary.data.mimeType` from the on-disk filename
+    extension (`mime-types.lookup`). Reading a `.media` path yields `false` -> `text/plain`,
+    causing Google Drive to store WebP/JPEG/MP4 files as unreadable text documents.
+    """
+    media_assets = [a for a in assets if str(a.get("local_path") or "").lower().endswith(".media")]
+    if not media_assets:
+        return
+    stage_dir = (job_dir / "delivery_media").resolve()
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    for asset in media_assets:
+        src = _safe_disk_path(job_dir, asset.get("local_path"))
+        safe_name = str(asset.get("filename") or "")
+        expected_sha = str(asset.get("sha256") or "")
+        if src is None or not safe_name or "/" in safe_name or "\\" in safe_name:
+            continue
+        target = (stage_dir / safe_name).resolve()
+        if not target.is_relative_to(stage_dir):
+            continue
+        needs_write = True
+        if target.is_file():
+            try:
+                with target.open("rb") as fh:
+                    if hashlib.file_digest(fh, "sha256").hexdigest() == expected_sha:
+                        needs_write = False
+            except OSError:
+                needs_write = True
+        if needs_write:
+            tmp = (stage_dir / f".{safe_name}.{os.getpid()}.tmp").resolve()
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+                try:
+                    os.link(src, tmp)
+                except OSError:
+                    shutil.copyfile(src, tmp)
+                os.replace(tmp, target)
+            finally:
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+        asset["n8n_path"] = f"/data/media/{job_id}/delivery_media/{safe_name}"
 
 
 def _target_subfolder_for_mime(mime: Any) -> str:
@@ -429,7 +504,7 @@ def build_delivery_plan(
                 pending_rights.append(aid)
                 continue
             rights_status = item.get("rights_status", "unverified")
-        safe_name = _safe_delivery_filename(aid, disk, item.get("mime"), sha)
+        safe_name = _safe_delivery_filename(aid, disk, item.get("mime"), sha, source_url=item.get("source_url"))
         if safe_name is None:
             errors.append(f"unsupported delivery mime: {aid}")
             continue
@@ -461,10 +536,12 @@ def build_delivery_plan(
         u["upload_key"] for u in (existing_delivery.get("uploaded") or [])
         if u.get("upload_key") and u.get("status") == "uploaded" and u.get("drive_file_id")
     ]
-    pending_uploads = [a for a in assets if a["upload_key"] not in uploaded_keys]
     status = "ready" if assets and not errors else ("partial" if assets else "failed")
     if not assets and pending_rights:
         status = "blocked_rights_review"
+    if status in ("ready", "partial") and assets:
+        _stage_delivery_media(job_dir, job_id, assets)
+    pending_uploads = [a for a in assets if a["upload_key"] not in uploaded_keys]
     folder_name = sanitize_folder_name(business_name or manifest.get("website_url", ""), job_id)
 
     reports: list[dict[str, Any]] = []

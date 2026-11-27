@@ -221,3 +221,52 @@ def test_blocked_rights_produces_zero_reports(tmp_path):
     assert plan["reports"] == []
     assert plan["pending_reports"] == []
     assert not (job / "delivery_reports").exists()
+    assert not (job / "delivery_media").exists()
+
+
+def test_media_extension_assets_stage_with_real_mime_extension_and_human_filename(tmp_path):
+    """Checkpoint `.media` files must stage to `delivery_media/<clean-name>.webp` so n8n infers
+    `image/webp` instead of `text/plain` when uploading to Google Drive."""
+    job = tmp_path / "job_webp"
+    (job / "collection").mkdir(parents=True)
+    raw = b"RIFF\x18\x00\x00\x00WEBPVP8 \x0c\x00\x00\x000123456789ab"
+    sha = hashlib.sha256(raw).hexdigest()
+    (job / "collection" / "b0c109311b0d297cb35d7b951bb9be4be2209241.media").write_bytes(raw)
+    manifest = {
+        "job_id": "job_webp",
+        "website_url": "https://vanityfurr.co.uk/",
+        "assets": [
+            {
+                "asset_id": "b0c109311b0d297cb35d7b951bb9be4be2209241",
+                "platform": "website",
+                "type": "image",
+                "extraction_status": "downloaded",
+                "local_path": "collection/b0c109311b0d297cb35d7b951bb9be4be2209241.media",
+                "sha256": sha,
+                "mime": "image/webp",
+                "source_url": "https://vanityfurr.co.uk/uploads/cat-landing-960.webp",
+                "rights_status": "verified",
+            }
+        ],
+    }
+    curation = {
+        "ai_envelope": {"mock": False, "prompt_version": "V2.0"},
+        "curation": {
+            "mode": "FINAL_CURATE",
+            "selected_asset_ids": ["b0c109311b0d297cb35d7b951bb9be4be2209241"],
+            "best_images": [{"asset_id": "b0c109311b0d297cb35d7b951bb9be4be2209241", "recommended_section": "hero"}],
+            "analysis_coverage": {"mock": False},
+        },
+    }
+    (job / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (job / "curation.json").write_text(json.dumps(curation), encoding="utf-8")
+
+    plan = build_delivery_plan(job, "job_webp", "Vanity Furr")
+    assert plan["status"] == "ready"
+    item = plan["pending_uploads"][0]
+    assert item["filename"] == f"cat-landing-960-{sha[:8]}.webp"
+    assert item["n8n_path"] == f"/data/media/job_webp/delivery_media/cat-landing-960-{sha[:8]}.webp"
+    assert not item["n8n_path"].endswith(".media")
+    staged = job / "delivery_media" / item["filename"]
+    assert staged.is_file()
+    assert hashlib.sha256(staged.read_bytes()).hexdigest() == sha
