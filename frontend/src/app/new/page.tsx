@@ -131,10 +131,11 @@ export default function NewCollection() {
     setServerError(null);
     try {
       const instagramTrimmed = form.instagram_url.trim();
+      const facebookTrimmed = form.facebook_url.trim();
       const payload = {
         website_url: form.website_url.trim(),
         ...(instagramTrimmed ? { instagram_url: instagramTrimmed } : {}),
-        facebook_url: form.facebook_url.trim(),
+        ...(facebookTrimmed ? { facebook_url: facebookTrimmed } : {}),
         business_name: form.business_name.trim() || undefined,
         max_pages: Number(form.max_pages),
         max_media: Number(form.max_media),
@@ -220,8 +221,8 @@ export default function NewCollection() {
               required: true,
               placeholder: "https://www.example-salon.com",
             })}
-            {field("facebook_url", "Facebook Page URL *", "Public business Facebook Page for preceding 365-day posts.", {
-              required: true,
+            {field("facebook_url", "Facebook Page URL (optional)", "Optional — leave blank for fast website-only collections, or add a public Facebook Page.", {
+              required: false,
               placeholder: "https://www.facebook.com/your-salon-page",
             })}
 

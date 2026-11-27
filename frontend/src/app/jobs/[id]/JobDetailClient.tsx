@@ -835,6 +835,7 @@ export default function JobDetailClient({ id }: { id: string }) {
             <span className="text-[#5C534B]">{nextStepHint}</span>
           </div>
           {job.collection_mode === "public_checkpoint" &&
+            status?.stage !== "completed" &&
             !["queued", "running"].includes(String(job.status)) &&
             !["queued", "started"].includes(String(job.ai_curation?.status || "")) && (
             <div className="flex items-center gap-2">

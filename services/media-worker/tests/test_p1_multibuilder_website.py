@@ -566,3 +566,93 @@ def test_shopify_auth_and_app_proxy_urls_excluded_and_galleries_prioritized():
     assert f"{base}/blogs/news/autumn-tips" in urls
     # Visual gallery page must appear BEFORE blog/product links
     assert urls.index(f"{base}/pages/grooming-gallery") < urls.index(f"{base}/blogs/news/autumn-tips")
+
+
+def test_subpage_403_preserves_homepage_downloads_universal_cdns_and_website_only_job(tmp_path, monkeypatch):
+    """Milestone 1 universal resilience:
+    1) A secondary subpage returning 403 must NOT poison held_origins or abort homepage/gallery downloads.
+    2) Duda (.cdn-website.com), GoHighLevel (.msgsndr.com), and GoDaddy (.wsimg.com) images download cleanly.
+    3) Website-only jobs (facebook_url=None, instagram_url=None) collect cleanly with facebook='not_requested'.
+    4) Homepage returning 403 STILL hard-stops as 'restricted' with 0 downloads."""
+    base = "https://www.universal-salon.example.com"
+    duda = "https://irp.cdn-website.com/salon/dog-duda.jpg"
+    ghl = "https://storage.msgsndr.com/salon/dog-ghl.jpg"
+    godaddy = "https://img1.wsimg.com/isteam/ip/dog-godaddy.jpg"
+    gallery_img = f"{base}/media/gallery-pup.jpg"
+    jpg1 = _jpeg_bytes(color=(120, 80, 60))
+    jpg2 = _jpeg_bytes(color=(60, 120, 80))
+    jpg3 = _jpeg_bytes(color=(80, 60, 120))
+    jpg4 = _jpeg_bytes(color=(140, 140, 50))
+
+    home_html = (
+        f'<html><body>'
+        f'<img src="{duda}" /><img src="{ghl}" /><img src="{godaddy}" />'
+        f'<a href="{base}/pages/about-members">Members</a>'
+        f'<a href="{base}/pages/gallery">Gallery</a>'
+        f'</body></html>'
+    ).encode("utf-8")
+    gallery_html = f'<html><body><img src="{gallery_img}" /></body></html>'.encode("utf-8")
+
+    responses = {
+        f"{base}/robots.txt": (200, {"Content-Type": "text/plain"}, b"User-agent: *\nAllow: /\n"),
+        "https://irp.cdn-website.com/robots.txt": (200, {"Content-Type": "text/plain"}, b"User-agent: *\nAllow: /\n"),
+        "https://storage.msgsndr.com/robots.txt": (200, {"Content-Type": "text/plain"}, b"User-agent: *\nAllow: /\n"),
+        "https://img1.wsimg.com/robots.txt": (200, {"Content-Type": "text/plain"}, b"User-agent: *\nAllow: /\n"),
+        f"{base}/": (200, {"Content-Type": "text/html"}, home_html),
+        f"{base}/pages/about-members": (403, {"Content-Type": "text/html"}, b"Forbidden"),
+        f"{base}/pages/gallery": (200, {"Content-Type": "text/html"}, gallery_html),
+        duda: (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(jpg1))}, jpg1),
+        ghl: (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(jpg2))}, jpg2),
+        godaddy: (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(jpg3))}, jpg3),
+        gallery_img: (200, {"Content-Type": "image/jpeg", "Content-Length": str(len(jpg4))}, jpg4),
+    }
+    monkeypatch.setattr(requests.Session, "get", _mock_http_get(responses))
+    monkeypatch.setattr(
+        "app.legacy_collector.SafeHTTPAdapter.send",
+        lambda self, req, **kw: _mock_http_get(responses)(self, req.url, **kw),
+        raising=False,
+    )
+
+    now = datetime(2026, 11, 27, 12, 0, 0, tzinfo=UTC)
+    job = {
+        "job_id": "f" * 32,
+        "website_url": f"{base}/",
+        "facebook_url": None,
+        "instagram_url": None,
+        "max_pages": 5,
+        "max_media": 10,
+        "social_permission_confirmed": False,
+        **frozen_window(now),
+    }
+    cfg = build_multitenant_collection_config(job)
+    cfg["run_preprocessing"] = False
+    job_dir = tmp_path / job["job_id"]
+    job_dir.mkdir(parents=True, exist_ok=True)
+    manifest = collect_public_job(job_dir, job, cfg)
+
+    assert manifest["sources"]["facebook"]["status"] == "not_requested"
+    assert manifest["sources"]["instagram"]["status"] == "not_requested"
+    assert "subpage_restricted" in manifest["sources"]["website"]["issues"]
+    downloaded_urls = {a["source_url"] for a in manifest["assets"] if a["extraction_status"] == "downloaded"}
+    assert downloaded_urls == {duda, ghl, godaddy, gallery_img}
+
+    # Verify root homepage 403 STILL hard-stops cleanly with 0 downloads
+    blocked_base = "https://www.blocked-root.example.com"
+    blocked_responses = {
+        f"{blocked_base}/robots.txt": (200, {"Content-Type": "text/plain"}, b"User-agent: *\nAllow: /\n"),
+        f"{blocked_base}/": (403, {"Content-Type": "text/html"}, b"Forbidden"),
+    }
+    monkeypatch.setattr(requests.Session, "get", _mock_http_get(blocked_responses))
+    monkeypatch.setattr(
+        "app.legacy_collector.SafeHTTPAdapter.send",
+        lambda self, req, **kw: _mock_http_get(blocked_responses)(self, req.url, **kw),
+        raising=False,
+    )
+    job2 = {**job, "job_id": "1" * 32, "website_url": f"{blocked_base}/"}
+    cfg2 = build_multitenant_collection_config(job2)
+    cfg2["run_preprocessing"] = False
+    job2_dir = tmp_path / job2["job_id"]
+    job2_dir.mkdir(parents=True, exist_ok=True)
+    manifest2 = collect_public_job(job2_dir, job2, cfg2)
+    assert manifest2["sources"]["website"]["stop_reason"] == "restricted"
+    assert manifest2["assets"] == []

@@ -9,7 +9,7 @@ export function sourceUrlErrors(body: Record<string, unknown>) {
   const errors: Record<string, string> = {};
   for (const field of ["website_url", "instagram_url", "facebook_url"] as const) {
     const value = body[field];
-    const optional = field === "instagram_url";
+    const optional = field === "instagram_url" || field === "facebook_url";
     if (value == null || (typeof value === "string" && !value.trim())) {
       if (!optional) {
         errors[field] = "URL is required";

@@ -1,5 +1,6 @@
 """Website discovery adapter for an injected, offline or guarded HTTP document transport."""
 
+import inspect
 import json
 from pathlib import PurePosixPath
 import re
@@ -251,6 +252,10 @@ class WebsiteInventory:
         seed_sitemaps = list(dict.fromkeys([*sitemaps, *(robots_sitemaps if self.historical_mode else ())]))
         self.seed = [("html", website_url), *(("xml", url) for url in seed_sitemaps)]
         self.fetch = fetch
+        try:
+            self._fetch_supports_subpage = "subpage" in inspect.signature(fetch).parameters
+        except (TypeError, ValueError):
+            self._fetch_supports_subpage = False
         self.permitted = permitted
         self.media_permitted = media_permitted or self._allowed
         self.document_limit = document_limit
@@ -436,7 +441,11 @@ class WebsiteInventory:
             if not self._allowed(url):
                 raise SourceStop("access_blocked")
             # Fixture or guarded HTTP transport supplies final URL and bytes.
-            final_url, body = self.fetch(url)
+            is_subpage = cursor is not None
+            if self._fetch_supports_subpage:
+                final_url, body = self.fetch(url, subpage=is_subpage)
+            else:
+                final_url, body = self.fetch(url)
             if not self._allowed(final_url):
                 raise SourceStop("access_blocked")
             if len(body) > self.document_limit:

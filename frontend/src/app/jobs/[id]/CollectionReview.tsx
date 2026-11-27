@@ -82,6 +82,8 @@ function humanizeCoverageStatus(s: Review["sources"][number]): { notes: string[]
   }
   if (lowerOutcomes.has("robots_disallowed")) {
     notes.push("Facebook CDN blocked automated downloads (robots.txt) — use Client Upload below");
+  } else if (lowerOutcomes.has("subpage_restricted")) {
+    notes.push("Some private or protected subpages were skipped; public pages collected");
   } else if (lowerOutcomes.has("login_redirect") || lowerOutcomes.has("restricted")) {
     notes.push("Platform login or access restriction encountered");
   } else if (lowerOutcomes.has("rate_limited")) {

@@ -135,14 +135,15 @@ GROQ_TIER_PRESETS: dict[str, dict[str, Any]] = {
         "max_retries": 3,
     },
     "gemini": {
-        "batch_size": 3,
-        "max_images_per_request": 3,
+        "batch_size": 5,
+        "max_images_per_request": 5,
         "max_requests_per_job": 40,
         "max_cost_usd_per_job": 1.00,
-        "min_request_spacing_s": 1.0,
-        "mode_a_max_output_tokens": 2200,
+        "min_request_spacing_s": 0.5,
+        "mode_a_max_output_tokens": 3200,
         "mode_b_max_output_tokens": 4000,
         "max_retries": 3,
+        "timeout_s": 60,
     },
 }
 
@@ -226,7 +227,7 @@ class AIProviderConfig:
             endpoint=(e.get("AI_ENDPOINT") or "").strip(),
             api_key=(e.get("AI_API_KEY") or "").strip(),
             tier_preset=tier_preset,
-            timeout_s=int((e.get("AI_TIMEOUT_S") or "").strip() or 120),
+            timeout_s=_int_opt("AI_TIMEOUT_S", 120),
             max_retries=_int_opt("AI_MAX_RETRIES", 2),
             batch_size=_int_opt("AI_BATCH_SIZE", 3),
             max_images_per_request=max(1, _int_opt("AI_MAX_IMAGES_PER_REQUEST", 5)),

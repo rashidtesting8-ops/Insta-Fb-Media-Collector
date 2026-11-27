@@ -175,7 +175,11 @@ class CreateJobRequest(BaseModel):
         max_length=2048,
         description="Optional public Instagram URL (parked by default in V2.1)",
     )
-    facebook_url: str = Field(min_length=1, max_length=2048, description="Required public Facebook URL")
+    facebook_url: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="Optional public Facebook URL (leave blank for website-only collections)",
+    )
     lookback_days: int = Field(default=365, ge=1, le=366)
     max_selected_images: int = Field(default=30, ge=1, le=200)
     max_selected_videos: int = Field(default=10, ge=1, le=100)
@@ -218,7 +222,7 @@ class CreateJobRequest(BaseModel):
     def validate_url(cls, value: str | None, info) -> str | None:
         from app.orchestration import _check_url
 
-        is_required = info.field_name != "instagram_url"
+        is_required = info.field_name == "website_url"
         errors: list[str] = []
         normalized = _check_url(value, info.field_name, errors, required=is_required)
         if errors:

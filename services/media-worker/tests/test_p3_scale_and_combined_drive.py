@@ -433,10 +433,11 @@ def test_gemini_3_vision_preset_reasoning_effort_and_secret_scrubbing():
         "AI_MIN_REQUEST_SPACING_S": "0",
     })
     assert cfg.tier_preset == "gemini"
-    assert cfg.batch_size == 3
-    assert cfg.max_images_per_request == 3
-    assert cfg.mode_a_max_output_tokens == 2200
+    assert cfg.batch_size == 5
+    assert cfg.max_images_per_request == 5
+    assert cfg.mode_a_max_output_tokens == 3200
     assert cfg.mode_b_max_output_tokens == 4000
+    assert cfg.timeout_s == 60
     assert cfg.max_requests_per_job == 40
     assert cfg.max_cost_usd_per_job == 1.0
 
