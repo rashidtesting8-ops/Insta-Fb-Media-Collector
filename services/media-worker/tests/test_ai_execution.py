@@ -258,3 +258,76 @@ def test_standalone_cannot_start_external_attempt(monkeypatch, flags):
     monkeypatch.setattr(sys, "argv", [str(runner), *flags])
     with pytest.raises(ai_execution.InferenceHeld, match="execution claim required"):
         runpy.run_path(str(runner), run_name="__main__")
+
+
+def test_fenced_503_overload_marks_rejected_and_retries_without_locking_job(setup, worker):
+    """HTTP 503 Service Unavailable (e.g. Gemini high-demand spike) must be treated as a
+    definitive non-billed rejection and retried under fenced execution, while HTTP 500
+    continues to record `ambiguous` and lock reconciliation."""
+    import base64
+    from requests import HTTPError, Response
+    from app.ai.provider import ImagePayload, UsageTracker
+
+    folder, job, consent, action = setup
+    action("approve")
+    tag = action("start")
+    config = AIProviderConfig(
+        provider="openai_compatible",
+        model="gemini-3.1-flash-lite",
+        endpoint="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        api_key="offline-test-key",
+        max_retries=2,
+        min_request_spacing_s=0.0,
+    )
+    attempts_seen: list[str] = []
+
+    def flaky_503_transport(request):
+        ai_execution.require_transport()
+        content = request["body"]["messages"][-1]["content"]
+        images = [
+            ImagePayload("test", "image/jpeg", base64.b64decode(p["image_url"]["url"].split(",")[1]))
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "image_url"
+        ]
+        mode = "A" if images else "B"
+        attempts_seen.append(mode)
+        if len(attempts_seen) == 1:
+            resp = Response()
+            resp.status_code = 503
+            resp._content = b'{"error":{"code":503,"status":"UNAVAILABLE","message":"high demand"}}'
+            raise HTTPError("503 Service Unavailable", response=resp)
+        mock = MockVisionProvider().complete(content[0]["text"], images, UsageTracker(AIProviderConfig(provider="mock")))
+        return {
+            "choices": [{"message": {"content": mock.text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 90},
+        }
+
+    result = run_started_curation(
+        folder,
+        job,
+        processing_consent=consent,
+        start_etag=tag,
+        config=config,
+        provider=OpenAICompatibleProvider(config, sleep=lambda _s: None, transport=flaky_503_transport),
+    )
+    assert result.status == "completed", result.errors
+    assert attempts_seen == ["A", "A", "B"]
+    assert (folder / "curation.json").is_file()
+    with worker.connect() as con:
+        outcomes = con.execute("SELECT mode, outcome FROM ai_provider_attempts ORDER BY rowid").fetchall()
+    assert outcomes == [("A", "rejected"), ("A", "returned"), ("B", "returned")]
+
+
+def test_resume_collection_blocked_while_ai_curation_active(setup, worker):
+    """POST /jobs/{id}/resume-collection must fail closed (409) while AI curation is queued/started."""
+    from fastapi import HTTPException
+    _, job, _, _ = setup
+    rec = worker.fetch(job)
+    rec["collection_mode"] = "public_checkpoint"
+    rec["status"] = "partial_success"
+    rec["ai_curation"] = {"status": "started"}
+    worker.store(rec)
+    with pytest.raises(HTTPException) as exc_info:
+        worker.resume_collection(job)
+    assert exc_info.value.status_code == 409
+    assert "AI curation is in progress" in str(exc_info.value.detail)

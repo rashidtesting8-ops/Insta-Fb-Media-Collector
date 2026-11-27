@@ -661,7 +661,9 @@ export default function JobDetailClient({ id }: { id: string }) {
             <span className="font-semibold text-[#181614]">Next step: {nextStepTitle}.</span>{" "}
             <span className="text-[#5C534B]">{nextStepHint}</span>
           </div>
-          {job.collection_mode === "public_checkpoint" && !["queued", "running"].includes(String(job.status)) && (
+          {job.collection_mode === "public_checkpoint" &&
+            !["queued", "running"].includes(String(job.status)) &&
+            !["queued", "started"].includes(String(job.ai_curation?.status || "")) && (
             <div className="flex items-center gap-2">
               <button
                 type="button"
