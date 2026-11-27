@@ -1168,6 +1168,9 @@ def resume_collection(job_id: str) -> dict[str, Any]:
             raise HTTPException(409, "Only checkpoint-backed jobs can resume collection")
         if rec.get("status") in ("queued", "running"):
             raise HTTPException(409, "Job is already running")
+        ai_state = (rec.get("ai_curation") or {}).get("status")
+        if ai_state in ("queued", "started"):
+            raise HTTPException(409, "Cannot resume collection while AI curation is in progress")
         checkpoint_enabled = (
             os.environ.get("PUBLIC_COLLECTION_CHECKPOINTS") == "1"
             or os.environ.get("COLLECTION_ENGINE", "").strip().lower() == "historical"

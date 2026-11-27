@@ -511,7 +511,7 @@ export default function CollectionReview({
             <div className="space-y-3 rounded-xl border border-teal-200 bg-gradient-to-br from-teal-50/90 to-emerald-50/50 p-4 text-xs">
               <div className="flex items-center gap-2 font-semibold text-teal-950">
                 <SparklesIcon className="h-4 w-4 text-[#0F766E]" />
-                Execute AI Visual Director V2 (Groq Vision)
+                Execute AI Visual Director V2 (Vision AI)
               </div>
               <p className="leading-relaxed text-teal-900">
                 Start AI is authorized for Revision {review.revision} ({review.eligible_assets.length} eligible asset

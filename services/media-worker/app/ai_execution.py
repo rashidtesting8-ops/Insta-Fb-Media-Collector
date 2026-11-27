@@ -167,10 +167,11 @@ def retry_limit(configured):
 
 
 def can_retry_http(status_code: int) -> bool:
-    """Under fenced execution, retry only definitive non-billed 429 rate limits (never ambiguous 5xx/timeouts)."""
+    """Under fenced execution, retry only definitive non-billed 429 rate limits and
+    503 Service Unavailable overload refusals (never ambiguous 500/502/504/timeouts)."""
     if _current.get() is None:
         return status_code == 0 or status_code == 429 or (500 <= status_code < 600)
-    return status_code == 429
+    return status_code in (429, 503)
 
 
 def checkpoint_analysis(parsed, ids, model, secret, usage):
@@ -238,7 +239,10 @@ def attempt(mode, ids, reserve=None, *, attempt_index: int = 0):
             pass
         outcome = "returned"
     except HTTPError as exc:
-        if exc.response is not None and 400 <= exc.response.status_code < 500 and exc.response.status_code != 408:
+        if exc.response is not None and (
+            (400 <= exc.response.status_code < 500 and exc.response.status_code != 408)
+            or exc.response.status_code == 503
+        ):
             outcome = "rejected"
         raise
     except InferenceHeld:

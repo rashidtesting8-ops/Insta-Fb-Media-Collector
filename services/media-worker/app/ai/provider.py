@@ -749,7 +749,12 @@ class OpenAICompatibleProvider(VisionProvider):
                 if 500 <= code < 600:
                     last_error = f"HTTP {code}: {detail}"
                     if attempt < retries and ai_execution.can_retry_http(code):
-                        self._sleep(2.0 * (2**attempt))
+                        retry_after = 0.0
+                        try:
+                            retry_after = float(str(resp_headers.get("retry-after") or "0").strip())
+                        except (TypeError, ValueError):
+                            retry_after = 0.0
+                        self._sleep(max(retry_after, 2.0 * (2**attempt)))
                         continue
                 raise RuntimeError(f"provider HTTP error: HTTP {code} {detail}") from None
             except (requests.Timeout, requests.RequestException, ValueError) as exc:
