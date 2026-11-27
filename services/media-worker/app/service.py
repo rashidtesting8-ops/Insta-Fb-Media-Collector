@@ -251,6 +251,7 @@ def ready() -> JSONResponse:
 def status() -> object:
     """Authenticated worker status used by the n8n health probe and dashboard settings."""
     from app.ai.provider import AIProviderConfig, build_provider
+    from app.browser_renderer import playwright_installed
 
     cfg = AIProviderConfig.from_env()
     provider_obj, provider_status = build_provider(cfg)
@@ -282,6 +283,8 @@ def status() -> object:
         "ai_max_cost_usd_per_job": cfg.max_cost_usd_per_job,
         "m4_approval_enabled": m4_approval_enabled(),
         "collection_engine": collection_engine,
+        "playwright_fallback_enabled": os.environ.get("PLAYWRIGHT_FALLBACK_ENABLED") == "1",
+        "playwright_installed": playwright_installed(),
     }
 
 

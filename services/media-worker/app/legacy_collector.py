@@ -470,7 +470,10 @@ _BUILDER_JSON_MEDIA_RE = re.compile(
     r"https://(?:static\.wixstatic\.com/media/|video\.wixstatic\.com/video/"
     r"|images\.squarespace-cdn\.com/|static1\.squarespace\.com/"
     r"|cdn\.shopify\.com/s/files/|cdn\.shopifycdn\.net/s/files/"
-    r"|cdn\.prod\.website-files\.com/)"
+    r"|cdn\.prod\.website-files\.com/"
+    r"|img\d*\.wsimg\.com/|media\.godaddysites\.com/"
+    r"|[a-z0-9-]+\.cdn-website\.com/"
+    r"|storage\.msgsndr\.com/|[a-z0-9-]+\.filesafe\.space/)"
     r"[^\s\"'<>\\)]+",
     re.IGNORECASE,
 )

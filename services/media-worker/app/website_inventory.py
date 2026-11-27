@@ -9,7 +9,7 @@ from xml.etree import ElementTree
 
 from bs4 import BeautifulSoup
 
-from app.browser_renderer import BrowserRendererUnavailable, looks_like_js_rendered_page
+from app.browser_renderer import BrowserRenderError, BrowserRendererUnavailable, looks_like_js_rendered_page
 from app.collection_checkpoint import Attachment, InventoryPage, SourceItem, SourceStop
 from app.legacy_collector import (
     MEDIA_EXTENSIONS,
@@ -485,7 +485,7 @@ class WebsiteInventory:
                     except BrowserRendererUnavailable:
                         self._js_disabled = True
                         issues.append("js_renderer_unavailable")
-                    except (PermissionError, SourceStop, OSError, ValueError):
+                    except (BrowserRenderError, PermissionError, SourceStop, OSError, ValueError):
                         issues.append("js_render_failed")
                 fresh: list[Attachment] = []
                 for att, fam_tag in grouped:

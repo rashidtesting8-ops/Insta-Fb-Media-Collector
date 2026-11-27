@@ -33,10 +33,12 @@ WEBSITE_MEDIA_HOST_SUFFIXES = (
     ".wixmp.com",
     ".squarespace-cdn.com",
     ".squarespace.com",
+    ".sqspcdn.com",
     ".shopify.com",
     ".shopifycdn.net",
     ".website-files.com",
     ".webflow.com",
+    ".framerusercontent.com",
     ".wp.com",
     ".cloudinary.com",
     ".wsimg.com",
@@ -608,6 +610,8 @@ def collect_public_job(
                     active_js_renderer = lambda target: render_page_html(  # noqa: E731
                         target,
                         robots_check=transport.page_permitted,
+                        site_origins=transport.site_origins,
+                        session_factory=session_factory,
                     )
                 inventory = WebsiteInventory(
                     url,

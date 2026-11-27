@@ -111,7 +111,7 @@ services:
     volumes:
       - ${MEDIA_STORAGE_DIR:-./storage/jobs}:/data/projects:rw
       - ./docs/AI_VISUAL_DIRECTOR_V2.md:/srv/docs/AI_VISUAL_DIRECTOR_V2.md:ro
-    mem_limit: 1g
+    mem_limit: ${COLLECTOR_MEM_LIMIT:-1536m}
     mem_reservation: 512m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/ready', timeout=3)"]

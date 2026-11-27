@@ -4,7 +4,14 @@ import { api } from "@/lib/api";
 import { FolderCloudIcon, RefreshIcon, ShieldCheckIcon, SparklesIcon } from "@/components/Icons";
 
 type HealthResponse = {
-  worker?: { ok: boolean; status?: number; collection_engine?: string; m4_approval_enabled?: boolean };
+  worker?: {
+    ok: boolean;
+    status?: number;
+    collection_engine?: string;
+    m4_approval_enabled?: boolean;
+    playwright_fallback_enabled?: boolean;
+    playwright_installed?: boolean;
+  };
   n8n?: { ok: boolean; status?: number };
   ai?: {
     configured: boolean;
@@ -101,6 +108,12 @@ export default function Settings() {
       statusText: health?.worker?.ok ? "Online & Ready" : "Unavailable",
       detail: `Engine: ${health?.worker?.collection_engine ?? "checking…"} · Approval Gate: ${
         health?.worker?.m4_approval_enabled ? "Enabled" : "Disabled"
+      } · JS Gallery Fallback: ${
+        health?.worker?.playwright_fallback_enabled && health?.worker?.playwright_installed
+          ? "Active (Chromium)"
+          : health?.worker?.playwright_fallback_enabled
+            ? "Enabled (Chromium not installed)"
+            : "Static HTML only"
       }`,
       Icon: ShieldCheckIcon,
     },

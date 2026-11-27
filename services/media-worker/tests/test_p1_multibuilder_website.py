@@ -23,9 +23,14 @@ import requests
 
 from app import public_collection
 from app.browser_renderer import (
+    BrowserRenderError,
     BrowserRendererUnavailable,
+    _append_computed_media_hints,
+    _looks_like_challenge_dom,
     looks_like_js_rendered_page,
     make_ssrf_route_handler,
+    playwright_installed,
+    render_page_html,
     verify_browser_url,
 )
 from app.legacy_collector import build_collector_session
@@ -238,10 +243,17 @@ def test_p1_default_sitemap_xml_probe_discovers_pages_when_robots_omits_sitemap(
     assert photo in by_url and by_url[photo]["extraction_status"] == "downloaded"
 
 
-def test_p1_browser_renderer_ssrf_guard_blocks_private_ips_schemes_ports_and_heavy_types():
+def test_p1_browser_renderer_ssrf_guard_blocks_private_ips_schemes_ports_and_heavy_types(monkeypatch):
     def fake_resolver(host: str, port: int):
         mapping = {
             "public-salon.example.test": "93.184.216.34",
+            "www.public-salon.example.test": "93.184.216.34",
+            "cdn.jsdelivr.net": "93.184.216.35",
+            "cdnjs.cloudflare.com": "93.184.216.36",
+            "unpkg.com": "93.184.216.37",
+            "static.wixstatic.com": "93.184.216.38",
+            "evil-tracker.example.net": "93.184.216.39",
+            "other-site.example.org": "93.184.216.40",
             "rebind-loopback.example.test": "127.0.0.1",
             "rebind-rfc1918.example.test": "10.0.0.42",
             "rebind-metadata.example.test": "169.254.169.254",
@@ -265,23 +277,147 @@ def test_p1_browser_renderer_ssrf_guard_blocks_private_ips_schemes_ports_and_hea
         with pytest.raises(ValueError):
             verify_browser_url(bad, resolver=fake_resolver)
 
-    handler = make_ssrf_route_handler(resolver=fake_resolver)
+    # Audit H-3: make_ssrf_route_handler MUST NEVER call route.continue_(); it fetches via
+    # SafeHTTPAdapter + response_get and validates EVERY redirect hop, host, robots, method, and cap.
+    mock_responses = {
+        "https://public-salon.example.test/": (
+            200,
+            {"Content-Type": "text/html", "Set-Cookie": "sid=secret", "Content-Encoding": "gzip"},
+            b"<html><body><div id='root'></div></body></html>",
+        ),
+        "https://public-salon.example.test/app.js": (
+            200,
+            {"Content-Type": "application/javascript", "Access-Control-Allow-Origin": "*"},
+            b"console.log('ok');",
+        ),
+        "https://cdnjs.cloudflare.com/ajax/libs/react.js": (
+            200,
+            {"Content-Type": "application/javascript"},
+            b"// react",
+        ),
+        "https://unpkg.com/gallery.js": (
+            200,
+            {"Content-Type": "application/javascript"},
+            b"// gallery",
+        ),
+        # H-3 Attack 1: 302 redirect to AWS metadata / loopback / internal Docker host
+        "https://public-salon.example.test/redir-metadata": (
+            302,
+            {"Location": "http://169.254.169.254/latest/meta-data/"},
+            b"",
+        ),
+        "https://public-salon.example.test/redir-offsite": (
+            302,
+            {"Location": "https://other-site.example.org/steal"},
+            b"",
+        ),
+        "https://public-salon.example.test/redir-login": (
+            302,
+            {"Location": "https://public-salon.example.test/login"},
+            b"",
+        ),
+        "https://public-salon.example.test/redir-robots": (
+            302,
+            {"Location": "https://public-salon.example.test/private-blocked"},
+            b"",
+        ),
+        # H-3 Attack 2: Document challenge / 403 / 429 must abort truthfully
+        "https://public-salon.example.test/cf-wall": (
+            403,
+            {"Content-Type": "text/html", "cf-mitigated": "challenge"},
+            b"Just a moment...",
+        ),
+        "https://public-salon.example.test/rate-limit": (
+            429,
+            {"Content-Type": "text/html"},
+            b"Too Many Requests",
+        ),
+        # H-3 Attack 3: Oversized subresource payload
+        "https://public-salon.example.test/huge.js": (
+            200,
+            {"Content-Type": "application/javascript"},
+            b"x" * 100_000,
+        ),
+    }
+    monkeypatch.setattr(requests.Session, "get", _mock_http_get(mock_responses))
 
-    def run_route(url: str, resource_type: str = "document") -> str:
-        outcome = []
+    route_state: dict = {}
+    handler = make_ssrf_route_handler(
+        site_url="https://public-salon.example.test/",
+        resolver=fake_resolver,
+        robots_check=lambda u: "/private-blocked" not in u,
+        max_requests=20,
+        max_response_bytes=16_384,
+        state=route_state,
+    )
+
+    def run_route(url: str, resource_type: str = "document", method: str = "GET") -> tuple[str, dict]:
+        outcome: list[tuple[str, dict]] = []
+
+        def forbid_continue():
+            pytest.fail("H-3 violation: route.continue_() must NEVER be called by make_ssrf_route_handler")
+
         route = SimpleNamespace(
-            request=SimpleNamespace(url=url, resource_type=resource_type),
-            continue_=lambda: outcome.append("continue"),
-            abort=lambda: outcome.append("abort"),
+            request=SimpleNamespace(url=url, resource_type=resource_type, method=method),
+            continue_=forbid_continue,
+            fulfill=lambda **kw: outcome.append(("fulfill", kw)),
+            abort=lambda: outcome.append(("abort", {})),
         )
         handler(route)
         return outcome[0]
 
-    assert run_route("https://public-salon.example.test/app.js", "script") == "continue"
-    assert run_route("https://public-salon.example.test/font.woff2", "font") == "abort"
-    assert run_route("https://public-salon.example.test/hero.mp4", "media") == "abort"
-    assert run_route("https://rebind-metadata.example.test/token", "xhr") == "abort"
-    assert run_route("file:///etc/hosts", "document") == "abort"
+    # Allowed same-origin document & scripts fulfill with sanitized headers (Set-Cookie/Content-Encoding stripped)
+    act, kw = run_route("https://public-salon.example.test/", "document")
+    assert act == "fulfill" and kw["status"] == 200
+    assert "set-cookie" not in kw["headers"] and "content-encoding" not in kw["headers"]
+
+    act, kw = run_route("https://public-salon.example.test/app.js", "script")
+    assert act == "fulfill" and kw["headers"].get("access-control-allow-origin") == "*"
+
+    # Vetted exact & suffix CDNs allowed
+    assert run_route("https://cdnjs.cloudflare.com/ajax/libs/react.js", "script")[0] == "fulfill"
+    assert run_route("https://unpkg.com/gallery.js", "script")[0] == "fulfill"
+
+    # Vetted images return 1x1 PNG stub with ZERO upstream requests
+    req_before = route_state["requests"]
+    act, kw = run_route("https://static.wixstatic.com/media/dog.jpg", "image")
+    assert act == "fulfill" and kw["headers"]["content-type"] == "image/png" and kw["body"].startswith(b"\x89PNG\r\n\x1a\n")
+    assert route_state["requests"] == req_before
+
+    # Untrusted image host, blocked resource types, non-GET methods, and untrusted third-party scripts all abort
+    assert run_route("https://evil-tracker.example.net/pixel.png", "image")[0] == "abort"
+    assert run_route("https://evil-tracker.example.net/track.js", "script")[0] == "abort"
+    assert run_route("https://public-salon.example.test/app.js", "script", method="POST")[0] == "abort"
+    assert run_route("https://public-salon.example.test/font.woff2", "font")[0] == "abort"
+    assert run_route("https://public-salon.example.test/hero.mp4", "media")[0] == "abort"
+    assert run_route("https://rebind-metadata.example.test/token", "xhr")[0] == "abort"
+    assert run_route("file:///etc/hosts", "document")[0] == "abort"
+
+    # Server-side 302 redirects to metadata, off-site, login wall, and robots-disallowed MUST all abort
+    assert run_route("https://public-salon.example.test/redir-metadata", "document")[0] == "abort"
+    assert run_route("https://public-salon.example.test/redir-offsite", "document")[0] == "abort"
+    assert run_route("https://public-salon.example.test/redir-login", "document")[0] == "abort"
+    assert run_route("https://public-salon.example.test/redir-robots", "document")[0] == "abort"
+
+    # Document 403/CF challenge & 429 abort and record document_error
+    assert run_route("https://public-salon.example.test/cf-wall", "document")[0] == "abort"
+    assert route_state["document_error"] == "restricted"
+    assert run_route("https://public-salon.example.test/rate-limit", "document")[0] == "abort"
+    assert route_state["document_error"] == "rate_limited"
+
+    # Oversized response exceeds max_response_bytes -> abort
+    assert run_route("https://public-salon.example.test/huge.js", "script")[0] == "abort"
+
+    # Helper checks: computed media escaping & challenge DOM detection
+    injected = _append_computed_media_hints(
+        "<html><body>ok</body></html>",
+        ["https://static.wixstatic.com/media/a.jpg", "https://cdn.prod.website-files.com/v.mp4", "javascript:alert(1)"],
+    )
+    assert 'src="https://static.wixstatic.com/media/a.jpg"' in injected
+    assert '<video src="https://cdn.prod.website-files.com/v.mp4">' in injected
+    assert "javascript:alert" not in injected
+    assert _looks_like_challenge_dom("<html><head><title>Just a moment...</title></head></html>") is True
+    assert _looks_like_challenge_dom("<html><body><h1>Luxury Dog Grooming</h1></body></html>") is False
 
 
 def test_p1_playwright_js_fallback_recovers_spa_gallery_and_degrades_gracefully(tmp_path, monkeypatch):
@@ -293,7 +429,8 @@ def test_p1_playwright_js_fallback_recovers_spa_gallery_and_degrades_gracefully(
 
     spa_shell = '<html><body><div id="root"></div><script src="/bundle.js"></script></body></html>'
     assert looks_like_js_rendered_page(spa_shell, 0) is True
-    assert looks_like_js_rendered_page(spa_shell, 2) is False
+    assert looks_like_js_rendered_page(spa_shell, 2) is True  # Logo + OG image still triggers SPA render
+    assert looks_like_js_rendered_page(spa_shell, 3) is False
 
     responses = {
         f"{web}/robots.txt": (200, {}, "User-agent: *\nAllow: /\n"),
@@ -337,6 +474,17 @@ def test_p1_playwright_js_fallback_recovers_spa_gallery_and_degrades_gracefully(
 
     manifest2 = collect_public_job(job_dir2, job2, build_multitenant_collection_config(job2), js_renderer=missing_renderer)
     assert "js_renderer_unavailable" in manifest2["sources"]["website"]["issues"]
+
+    # 3. When headless Chromium times out (BrowserRenderError) -> degrades gracefully with js_render_failed.
+    job_dir3 = tmp_path / ("e" * 32)
+    job_dir3.mkdir()
+    job3 = {**job, "job_id": job_dir3.name}
+
+    def timeout_renderer(_url: str) -> bytes:
+        raise BrowserRenderError("Headless browser render failed: TimeoutError")
+
+    manifest3 = collect_public_job(job_dir3, job3, build_multitenant_collection_config(job3), js_renderer=timeout_renderer)
+    assert "js_render_failed" in manifest3["sources"]["website"]["issues"]
 
 
 def test_p1_multibatch_website_resume_continues_checkpoint_across_pages(worker, tmp_path, monkeypatch):
