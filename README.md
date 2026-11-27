@@ -1,4 +1,4 @@
-# Atelier Media — Pet Grooming Media Intelligence (V2.1)
+# Pet Grooming Media Intelligence 
 
 [![CI Verification](https://github.com/rashidtesting8-ops/Insta-Fb-Media-Collector/actions/workflows/tests.yml/badge.svg)](https://github.com/rashidtesting8-ops/Insta-Fb-Media-Collector/actions/workflows/tests.yml)
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
