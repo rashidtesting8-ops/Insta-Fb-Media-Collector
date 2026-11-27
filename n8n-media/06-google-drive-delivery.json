@@ -341,8 +341,8 @@
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify($json) }}",
-        "options": {"responseCode": 200}
+        "responseBody": "={{ JSON.stringify($json.error ? { status: 'failed', error: String(($json.error && $json.error.message) || $json.error || 'Unable to save Google Drive delivery ledger') } : $json) }}",
+        "options": {"responseCode": "={{ $json.error || $json.status === 'failed' ? 502 : 200 }}"}
       },
       "id": "a6000000-0000-4000-8000-000000000009",
       "name": "Respond With Delivery Result",

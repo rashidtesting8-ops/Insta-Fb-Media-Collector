@@ -2,6 +2,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CheckIcon, RefreshIcon, ShieldCheckIcon, SparklesIcon } from "@/components/Icons";
+import { friendlyErrorMessage } from "@/lib/errors";
 
 type Action = "approve" | "deny" | "revoke" | "start";
 type Review = {
@@ -122,6 +123,7 @@ export default function CollectionReview({
   const url = `/api/jobs/${id}/collection-approval`;
   const [review, setReview] = useState<Review | null>(null);
   const [message, setMessage] = useState("");
+  const [messageIsError, setMessageIsError] = useState(false);
   const [login, setLogin] = useState(false);
   const [reason, setReason] = useState("");
   const [policyReason, setPolicyReason] = useState("");
@@ -137,14 +139,29 @@ export default function CollectionReview({
     const version = ++latest.current;
     try {
       const res = await fetch(url, { cache: "no-store" });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (latest.current !== version) return;
-      setLogin(res.status === 401 || res.status === 403);
+      setLogin(res.status === 401);
       setReview(res.ok ? data : null);
-      setMessage(res.ok ? "" : res.status === 409 ? "No accepted collection revision is available." : data.error);
+      if (res.ok) {
+        setMessage("");
+        setMessageIsError(false);
+      } else {
+        setMessageIsError(res.status !== 409);
+        setMessage(
+          res.status === 409
+            ? "No accepted collection revision is available."
+            : res.status === 403
+              ? friendlyErrorMessage(
+                  data.error || "Named Admin access is required for collection review. Sign in with a Named Admin account in Settings or Login.",
+                )
+              : friendlyErrorMessage(data.error, `Review unavailable (HTTP ${res.status}).`),
+        );
+      }
     } catch {
       if (latest.current === version) {
         setReview(null);
+        setMessageIsError(true);
         setMessage("Review unavailable.");
       }
     } finally {
@@ -182,18 +199,28 @@ export default function CollectionReview({
         body: JSON.stringify(action === "start" ? {} : { action, reason: effectiveReason }),
       });
       if (!res.ok) {
-        setMessage((await res.json()).error);
-        if ([401, 403, 409, 412].includes(res.status)) {
+        const errData = await res.json().catch(() => ({}));
+        setMessageIsError(true);
+        setMessage(
+          res.status === 403
+            ? friendlyErrorMessage(
+                errData.error || "Action not allowed for your account (an independent second Named Admin must approve your submission).",
+              )
+            : friendlyErrorMessage(errData.error, `Unable to record decision (HTTP ${res.status}).`),
+        );
+        if ([401, 409, 412].includes(res.status)) {
           setReview(null);
           setReason("");
         }
-        setLogin(res.status === 401 || res.status === 403);
+        setLogin(res.status === 401);
         return;
       }
       setReason("");
+      setMessageIsError(false);
       await load();
       onChanged?.();
     } catch {
+      setMessageIsError(true);
       setMessage("Outcome unknown. Refresh the review to check the recorded decision.");
     } finally {
       setBusy(false);
@@ -218,20 +245,23 @@ export default function CollectionReview({
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setMessage(data.error || "Unable to update undated website policy.");
-        if ([401, 403, 409, 412].includes(res.status)) setReview(null);
-        setLogin(res.status === 401 || res.status === 403);
+        setMessageIsError(true);
+        setMessage(friendlyErrorMessage(data.error, "Unable to update undated website policy."));
+        if ([401, 409, 412].includes(res.status)) setReview(null);
+        setLogin(res.status === 401);
         return;
       }
       setPolicyReason("");
       await load();
       onChanged?.();
+      setMessageIsError(false);
       setMessage(
         nextInclude
           ? "Website photos included! Ready for an independent team admin to approve."
           : "Undated website media excluded — updated revision published for approval.",
       );
     } catch {
+      setMessageIsError(true);
       setMessage("Outcome unknown. Refresh the review to verify policy revision.");
     } finally {
       setBusy(false);
@@ -260,11 +290,13 @@ export default function CollectionReview({
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setMessage(data.error || "AI execution could not start.");
-        setLogin(res.status === 401 || res.status === 403);
+        setMessageIsError(true);
+        setMessage(friendlyErrorMessage(data.error, "AI execution could not start."));
+        setLogin(res.status === 401);
         return;
       }
       setConsentChecked(false);
+      setMessageIsError(false);
       setMessage(
         res.status === 202
           ? "AI Visual Director V2 curation queued in background. Status will refresh automatically."
@@ -272,6 +304,7 @@ export default function CollectionReview({
       );
       onChanged?.();
     } catch {
+      setMessageIsError(true);
       setMessage("AI execution request failed. Refresh job status before retrying.");
     } finally {
       setBusy(false);
@@ -298,19 +331,22 @@ export default function CollectionReview({
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setMessage(data.error || "Unable to reconcile failed AI run.");
-        if ([401, 403, 409, 412].includes(res.status)) setReview(null);
-        setLogin(res.status === 401 || res.status === 403);
+        setMessageIsError(true);
+        setMessage(friendlyErrorMessage(data.error, "Unable to reconcile failed AI run."));
+        if ([401, 409, 412].includes(res.status)) setReview(null);
+        setLogin(res.status === 401);
         return;
       }
       setReconcileReason("");
       setConsentChecked(false);
       await load();
       onChanged?.();
+      setMessageIsError(false);
       setMessage(
         "Failed AI run reconciled! A fresh revision is now open for independent Team Admin Approval and AI retry.",
       );
     } catch {
+      setMessageIsError(true);
       setMessage("Outcome unknown. Refresh the review to verify reconciliation status.");
     } finally {
       setBusy(false);
@@ -360,8 +396,12 @@ export default function CollectionReview({
 
       {message && (
         <div
-          role="status"
-          className="rounded-xl border border-[#E5DDD2] bg-[#FAF7F2] px-4 py-2.5 text-xs font-medium text-[#2C2824]"
+          role={messageIsError ? "alert" : "status"}
+          className={
+            messageIsError
+              ? "rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs font-medium text-rose-900"
+              : "rounded-xl border border-[#E5DDD2] bg-[#FAF7F2] px-4 py-2.5 text-xs font-medium text-[#2C2824]"
+          }
         >
           {message}
         </div>

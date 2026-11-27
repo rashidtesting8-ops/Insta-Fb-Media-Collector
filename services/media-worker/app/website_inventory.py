@@ -205,6 +205,20 @@ def group_wordpress_responsive_media(
     return result
 
 
+_UNSAFE_XML_DECL_RE = re.compile(rb"<!\s*(?:doctype|entity|element|attlist)\b", re.IGNORECASE)
+
+
+def _canonical_site_origins(orig: tuple[str, str | None, int]) -> set[tuple[str, str, int]]:
+    scheme, host, port = orig
+    low = (host or "").lower().rstrip(".")
+    out = {(scheme, low, port)}
+    if low.startswith("www.") and len(low) > 4:
+        out.add((scheme, low[4:], port))
+    elif low and "." in low and not low.replace(".", "").isdigit():
+        out.add((scheme, f"www.{low}", port))
+    return out
+
+
 class WebsiteInventory:
     def __init__(
         self,
@@ -224,6 +238,7 @@ class WebsiteInventory:
         if min(document_limit, entry_limit) < 1:
             raise ValueError("Fixture discovery limits must be positive")
         self.origin = self._origin(website_url)
+        self.site_origins = _canonical_site_origins(self.origin)
         self.historical_mode = bool(historical_mode)
         seed_sitemaps = list(dict.fromkeys([*sitemaps, *(robots_sitemaps if self.historical_mode else ())]))
         self.seed = [("html", website_url), *(("xml", url) for url in seed_sitemaps)]
@@ -240,12 +255,12 @@ class WebsiteInventory:
     @staticmethod
     def _origin(url):
         parts = urlsplit(url)
-        return parts.scheme, parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+        return parts.scheme, (parts.hostname or "").lower().rstrip("."), parts.port or (443 if parts.scheme == "https" else 80)
 
     def _allowed(self, url):
         parts = urlsplit(url)
         return (parts.scheme in ("https", "http") and parts.username is None and parts.password is None
-                and self._origin(url) == self.origin and self.permitted(url))
+                and self._origin(url) in self.site_origins and self.permitted(url))
 
     def _same_origin_candidate(self, url):
         if not url:
@@ -253,7 +268,7 @@ class WebsiteInventory:
         parts = urlsplit(url)
         if parts.scheme not in ("https", "http") or parts.username is not None or parts.password is not None:
             return False
-        return self._origin(url) == self.origin
+        return self._origin(url) in self.site_origins
 
     @staticmethod
     def _is_excluded_page(url: str) -> bool:
@@ -281,8 +296,8 @@ class WebsiteInventory:
         return False
 
     def _sitemap(self, body, base):
-        # Reject declarations (including UTF-16/NUL forms) before using the XML parser.
-        if b"\x00" in body or b"<!" in body:
+        # Reject NUL bytes and DTD/entity declarations while permitting standard XML comments (e.g. Yoast/WP).
+        if b"\x00" in body or _UNSAFE_XML_DECL_RE.search(body):
             raise ValueError("Unsupported sitemap markup")
         root = ElementTree.fromstring(body)
         kind = root.tag.rsplit("}", 1)[-1]

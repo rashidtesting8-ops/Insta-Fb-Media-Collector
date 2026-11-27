@@ -2,6 +2,7 @@
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
+import { friendlyErrorMessage } from "@/lib/errors";
 import { sourceUrlErrors } from "@/lib/intake";
 import { ArrowRightIcon, CheckIcon, FolderCloudIcon, ShieldCheckIcon, SparklesIcon } from "@/components/Icons";
 
@@ -157,7 +158,7 @@ export default function NewCollection() {
       });
       router.push(`/jobs/${job.job_id}`);
     } catch (err: unknown) {
-      setServerError(err instanceof Error ? err.message : String(err));
+      setServerError(friendlyErrorMessage(err, "Unable to start collection. Confirm Docker services are running and retry."));
     } finally {
       setSubmitting(false);
     }

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import CollectionReview from "./CollectionReview";
 import { api } from "@/lib/api";
+import { friendlyErrorMessage, safeExternalHref } from "@/lib/errors";
 import type {
   JobRecord,
   PipelineStatus,
@@ -212,7 +213,8 @@ export default function JobDetailClient({ id }: { id: string }) {
   const [businessName, setBusinessName] = useState("");
   const [releaseConfirmed, setReleaseConfirmed] = useState(false);
   const [delivering, setDelivering] = useState(false);
-  const [deliveryMessage, setDeliveryMessage] = useState<string | null>(null);
+  const [deliveryMessage, setDeliveryMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  const [pollWarning, setPollWarning] = useState<string | null>(null);
   const [copiedDriveLink, setCopiedDriveLink] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [resumeMessage, setResumeMessage] = useState<string | null>(null);
@@ -223,6 +225,7 @@ export default function JobDetailClient({ id }: { id: string }) {
   const [uploadingMedia, setUploadingMedia] = useState(false);
   const [uploadMessage, setUploadMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [copiedClientGuide, setCopiedClientGuide] = useState(false);
+  const hasLoadedJobRef = useRef(false);
 
   const triggerRefresh = useCallback(() => {
     setRefreshTick((t) => t + 1);
@@ -232,8 +235,10 @@ export default function JobDetailClient({ id }: { id: string }) {
     const controller = new AbortController();
     const options = { signal: controller.signal };
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let consecutiveErrors = 0;
     async function loadAll() {
       let shouldContinuePolling = false;
+      let nextDelayMs = 5000;
       try {
         const [j, s, m, c, d, r] = await Promise.all([
           api<JobRecord>(`/api/jobs/${id}`, options),
@@ -244,9 +249,12 @@ export default function JobDetailClient({ id }: { id: string }) {
           api<RightsReview>(`/api/jobs/${id}/rights`, options).catch(() => null),
         ]);
         if (controller.signal.aborted) return;
+        consecutiveErrors = 0;
+        hasLoadedJobRef.current = true;
         const aiActive = ["queued", "started"].includes(String(j?.ai_curation?.status || ""));
         shouldContinuePolling = !s.terminal || aiActive;
         setError(null);
+        setPollWarning(null);
         setJob(j);
         setStatus(s);
         setManifest(m);
@@ -260,11 +268,21 @@ export default function JobDetailClient({ id }: { id: string }) {
         }
         lastReviewSyncKey.current = syncKey;
       } catch (e: unknown) {
-        if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
+        if (!controller.signal.aborted) {
+          const msg = friendlyErrorMessage(e, "Unable to refresh project status.");
+          if (hasLoadedJobRef.current) {
+            consecutiveErrors += 1;
+            setPollWarning(msg);
+            shouldContinuePolling = true;
+            nextDelayMs = Math.min(15000, 5000 * consecutiveErrors);
+          } else {
+            setError(msg);
+          }
+        }
       } finally {
         if (!controller.signal.aborted) {
           setLoading(false);
-          if (shouldContinuePolling) timer = setTimeout(loadAll, 5000);
+          if (shouldContinuePolling) timer = setTimeout(loadAll, nextDelayMs);
         }
       }
     }
@@ -550,18 +568,37 @@ export default function JobDetailClient({ id }: { id: string }) {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setDeliveryMessage(data.error || `Drive delivery failed (HTTP ${res.status}).`);
+        setDeliveryMessage({
+          ok: false,
+          text: friendlyErrorMessage(data.error || data.reason, `Google Drive delivery failed (HTTP ${res.status}).`),
+        });
         return;
       }
-      setReleaseConfirmed(false);
-      setDeliveryMessage(
-        data.status === "completed"
-          ? "Google Drive delivery completed."
-          : `Delivery response: ${data.status || "received"}${data.reason ? ` — ${data.reason}` : ""}`,
-      );
+      const responseStatus = String(data.status || "").toLowerCase();
+      if (responseStatus === "completed") {
+        setReleaseConfirmed(false);
+        setDeliveryMessage({ ok: true, text: "Google Drive delivery completed! Your private client folder is ready above." });
+      } else if (responseStatus === "partial_success") {
+        setReleaseConfirmed(false);
+        setDeliveryMessage({
+          ok: false,
+          text: `Google Drive upload partially completed — some files or reports failed (${Array.isArray(data.errors) && data.errors.length ? data.errors.join("; ") : data.reason || "check receipts above"}).`,
+        });
+      } else {
+        const detail = data.error || data.reason || (Array.isArray(data.errors) ? data.errors.join("; ") : "");
+        setDeliveryMessage({
+          ok: false,
+          text: friendlyErrorMessage(
+            detail || `Google Drive delivery did not complete (status: ${responseStatus || "blocked"}).`,
+          ),
+        });
+      }
       triggerRefresh();
-    } catch {
-      setDeliveryMessage("Google Drive delivery request unavailable.");
+    } catch (e: unknown) {
+      setDeliveryMessage({
+        ok: false,
+        text: friendlyErrorMessage(e, "Google Drive delivery request unavailable. Confirm n8n is running and retry."),
+      });
     } finally {
       setDelivering(false);
     }
@@ -602,12 +639,18 @@ export default function JobDetailClient({ id }: { id: string }) {
   }
   if (error) {
     return (
-      <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800">
-        {error}
+      <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800">
+        <span>{error}</span>
+        <button type="button" onClick={triggerRefresh} className="studio-btn-secondary py-1.5 text-xs">
+          Retry now
+        </button>
       </div>
     );
   }
   if (!job) return <div className="p-4 text-sm text-[#6B635B]">Job not found.</div>;
+
+  const safeWebsiteHref = safeExternalHref(job.website_url);
+  const safeDriveFolderHref = safeExternalHref(delivery?.drive_folder_link, { httpsOnly: true });
 
   const visual = stagePresentation(status?.stage);
   const salonName = defaultBusinessName(job, delivery);
@@ -665,6 +708,20 @@ export default function JobDetailClient({ id }: { id: string }) {
 
   return (
     <div className="space-y-6">
+      {pollWarning && (
+        <div
+          role="alert"
+          className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-950"
+        >
+          <div>
+            <strong className="font-semibold">Live refresh paused briefly:</strong> {pollWarning}
+          </div>
+          <button type="button" onClick={triggerRefresh} className="studio-btn-secondary py-1 text-xs">
+            Retry now
+          </button>
+        </div>
+      )}
+
       {/* Studio Project Header */}
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 space-y-1.5">
@@ -684,9 +741,9 @@ export default function JobDetailClient({ id }: { id: string }) {
           </div>
           <h1 className="truncate font-serif text-3xl font-medium tracking-tight text-[#181614]">{salonName}</h1>
           <div className="flex flex-wrap items-center gap-3 text-xs text-[#6B635B]">
-            {job.website_url && (
+            {safeWebsiteHref && (
               <a
-                href={job.website_url}
+                href={safeWebsiteHref}
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex items-center gap-1 hover:text-[#0F766E] hover:underline"
@@ -705,9 +762,9 @@ export default function JobDetailClient({ id }: { id: string }) {
             <RefreshIcon className="h-4 w-4" />
             Refresh
           </button>
-          {delivery?.drive_folder_link && (
+          {safeDriveFolderHref && (
             <a
-              href={delivery.drive_folder_link}
+              href={safeDriveFolderHref}
               target="_blank"
               rel="noreferrer"
               className="studio-btn-primary"
@@ -884,6 +941,20 @@ export default function JobDetailClient({ id }: { id: string }) {
             ))}
           </div>
         </div>
+
+        {!["queued", "running"].includes(String(job.status)) && downloadedCount === 0 && (
+          <div
+            role="alert"
+            className="space-y-1 rounded-xl border border-amber-300 bg-amber-50/90 px-4 py-3 text-xs text-amber-950"
+          >
+            <div className="font-semibold">No photos or videos could be downloaded yet</div>
+            <p className="leading-relaxed text-amber-900">
+              {job.error
+                ? friendlyErrorMessage(job.error)
+                : "The business website may block automated crawlers, require JavaScript rendering, or have no public gallery images. Double-check the exact website URL (including www. if used) or start a fresh collection."}
+            </p>
+          </div>
+        )}
 
         {mock && (
           <div className="rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-sm text-amber-900">
@@ -1380,12 +1451,29 @@ export default function JobDetailClient({ id }: { id: string }) {
           </div>
         )}
 
-        {delivery && (
-          <div className="space-y-4 rounded-2xl border border-emerald-200/80 bg-emerald-50/40 p-4 text-sm">
+        {delivery && (() => {
+          const ds = String(delivery.status || "").toLowerCase();
+          const isFailed = ds === "failed" || ds.startsWith("blocked");
+          const isPartial = ds === "partial_success" || ds === "uploading";
+          const cardTone = isFailed
+            ? "border-rose-200 bg-rose-50/60"
+            : isPartial
+              ? "border-amber-200 bg-amber-50/50"
+              : "border-emerald-200/80 bg-emerald-50/40";
+          const pillTone = isFailed
+            ? "bg-rose-100 text-rose-900"
+            : isPartial
+              ? "bg-amber-100 text-amber-950"
+              : "bg-emerald-100 text-emerald-900";
+          return (
+          <div
+            role={isFailed ? "alert" : undefined}
+            className={`space-y-4 rounded-2xl border p-4 text-sm ${cardTone}`}
+          >
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
-                  <span className="rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-semibold text-emerald-900">
+                  <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${pillTone}`}>
                     Status: {delivery.status}
                   </span>
                   <span className="rounded-full bg-white px-2.5 py-0.5 text-xs font-medium text-[#544B43] ring-1 ring-[#E4DCD1]">
@@ -1399,18 +1487,18 @@ export default function JobDetailClient({ id }: { id: string }) {
                 )}
               </div>
 
-              {delivery.drive_folder_link && (
+              {safeDriveFolderHref && (
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => copyDriveFolderLink(delivery.drive_folder_link!)}
+                    onClick={() => copyDriveFolderLink(safeDriveFolderHref)}
                     className="studio-btn-secondary py-2 text-xs"
                   >
                     {copiedDriveLink ? "Drive Link Copied ✓" : "Copy Drive Link"}
                   </button>
                   <a
                     className="studio-btn-primary"
-                    href={delivery.drive_folder_link}
+                    href={safeDriveFolderHref}
                     target="_blank"
                     rel="noreferrer"
                   >
@@ -1443,12 +1531,15 @@ export default function JobDetailClient({ id }: { id: string }) {
                 <div className="rounded-xl border border-[#E6DDD2] bg-white p-3.5">
                   <div className="text-xs font-semibold text-[#181614]">Media files uploaded</div>
                   <ul className="mt-2 space-y-1.5">
-                    {delivery.uploaded.map((u) => (
+                    {delivery.uploaded.map((u) => {
+                      const safeFileHref = safeExternalHref(u.drive_link, { httpsOnly: true });
+                      return (
                       <li key={u.asset_id} className="truncate font-mono text-xs text-[#4B433B]">
                         {u.target_subfolder ? `${u.target_subfolder}/` : ""}
-                        {u.filename || u.asset_id}: <strong className="text-emerald-700">{u.status}</strong>{" "}
-                        {u.drive_link ? (
-                          <a href={u.drive_link} target="_blank" rel="noreferrer" className="text-[#0F766E] underline">
+                        {u.filename || u.asset_id}:{" "}
+                        <strong className={u.status === "failed" ? "text-rose-700" : "text-emerald-700"}>{u.status}</strong>{" "}
+                        {safeFileHref ? (
+                          <a href={safeFileHref} target="_blank" rel="noreferrer" className="text-[#0F766E] underline">
                             ({u.drive_file_id})
                           </a>
                         ) : u.drive_file_id ? (
@@ -1458,7 +1549,8 @@ export default function JobDetailClient({ id }: { id: string }) {
                         )}{" "}
                         {u.error ? `— ${u.error}` : ""}
                       </li>
-                    ))}
+                      );
+                    })}
                   </ul>
                 </div>
               )}
@@ -1469,12 +1561,14 @@ export default function JobDetailClient({ id }: { id: string }) {
                     Client AI &amp; Inventory reports ({delivery.reports_status || "recorded"})
                   </div>
                   <ul className="mt-2 space-y-1.5">
-                    {delivery.reports_uploaded.map((r) => (
+                    {delivery.reports_uploaded.map((r) => {
+                      const safeRepHref = safeExternalHref(r.drive_link, { httpsOnly: true });
+                      return (
                       <li key={r.report_id || r.filename} className="truncate font-mono text-xs text-[#4B433B]">
                         {r.target_subfolder || "Reports"}/{r.filename || r.report_id}:{" "}
-                        <strong className="text-emerald-700">{r.status}</strong>{" "}
-                        {r.drive_link ? (
-                          <a href={r.drive_link} target="_blank" rel="noreferrer" className="text-[#0F766E] underline">
+                        <strong className={r.status === "failed" ? "text-rose-700" : "text-emerald-700"}>{r.status}</strong>{" "}
+                        {safeRepHref ? (
+                          <a href={safeRepHref} target="_blank" rel="noreferrer" className="text-[#0F766E] underline">
                             ({r.drive_file_id})
                           </a>
                         ) : r.drive_file_id ? (
@@ -1484,7 +1578,8 @@ export default function JobDetailClient({ id }: { id: string }) {
                         )}{" "}
                         {r.error ? `— ${r.error}` : ""}
                       </li>
-                    ))}
+                      );
+                    })}
                   </ul>
                 </div>
               )}
@@ -1496,10 +1591,13 @@ export default function JobDetailClient({ id }: { id: string }) {
               </div>
             )}
             {delivery.errors && delivery.errors.length > 0 && (
-              <div className="text-xs font-medium text-rose-700">Errors: {delivery.errors.join("; ")}</div>
+              <div className="rounded-lg border border-rose-200 bg-white px-3 py-2 text-xs font-medium text-rose-800">
+                Delivery errors: {delivery.errors.join("; ")}
+              </div>
             )}
           </div>
-        )}
+          );
+        })()}
 
         {selection && !mock && (
           <div className="studio-card-soft space-y-4 p-4 text-xs">
@@ -1531,9 +1629,16 @@ export default function JobDetailClient({ id }: { id: string }) {
               </span>
             </label>
             {deliveryMessage && (
-              <p className="font-medium text-[#0F766E]" role="status">
-                {deliveryMessage}
-              </p>
+              <div
+                role={deliveryMessage.ok ? "status" : "alert"}
+                className={
+                  deliveryMessage.ok
+                    ? "rounded-xl border border-emerald-200 bg-emerald-50 px-3.5 py-2.5 text-xs font-medium text-emerald-900"
+                    : "rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-xs font-medium text-rose-900"
+                }
+              >
+                {deliveryMessage.text}
+              </div>
             )}
             <button
               type="button"
