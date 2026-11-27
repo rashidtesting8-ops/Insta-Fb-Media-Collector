@@ -641,3 +641,81 @@ test("JobDetailClient and CollectionReview surface live AI failure reason and 1-
   await waitFor(() => assert.ok(rendered.container.textContent.includes("Quick Approve (1-Click)")), { timeout: 2000 });
   rendered.unmount();
 });
+
+test("Localhost UX shows non-destructive poll warnings, zero-files alert, truthful Drive failure alert, and accurate 403 messaging", async () => {
+  let jobFetches = 0;
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    const method = init?.method || "GET";
+    if (u === `/api/jobs/${ID}`) {
+      jobFetches += 1;
+      if (jobFetches === 2) throw new Error("Failed to fetch");
+      return jsonResponse({
+        job_id: ID,
+        status: "partial_success",
+        website_url: "https://salon-zero.co.uk/",
+      });
+    }
+    if (u === `/api/jobs/${ID}/status`) {
+      return jsonResponse({
+        job_id: ID,
+        stage: "partial_success",
+        terminal: true,
+        job_status: "partial_success",
+        detail: "Partial extraction success.",
+      });
+    }
+    if (u === `/api/jobs/${ID}/manifest`) return jsonResponse({ job_id: ID, assets: [] });
+    if (u === `/api/jobs/${ID}/curation`) {
+      return jsonResponse({
+        ai_envelope: { mock: false, prompt_version: "V2.0" },
+        curation: {
+          mode: "FINAL_CURATE",
+          selected_asset_ids: ["a1"],
+          best_images: [{ asset_id: "a1" }],
+          analysis_coverage: { mock: false },
+        },
+      });
+    }
+    if (u === `/api/jobs/${ID}/delivery` && method === "GET") {
+      return jsonResponse({
+        status: "failed",
+        errors: ["Google Drive OAuth token expired"],
+      });
+    }
+    if (u === `/api/jobs/${ID}/delivery` && method === "POST") {
+      return jsonResponse({ status: "failed", error: "OAuth invalid_grant" }, 502);
+    }
+    if (u === `/api/jobs/${ID}/rights`) return jsonResponse({ error: "none" }, 404);
+    if (u === `/api/jobs/${ID}/collection-approval`) {
+      return jsonResponse({ error: "Independent second Admin required" }, 403);
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+
+  const rendered = render(React.createElement(JobDetailClient, { id: ID }));
+  await waitFor(() => assert.ok(rendered.container.textContent.includes("No photos or videos could be downloaded yet")), { timeout: 2000 });
+  // Truthful Drive failed alert + error list
+  assert.ok(rendered.container.textContent.includes("Google Drive OAuth token expired"));
+  // Wait for CollectionReview's 403 fetch to settle; must NOT show misleading "Sign in as a named Admin" banner
+  await waitFor(() => assert.ok(rendered.container.textContent.includes("Independent second Admin required")), { timeout: 2000 });
+  assert.ok(!rendered.container.textContent.includes("Sign in as a named Admin"));
+
+  // Trigger a refresh that throws network error -> must keep page rendered and show non-destructive poll warning!
+  await act(async () => {
+    fireEvent.click(rendered.getByRole("button", { name: "Refresh" }));
+  });
+  await waitFor(() => assert.ok(rendered.container.textContent.includes("Live refresh paused briefly")), { timeout: 2000 });
+  assert.ok(rendered.container.textContent.includes("salon-zero.co.uk"));
+
+  // Trigger Drive delivery failure -> shows plain-English OAuth guidance alert!
+  const checkbox = rendered.container.querySelector('input[type="checkbox"]');
+  await act(async () => {
+    fireEvent.click(checkbox);
+  });
+  await act(async () => {
+    fireEvent.click(rendered.getByRole("button", { name: /Deliver Approved Media to Google Drive/i }));
+  });
+  await waitFor(() => assert.ok(rendered.container.textContent.includes("verify the '06 - Google Drive Delivery' workflow")), { timeout: 2000 });
+  rendered.unmount();
+});

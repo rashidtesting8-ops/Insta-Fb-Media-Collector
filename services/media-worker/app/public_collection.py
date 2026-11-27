@@ -188,10 +188,22 @@ def check_response(response):
         raise SourceStop("restricted")
 
 
+def _canonical_site_origins(orig: tuple[str, str, int]) -> set[tuple[str, str, int]]:
+    scheme, host, port = orig
+    low = (host or "").lower().rstrip(".")
+    out = {(scheme, low, port)}
+    if low.startswith("www.") and len(low) > 4:
+        out.add((scheme, low[4:], port))
+    elif low and "." in low and not low.replace(".", "").isdigit():
+        out.add((scheme, f"www.{low}", port))
+    return out
+
+
 class PublicHTTP:
     def __init__(self, source_url, config, session, held_origins=None):
         self.origin = origin(source_url)
-        self.media_origins = {origin(url) for url in config["media_origins"]}
+        self.site_origins = _canonical_site_origins(self.origin)
+        self.media_origins = {origin(url) for url in config["media_origins"]} | self.site_origins
         self.media_host_suffixes = tuple(
             s.lower()
             for s in (config.get("media_host_suffixes") or ())
@@ -255,7 +267,7 @@ class PublicHTTP:
             raise
 
     def page_permitted(self, url):
-        return origin(url) == self.origin and self._robots(url)
+        return origin(url) in self.site_origins and self._robots(url)
 
     def media_permitted(self, url):
         # Discovery checks origin/suffix only. Robots rules are checked for each actual download hop.
@@ -294,7 +306,7 @@ class PublicHTTP:
             raise
 
     def document(self, url, byte_limit):
-        with self._get(url, {self.origin}) as response:
+        with self._get(url, self.site_origins) as response:
             body = bytearray()
             for chunk in response.iter_content(65536):
                 self._clock()

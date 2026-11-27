@@ -2,6 +2,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
+import { friendlyErrorMessage } from "@/lib/errors";
 import type { JobSummary } from "@/lib/types";
 import {
   ArrowRightIcon,
@@ -101,6 +102,7 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [visibleCount, setVisibleCount] = useState(20);
 
   async function load() {
     setRefreshing(true);
@@ -109,7 +111,7 @@ export default function Dashboard() {
       const data = await api<{ jobs: JobSummary[]; total: number }>("/api/jobs");
       setJobs(data.jobs || []);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyErrorMessage(e, "Unable to load projects from the local worker."));
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -126,7 +128,7 @@ export default function Dashboard() {
         }
       })
       .catch((e: unknown) => {
-        if (active) setError(e instanceof Error ? e.message : String(e));
+        if (active) setError(friendlyErrorMessage(e, "Unable to load projects from the local worker."));
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -188,8 +190,11 @@ export default function Dashboard() {
       </div>
 
       {error && (
-        <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
-          {error}
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+          <span>{error}</span>
+          <button type="button" onClick={load} className="studio-btn-secondary py-1.5 text-xs">
+            Retry
+          </button>
         </div>
       )}
 
@@ -323,8 +328,9 @@ export default function Dashboard() {
             )}
           </div>
         ) : (
-          <ul className="divide-y divide-[#F0E9E0]">
-            {filteredJobs.slice(0, 20).map((j) => {
+          <>
+            <ul className="divide-y divide-[#F0E9E0]">
+              {filteredJobs.slice(0, visibleCount).map((j) => {
               const badge = friendlyJobStatus(j.status);
               const domain = friendlyDomain(j.website_url);
               const dateText = friendlyDate(j.created_at || j.updated_at);
@@ -363,8 +369,27 @@ export default function Dashboard() {
                   </Link>
                 </li>
               );
-            })}
-          </ul>
+              })}
+            </ul>
+            {filteredJobs.length > visibleCount && (
+              <div className="flex flex-wrap items-center justify-center gap-3 border-t border-[#F0E9E0] px-5 py-3.5 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setVisibleCount((c) => c + 20)}
+                  className="studio-btn-secondary py-1.5 text-xs"
+                >
+                  Load 20 more ({filteredJobs.length - visibleCount} remaining)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setVisibleCount(filteredJobs.length)}
+                  className="font-semibold text-[#0F766E] hover:underline"
+                >
+                  Show all ({filteredJobs.length})
+                </button>
+              </div>
+            )}
+          </>
         )}
       </section>
     </div>
